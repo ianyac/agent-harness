@@ -21,6 +21,7 @@ writes all implementation code. The teacher reviews every diff.
 | Language | Python 3.12+ | Least ceremony; focus on concepts over plumbing |
 | Env/deps | `uv` | Simple, fast, lockfile |
 | LLM backend | Codex subscription, behind a learner-written adapter | Forces a real provider-abstraction boundary |
+| Message format | OpenAI chat-completions dicts (`{"role", "content"}`), no wrapper type | Learner's call: de facto ecosystem standard, zero translation for the backend. Accepted knowingly: OpenAI tool-call warts (JSON-string `arguments`) live in our code |
 | Frameworks | None that own the control flow | The harness *is* the framework; the loop must be ours. Libraries that stay out of the loop (HTTP client, pytest, pydantic) are fine |
 | Structure | One evolving codebase; git tag per lesson (`lesson-NN`) | Diffs between tags show what each concept costs; mirrors honest evolution |
 | Scaffolding | None up front — lesson 1 is a single file | Modules get extracted only when a lesson forces the boundary |
@@ -35,8 +36,9 @@ tests. Lessons may be split or merged as actual difficulty emerges.
    hardcoded fake model. Core insight: a harness is
    `while true: messages → model → message`. The fake model stays forever as
    the test double.
-2. **The provider adapter.** Internal provider-neutral message format,
-   `LLMClient` interface, learner writes the Codex adapter behind it.
+2. **The provider adapter.** OpenAI message dicts as the internal format;
+   `LLMClient` interface + contract test; learner writes the Codex adapter
+   behind it (transport, auth, response normalization).
 
 ### Stage 2 — Tools
 3. **Tools are structured text.** Tool definitions (name, description, JSON
@@ -90,7 +92,6 @@ scaffolded):
 ```
 agent-harness/
 ├── harness/
-│   ├── messages.py      # L1–2: Message/ToolCall types (provider-neutral)
 │   ├── llm.py           # L2: LLMClient interface + Codex adapter
 │   ├── tools/           # L3+: Tool interface, registry; fs.py, bash.py, agent.py
 │   ├── loop.py          # L4: the agent loop
@@ -111,12 +112,13 @@ the provider API → tool calls in the reply are looked up in the registry and
 executed (through the permission gate from L7) → results appended as messages →
 model called again → repeat until plain text → display, wait for input.
 
-**Dependency direction:** `main → loop → (llm, tools, permissions)`; everything
-may depend on `messages`. Nothing depends on `main`.
+**Dependency direction:** `main → loop → (llm, tools, permissions)`. Nothing
+depends on `main`. Messages are plain OpenAI-format dicts; there is no shared
+message module.
 
 **Invariants (keep streaming/MCP addable):**
-1. Nothing outside `llm.py` ever touches a provider's raw request/response
-   format.
+1. The loop and tools only ever see plain OpenAI-format message dicts.
+   Provider SDK objects, HTTP transport, and auth never escape `llm.py`.
 2. The loop never knows a tool's name — tools are always looked up in the
    registry.
 

@@ -1,8 +1,11 @@
 # TEMP: REPL runs on the fake until the codex adapter lands (task 6)
 from tests.fake_llm import FakeLLM
+from harness.llm import LLMClient
 
 
-def run_turn(messages: list[dict[str, str]], user_input: str, llm) -> dict[str, str]:
+def run_turn(
+    messages: list[dict[str, str]], user_input: str, llm: LLMClient
+) -> dict[str, str]:
     messages.append({"role": "user", "content": user_input})
     response = llm.complete(messages)
     messages.append(response)

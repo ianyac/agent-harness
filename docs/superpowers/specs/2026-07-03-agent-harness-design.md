@@ -11,8 +11,11 @@ tool use (filesystem + bash), a permission system, sandboxed execution, a
 designed system prompt, context compaction, subagents, persistent sessions,
 hooks, and skills.
 
-The teacher (Claude) explains concepts and leads testing; the learner (yc)
-writes all implementation code. The teacher reviews every diff.
+Roles (renegotiated 2026-07-03, mid-lesson 2): the teacher (Claude) explains
+concepts, writes the code and tests, and explains every change. The learner
+(yc) reviews every diff before it commits, asks questions freely, and must
+pass a concept quiz at each lesson tag. (Lessons 1 and most of 2 ran the
+original inverted protocol: learner wrote, teacher reviewed.)
 
 ## Decisions
 
@@ -124,17 +127,18 @@ message module.
 
 ## Lesson workflow
 
-Each lesson:
+Each lesson (roles as renegotiated 2026-07-03):
 1. **Concept briefing** — teacher explains the problem, the mechanism, and how
    Claude Code does it. Short.
-2. **Tests as the spec** — teacher leads turning the lesson's required
-   behaviors into failing pytest tests before implementation. Early lessons:
-   written together line-by-line. Later lessons: learner drafts, teacher
-   reviews. Red first.
-3. **Learner implements** until green. Teacher answers questions, never grabs
-   the keyboard.
-4. **Teacher reviews** the diff: correctness, then simplicity, then style.
+2. **Tests as the spec** — teacher writes the failing pytest tests first and
+   explains what they pin. Red first.
+3. **Teacher implements** until green, explaining the design as it goes.
+4. **Learner reviews** the diff before commit — findings are resolved or
+   argued, never skipped. Teacher quizzes the learner on the lesson's
+   concepts; passing the quiz is part of the gate.
 5. **Verify & tag** — run the REPL as a smoke test, commit, tag `lesson-NN`.
+6. Task-assigning messages to the learner end with an explicit numbered
+   `TODO:` list.
 
 ## Testing strategy
 

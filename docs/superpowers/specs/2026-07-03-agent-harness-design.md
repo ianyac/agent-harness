@@ -1,0 +1,138 @@
+# Agent Harness — Learning Project Design
+
+**Date:** 2026-07-03
+**Status:** Approved pending user review
+
+## Goal
+
+Learn how agent harnesses work by building a "mini Claude Code" from the ground
+up, one concept per lesson. The finished harness: an interactive CLI agent with
+tool use (filesystem + bash), a permission system, a designed system prompt,
+context compaction, subagents, and persistent sessions.
+
+The teacher (Claude) explains concepts and leads testing; the learner (yc)
+writes all implementation code. The teacher reviews every diff.
+
+## Decisions
+
+| Decision | Choice | Rationale |
+|---|---|---|
+| Language | Python 3.12+ | Least ceremony; focus on concepts over plumbing |
+| Env/deps | `uv` | Simple, fast, lockfile |
+| LLM backend | Codex subscription, behind a learner-written adapter | Forces a real provider-abstraction boundary |
+| Frameworks | None that own the control flow | The harness *is* the framework; the loop must be ours. Libraries that stay out of the loop (HTTP client, pytest, pydantic) are fine |
+| Structure | One evolving codebase; git tag per lesson (`lesson-NN`) | Diffs between tags show what each concept costs; mirrors honest evolution |
+| Scaffolding | None up front — lesson 1 is a single file | Modules get extracted only when a lesson forces the boundary |
+
+## Curriculum
+
+One concept per lesson. Every lesson ends with a runnable harness and passing
+tests. Lessons may be split or merged as actual difficulty emerges.
+
+### Stage 1 — The Loop
+1. **The conversation is the state.** Messages list, roles, a REPL against a
+   hardcoded fake model. Core insight: a harness is
+   `while true: messages → model → message`. The fake model stays forever as
+   the test double.
+2. **The provider adapter.** Internal provider-neutral message format,
+   `LLMClient` interface, learner writes the Codex adapter behind it.
+
+### Stage 2 — Tools
+3. **Tools are structured text.** Tool definitions (name, description, JSON
+   schema), tool registry, parsing tool calls from responses. No execution yet.
+4. **The agent loop.** Execute tool calls, append results, call model again,
+   repeat until a plain text reply. The ~20-line heart of every harness.
+5. **Real tools: the filesystem.** `read_file`, `write_file`, `list_dir`.
+   Tool-design craft: descriptions, string results.
+6. **The universal tool: bash.** Shell execution, cwd, timeouts, output
+   truncation.
+
+### Stage 3 — Safety
+7. **Permissions.** Gate between "model wants to" and "harness does":
+   allowlists, ask-the-human, permission modes.
+8. **Failure is information.** Tool errors returned to the model as results,
+   not crashes. Turn limits, API retries, cancellation.
+
+### Stage 4 — Context engineering
+9. **The system prompt.** Environment info, behavioral instructions, tool
+   guidance; write ours.
+10. **Context is scarce.** Token counting, budget tracking, compaction
+    (summarize when near the limit).
+
+### Stage 5 — Scale-out
+11. **Subagents.** An `agent` tool spawning a fresh inner loop with empty
+    context, returning only its final answer.
+12. **Sessions.** JSONL transcripts, resume, final polish.
+
+### Stage 6 — Extensions (optional, decided later)
+13. **Streaming output.** Streaming variant of `LLMClient` yielding chunks that
+    assemble into the same message type; loop unchanged.
+14. **MCP client.** MCP tools as registry entries whose `execute` forwards
+    JSON-RPC over stdio; loop, permissions, truncation unchanged.
+
+## Architecture
+
+Target shape (converged at lesson 12; extracted incrementally, never
+scaffolded):
+
+```
+agent-harness/
+├── harness/
+│   ├── messages.py      # L1–2: Message/ToolCall types (provider-neutral)
+│   ├── llm.py           # L2: LLMClient interface + Codex adapter
+│   ├── tools/           # L3+: Tool interface, registry; fs.py, bash.py, agent.py
+│   ├── loop.py          # L4: the agent loop
+│   ├── permissions.py   # L7
+│   ├── prompts.py       # L9: system prompt assembly
+│   ├── compaction.py    # L10
+│   └── session.py       # L12: JSONL transcripts
+├── tests/               # fake model test double + per-module tests
+└── main.py              # the REPL
+```
+
+**Data flow (from L4):** REPL appends user input to `messages` → loop sends
+messages + tool definitions through `LLMClient` → adapter translates to/from
+the provider API → tool calls in the reply are looked up in the registry and
+executed (through the permission gate from L7) → results appended as messages →
+model called again → repeat until plain text → display, wait for input.
+
+**Dependency direction:** `main → loop → (llm, tools, permissions)`; everything
+may depend on `messages`. Nothing depends on `main`.
+
+**Invariants (keep streaming/MCP addable):**
+1. Nothing outside `llm.py` ever touches a provider's raw request/response
+   format.
+2. The loop never knows a tool's name — tools are always looked up in the
+   registry.
+
+## Lesson workflow
+
+Each lesson:
+1. **Concept briefing** — teacher explains the problem, the mechanism, and how
+   Claude Code does it. Short.
+2. **Tests as the spec** — teacher leads turning the lesson's required
+   behaviors into failing pytest tests before implementation. Early lessons:
+   written together line-by-line. Later lessons: learner drafts, teacher
+   reviews. Red first.
+3. **Learner implements** until green. Teacher answers questions, never grabs
+   the keyboard.
+4. **Teacher reviews** the diff: correctness, then simplicity, then style.
+5. **Verify & tag** — run the REPL as a smoke test, commit, tag `lesson-NN`.
+
+## Testing strategy
+
+- The fake `LLMClient` (from L1) returns scripted responses, enabling
+  deterministic tests of the loop, tool dispatch, stop conditions, permissions,
+  truncation, and compaction — zero API calls.
+- Tests in `tests/`, run with `uv run pytest`.
+- The real Codex adapter is excluded from the automated suite (slow, costly,
+  nondeterministic); REPL smoke tests cover it.
+- Known limit, taught explicitly: unit tests can't cover model *choices*;
+  end-to-end behavior is verified by using the harness.
+
+## Out of scope
+
+- Multi-provider support beyond the one Codex adapter (the interface allows it;
+  we don't build it).
+- GUI/TUI beyond a plain REPL.
+- Hooks, skills, plugins, sandboxing — noted where relevant, not built.

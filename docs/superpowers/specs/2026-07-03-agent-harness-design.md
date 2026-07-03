@@ -32,13 +32,16 @@ One concept per lesson. Every lesson ends with a runnable harness and passing
 tests. Lessons may be split or merged as actual difficulty emerges.
 
 ### Stage 1 — The Loop
-1. **The conversation is the state.** Messages list, roles, a REPL against a
-   hardcoded fake model. Core insight: a harness is
-   `while true: messages → model → message`. The fake model stays forever as
-   the test double.
-2. **The provider adapter.** OpenAI message dicts as the internal format;
-   `LLMClient` interface + contract test; learner writes the Codex adapter
-   behind it (transport, auth, response normalization).
+1. **The conversation is the state (spike).** Messages list, roles, a REPL
+   against the real model: learner researches Codex access and gets a real
+   multi-turn conversation working, verified manually. Core insight: a harness
+   is `while true: messages → model → message`; memory lives in the list. A
+   raw response is captured as a test fixture. Deliberately untested — a
+   sanctioned spike against an unknown external system.
+2. **The provider adapter (stabilize).** OpenAI message dicts as the internal
+   format; `LLMClient` interface + contract test; `CodexAdapter` with
+   `normalize()` extracted from the spike; `FakeLLM` written as the permanent
+   test double. The spike's code comes under test here.
 
 ### Stage 2 — Tools
 3. **Tools are structured text.** Tool definitions (name, description, JSON
@@ -138,7 +141,11 @@ Each lesson:
 
 ## Testing strategy
 
-- The fake `LLMClient` (from L1) returns scripted responses, enabling
+- Spike-and-stabilize exception: when a lesson confronts an unknown external
+  system (L1's Codex access), it may run as a spike — code first, verified
+  manually — provided the immediately following lesson brings that code under
+  test. Spiked code is not "done" until stabilized.
+- The fake `LLMClient` (from L2) returns scripted responses, enabling
   deterministic tests of the loop, tool dispatch, stop conditions, permissions,
   truncation, and compaction — zero API calls.
 - Tests in `tests/`, run with `uv run pytest`.

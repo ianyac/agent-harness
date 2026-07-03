@@ -1,4 +1,5 @@
-from main import FakeLLM, run_turn
+from tests.fake_llm import FakeLLM
+from main import run_turn
 
 
 def test_fake_llm_returns_scripted_responses_in_order():

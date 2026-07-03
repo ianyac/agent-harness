@@ -7,8 +7,9 @@
 
 Learn how agent harnesses work by building a "mini Claude Code" from the ground
 up, one concept per lesson. The finished harness: an interactive CLI agent with
-tool use (filesystem + bash), a permission system, a designed system prompt,
-context compaction, subagents, and persistent sessions.
+tool use (filesystem + bash), a permission system, sandboxed execution, a
+designed system prompt, context compaction, subagents, persistent sessions,
+hooks, and skills.
 
 The teacher (Claude) explains concepts and leads testing; the learner (yc)
 writes all implementation code. The teacher reviews every diff.
@@ -52,27 +53,38 @@ tests. Lessons may be split or merged as actual difficulty emerges.
    allowlists, ask-the-human, permission modes.
 8. **Failure is information.** Tool errors returned to the model as results,
    not crashes. Turn limits, API retries, cancellation.
+9. **Sandboxing.** Permissions gate *intent*; the sandbox contains *execution*.
+   OS-level sandbox for bash and file tools (macOS `sandbox-exec` profiles):
+   writes confined to the workspace, network gating. Defense in depth.
 
 ### Stage 4 — Context engineering
-9. **The system prompt.** Environment info, behavioral instructions, tool
-   guidance; write ours.
-10. **Context is scarce.** Token counting, budget tracking, compaction
+10. **The system prompt.** Environment info, behavioral instructions, tool
+    guidance; write ours.
+11. **Context is scarce.** Token counting, budget tracking, compaction
     (summarize when near the limit).
 
 ### Stage 5 — Scale-out
-11. **Subagents.** An `agent` tool spawning a fresh inner loop with empty
+12. **Subagents.** An `agent` tool spawning a fresh inner loop with empty
     context, returning only its final answer.
-12. **Sessions.** JSONL transcripts, resume, final polish.
+13. **Sessions.** JSONL transcripts, resume.
 
-### Stage 6 — Extensions (optional, decided later)
-13. **Streaming output.** Streaming variant of `LLMClient` yielding chunks that
+### Stage 6 — Extensibility
+14. **Hooks.** Lifecycle extension points (pre/post tool use, session start,
+    stop): user-configured commands that can observe, block, or inject
+    context. A generalization of the L7 permission gate.
+15. **Skills.** Progressive disclosure of instructions: skill files with
+    frontmatter, metadata listed in the system prompt, full content loaded
+    into context on demand. Builds directly on L10–11.
+
+### Stage 7 — Extensions (optional, decided later)
+16. **Streaming output.** Streaming variant of `LLMClient` yielding chunks that
     assemble into the same message type; loop unchanged.
-14. **MCP client.** MCP tools as registry entries whose `execute` forwards
+17. **MCP client.** MCP tools as registry entries whose `execute` forwards
     JSON-RPC over stdio; loop, permissions, truncation unchanged.
 
 ## Architecture
 
-Target shape (converged at lesson 12; extracted incrementally, never
+Target shape (converged at lesson 15; extracted incrementally, never
 scaffolded):
 
 ```
@@ -83,9 +95,12 @@ agent-harness/
 │   ├── tools/           # L3+: Tool interface, registry; fs.py, bash.py, agent.py
 │   ├── loop.py          # L4: the agent loop
 │   ├── permissions.py   # L7
-│   ├── prompts.py       # L9: system prompt assembly
-│   ├── compaction.py    # L10
-│   └── session.py       # L12: JSONL transcripts
+│   ├── sandbox.py       # L9: sandbox profiles wrapping bash/fs execution
+│   ├── prompts.py       # L10: system prompt assembly
+│   ├── compaction.py    # L11
+│   ├── session.py       # L13: JSONL transcripts
+│   ├── hooks.py         # L14: lifecycle events + hook config
+│   └── skills.py        # L15: skill discovery and on-demand loading
 ├── tests/               # fake model test double + per-module tests
 └── main.py              # the REPL
 ```
@@ -135,4 +150,5 @@ Each lesson:
 - Multi-provider support beyond the one Codex adapter (the interface allows it;
   we don't build it).
 - GUI/TUI beyond a plain REPL.
-- Hooks, skills, plugins, sandboxing — noted where relevant, not built.
+- A plugin system (bundling hooks/skills/tools for distribution) — hooks and
+  skills themselves are in scope (L14–15); packaging them is not.

@@ -21,8 +21,8 @@ original inverted protocol: learner wrote, teacher reviewed.)
 
 | Decision | Choice | Rationale |
 |---|---|---|
-| Language | TypeScript on Bun (pivoted 2026-07-04; lessons 1–3 were Python, archived under `python/`, tag `python-final`) | Learner's call; TS is what production harnesses (incl. Claude Code) ship in; types help as message shapes multiply |
-| Env/deps | `bun` (runtime, tests, packages) | Native TS execution, built-in test runner, one tool |
+| Language | Python 3.14 for the full curriculum; TypeScript re-expression afterward (parked on branch `ts-speedrun`, tag `ts-lesson-01`) | Learner's call (2026-07-04, revised same day): concepts first in one language end to end; the TS port becomes a consolidation exercise once the harness is complete |
+| Env/deps | `uv` (`bun` on the parked TS branch) | Simple, fast, lockfile |
 | LLM backend | Codex subscription, behind a learner-written adapter | Forces a real provider-abstraction boundary |
 | Message format | OpenAI chat-completions dicts (`{"role", "content"}`), no wrapper type | Learner's call: de facto ecosystem standard, zero translation for the backend. Accepted knowingly: OpenAI tool-call warts (JSON-string `arguments`) live in our code |
 | Frameworks | None that own the control flow | The harness *is* the framework; the loop must be ours. Libraries that stay out of the loop (HTTP client, pytest, pydantic) are fine |
@@ -94,21 +94,22 @@ scaffolded):
 
 ```
 agent-harness/
-├── src/
-│   ├── llm.ts           # L2: LLMClient interface + Codex adapter
-│   ├── tools.ts         # L3+: Tool interface, registry (fs/bash/agent tools later)
-│   ├── loop.ts          # L4: the agent loop
-│   ├── permissions.ts   # L7
-│   ├── sandbox.ts       # L9: sandbox profiles wrapping bash/fs execution
-│   ├── prompts.ts       # L10: system prompt assembly
-│   ├── compaction.ts    # L11
-│   ├── session.ts       # L13: JSONL transcripts
-│   ├── hooks.ts         # L14: lifecycle events + hook config
-│   └── skills.ts        # L15: skill discovery and on-demand loading
-├── tests/               # fake model test double + *.test.ts (bun test)
-├── main.ts              # the REPL
-└── python/              # archived Python implementation of L1–3 (tag python-final)
+├── harness/
+│   ├── llm.py           # L2: LLMClient interface + Codex adapter
+│   ├── tools.py         # L3+: Tool + registry (fs/bash/agent tools later)
+│   ├── loop.py          # L4: the agent loop
+│   ├── permissions.py   # L7
+│   ├── sandbox.py       # L9: sandbox profiles wrapping bash/fs execution
+│   ├── prompts.py       # L10: system prompt assembly
+│   ├── compaction.py    # L11
+│   ├── session.py       # L13: JSONL transcripts
+│   ├── hooks.py         # L14: lifecycle events + hook config
+│   └── skills.py        # L15: skill discovery and on-demand loading
+├── tests/               # fake model test double + per-module tests
+└── main.py              # the REPL
 ```
+(TypeScript mirror of this tree lives on the `ts-speedrun` branch, resumed
+after L15.)
 
 **Data flow (from L4):** REPL appends user input to `messages` → loop sends
 messages + tool definitions through `LLMClient` → adapter translates to/from
@@ -146,8 +147,8 @@ Each lesson (roles as renegotiated 2026-07-03):
 - The fake `LLMClient` (from L1) returns scripted responses, enabling
   deterministic tests of the loop, tool dispatch, stop conditions, permissions,
   truncation, and compaction — zero API calls.
-- Tests in `tests/`, run with `bun test` (archived Python line: `cd python &&
-  uv run pytest`).
+- Tests in `tests/`, run with `uv run pytest` (the parked TS branch uses
+  `bun test`).
 - The real Codex adapter is excluded from the automated suite (slow, costly,
   nondeterministic); REPL smoke tests cover it.
 - Known limit, taught explicitly: unit tests can't cover model *choices*;

@@ -1,10 +1,9 @@
 # Stage 2: Tools — Implementation Plan (Lessons 3–6)
 
-> **Language pivot (2026-07-04):** project moved to TypeScript on Bun after
-> Task 3.3; Python implementation archived under `python/` (tag
-> `python-final`). Lessons 1–3 are being re-expressed per
-> `2026-07-04-ts-speedrun.md`; lessons 4–6 below then proceed in TS (file
-> names map `harness/*.py` → `src/*.ts`, `uv run pytest` → `bun test`).
+> **Language note (2026-07-04):** a brief TS pivot after Task 3.3 was
+> reversed the same day — the curriculum continues in Python to the end;
+> the TypeScript re-expression is parked on branch `ts-speedrun` (see
+> `2026-07-04-ts-speedrun.md`, status: paused) and resumes after L15.
 
 > **Protocol (since the 2026-07-03 role switch):** the teacher writes all code
 > and tests, explaining as it goes; the learner reviews every diff before it

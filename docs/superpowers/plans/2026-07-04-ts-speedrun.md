@@ -1,5 +1,10 @@
 # TypeScript Speed-Run — Re-express Lessons 1–3 (Plan)
 
+> **Status: PAUSED (2026-07-04).** The curriculum continues in Python first;
+> this speed-run resumes after lesson 15 and then covers all lessons, not
+> just 1–3. Work parked on branch `ts-speedrun`: TS-1 complete (tag
+> `ts-lesson-01`), TS-2 mid-flight (commit `29c959f`).
+
 > Teacher writes, learner reviews each diff, quiz at each tag — the standing
 > protocol. This plan re-expresses the already-designed and already-reviewed
 > Python lessons 1–3 in TypeScript on Bun. No new design decisions: where the

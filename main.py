@@ -1,13 +1,5 @@
-from harness.llm import CodexAdapter, LLMClient
-
-
-def run_turn(
-    messages: list[dict[str, str]], user_input: str, llm: LLMClient
-) -> dict[str, str]:
-    messages.append({"role": "user", "content": user_input})
-    response = llm.complete(messages)
-    messages.append(response)
-    return response
+from harness.llm import CodexAdapter
+from harness.loop import run_turn
 
 
 def main():

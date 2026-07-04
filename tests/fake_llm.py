@@ -20,9 +20,7 @@ class FakeLLM:
         self.current_line = 0
         self._call_counter = 0
 
-    def complete(
-        self, messages: list[dict], tools: list[dict] | None = None
-    ) -> dict:
+    def complete(self, messages: list[dict], tools: list[dict] | None = None) -> dict:
         turn = self.turns[self.current_line]
         self.current_line += 1
         turn["messages"] = deepcopy(messages)

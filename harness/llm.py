@@ -131,9 +131,7 @@ class CodexAdapter:
             "Accept": "text/event-stream",
         }
 
-    def complete(
-        self, messages: list[dict], tools: list[dict] | None = None
-    ) -> dict:
+    def complete(self, messages: list[dict], tools: list[dict] | None = None) -> dict:
         body = {
             "model": self.model,
             "instructions": self.instructions,

@@ -34,18 +34,26 @@ class FakeLLM:
                     "role": "assistant",
                     "content": None,
                     "tool_calls": [
-                        self._tool_call(c["name"], c["arguments"])
+                        # raw_arguments scripts a model emitting broken JSON
+                        self._tool_call(
+                            c["name"],
+                            c["arguments"],
+                            raw=c.get("raw_arguments"),
+                        )
                         for c in entry["calls"]
                     ],
                 }
             case unknown:
                 raise ValueError(f"unknown FakeLLM script entry type {unknown!r}")
 
-    def _tool_call(self, name: str, arguments: dict) -> dict:
+    def _tool_call(self, name: str, arguments: dict, raw: str | None = None) -> dict:
         call = {
             "id": f"call_{self._call_counter}",
             "type": "function",
-            "function": {"name": name, "arguments": json.dumps(arguments)},
+            "function": {
+                "name": name,
+                "arguments": json.dumps(arguments) if raw is None else raw,
+            },
         }
         self._call_counter += 1
         return call

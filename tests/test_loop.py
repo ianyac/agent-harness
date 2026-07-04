@@ -1,5 +1,3 @@
-import pytest
-
 from harness.loop import run_turn
 from harness.tools.base import Tool
 from tests.fake_llm import FakeLLM
@@ -125,8 +123,12 @@ def test_observer_sees_each_execution_in_order():
     assert seen == [("add", {"a": 1, "b": 1}), ("add", {"a": 2, "b": 2})]
 
 
-def test_iteration_cap_raises_instead_of_looping_forever():
+def test_iteration_cap_ends_the_turn_gracefully():
+    # rewritten in lesson 8: the cap is a failure, and failure is information
     endless = {"type": "tool_calls", "calls": [{"name": "add", "arguments": {"a": 1, "b": 1}}]}
     llm = FakeLLM([endless, endless, endless])
-    with pytest.raises(RuntimeError, match="3 iterations"):
-        run_turn([], "loop forever", llm, tools={"add": add_tool()}, max_iterations=3)
+    messages = []
+    reply = run_turn(messages, "loop forever", llm, tools={"add": add_tool()}, max_iterations=3)
+    assert reply["role"] == "assistant"
+    assert "3 iterations" in reply["content"]
+    assert messages[-1] == reply

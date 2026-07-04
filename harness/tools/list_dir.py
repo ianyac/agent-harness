@@ -26,4 +26,5 @@ def list_dir_tool() -> Tool:
             },
         },
         execute=_list_dir,
+        read_only=True,
     )

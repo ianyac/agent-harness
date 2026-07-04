@@ -55,4 +55,5 @@ def read_file_tool() -> Tool:
             "required": ["path"],
         },
         execute=_read_file,
+        read_only=True,
     )

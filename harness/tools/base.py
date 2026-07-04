@@ -8,6 +8,7 @@ class Tool:
     description: str
     parameters: dict  # JSON schema for the arguments object
     execute: Callable[..., str]  # kwargs from parsed arguments -> string result
+    read_only: bool = False  # True = observes only; permissions trust this flag
 
     def __post_init__(self):
         # fail at construction, not as a provider 400 mid-conversation

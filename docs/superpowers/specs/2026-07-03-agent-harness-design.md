@@ -21,7 +21,7 @@ original inverted protocol: learner wrote, teacher reviewed.)
 
 | Decision | Choice | Rationale |
 |---|---|---|
-| Language | Python 3.12+ | Least ceremony; focus on concepts over plumbing |
+| Language | Python 3.14+ (upgraded from 3.12, 2026-07-04) | Least ceremony; focus on concepts over plumbing |
 | Env/deps | `uv` | Simple, fast, lockfile |
 | LLM backend | Codex subscription, behind a learner-written adapter | Forces a real provider-abstraction boundary |
 | Message format | OpenAI chat-completions dicts (`{"role", "content"}`), no wrapper type | Learner's call: de facto ecosystem standard, zero translation for the backend. Accepted knowingly: OpenAI tool-call warts (JSON-string `arguments`) live in our code |

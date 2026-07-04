@@ -17,8 +17,8 @@ chat-completions dicts, now including `tool_calls` on assistant messages and
 API wire shapes (`function_call` / `function_call_output` items). FakeLLM
 learns to script tool calls, which is what makes the loop testable offline.
 
-**Tech Stack:** unchanged — Python 3.12+, `uv`, `pytest`, `httpx` in the
-adapter only.
+**Tech Stack:** Python 3.14+ (pinned 2026-07-04), `uv`, `pytest`, `httpx` in
+the adapter only.
 
 ## Global Constraints
 

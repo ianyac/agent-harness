@@ -2,6 +2,9 @@
   "name": "agent-harness",
   "private": true,
   "type": "module",
+  "scripts": {
+    "check": "tsc --noEmit && bun test"
+  },
   "devDependencies": {
     "@types/bun": "^1.3.14"
   }

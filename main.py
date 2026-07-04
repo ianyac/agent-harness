@@ -2,25 +2,17 @@ import json
 
 from harness.llm import CodexAdapter
 from harness.loop import run_turn
-from harness.tools import Tool
-
-
-def add_tool() -> Tool:  # toy tool; real ones arrive in lesson 5
-    return Tool(
-        name="add",
-        description="Add two integers and return the sum.",
-        parameters={
-            "type": "object",
-            "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}},
-            "required": ["a", "b"],
-        },
-        execute=lambda a, b: str(a + b),
-    )
+from harness.tools.list_dir import list_dir_tool
+from harness.tools.read_file import read_file_tool
+from harness.tools.write_file import write_file_tool
 
 
 def main():
     llm = CodexAdapter()
-    tools = {"add": add_tool()}
+    tools = {
+        tool.name: tool
+        for tool in [read_file_tool(), write_file_tool(), list_dir_tool()]
+    }
     messages = []
     while True:
         try:

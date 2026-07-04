@@ -1,7 +1,7 @@
 import pytest
 
 from harness.loop import run_turn
-from harness.tools import Tool
+from harness.tools.base import Tool
 from tests.fake_llm import FakeLLM
 
 

@@ -2,7 +2,7 @@ import json
 from typing import Callable
 
 from harness.llm import LLMClient
-from harness.tools import Tool, definitions
+from harness.tools.base import Tool, definitions
 
 
 def run_turn(

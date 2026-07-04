@@ -96,7 +96,11 @@ scaffolded):
 agent-harness/
 ├── harness/
 │   ├── llm.py           # L2: LLMClient interface + Codex adapter
-│   ├── tools.py         # L3+: Tool + registry (fs/bash/agent tools later)
+│   ├── tools/           # one file per tool (learner's ruling, 2026-07-04)
+│   │   ├── base.py      # L3: Tool + definitions; __init__.py stays empty
+│   │   ├── read_file.py # L5   (bash.py L6, agent.py L12 join later)
+│   │   ├── write_file.py
+│   │   └── list_dir.py
 │   ├── loop.py          # L4: the agent loop
 │   ├── permissions.py   # L7
 │   ├── sandbox.py       # L9: sandbox profiles wrapping bash/fs execution

@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from harness.tools import Tool, definitions
+from harness.tools.base import Tool, definitions
 
 
 def sample_tool() -> Tool:

@@ -201,7 +201,10 @@ charges: safety (deferred to lessons 7/9, named here) and unbounded output
 - All four tools registered in the REPL; smoke: "how many .py files are in
   this project, and which is longest?" — real model, real pipeline.
 - `read_file` retrofitted with the same truncation helper (shared in
-  `harness/truncate.py` if extraction is warranted — reviewer's call).
+  `harness/truncate.py` if extraction is warranted — reviewer's call), plus
+  `offset`/`limit` parameters for partial reads (reviewer's ask, 2026-07-04).
+  Requirement: partial results must announce their own incompleteness (e.g.
+  a `[showing lines N–M of TOTAL]` header) so the model knows to continue.
 - Review gate, quiz, commit, tag `lesson-06`.
 
 ---

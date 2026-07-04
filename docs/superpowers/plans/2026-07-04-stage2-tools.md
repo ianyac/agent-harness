@@ -20,6 +20,23 @@ learns to script tool calls, which is what makes the loop testable offline.
 **Tech Stack:** Python 3.14+ (pinned 2026-07-04), `uv`, `pytest`, `httpx` in
 the adapter only.
 
+## Decisions under review (the five judgment calls in this plan)
+
+1. **Internal message shapes** (next section): OpenAI `tool_calls` format
+   adopted warts-and-all, per the Stage 1 format decision — including
+   `arguments` as a JSON string. Least reversible choice in the stage.
+2. **The socket changes once** (next section): `LLMClient.complete` gains
+   `tools: list[dict] | None = None`. Backward-compatible, but it is a
+   Protocol change.
+3. **Scoping calls** (Tasks 4.1, 5.1): tool-execution errors crash until
+   lesson 8; filesystem tools get no confinement until lessons 7/9; the loop
+   caps at a crude `max_iterations=20` as a lesson-8 placeholder. Same
+   "scheduled, not missing" pattern as Stage 1's retries.
+4. **Truncation lands early** (Task 6.1): bash forces the context-budget
+   question in lesson 6 rather than waiting for Stage 4.
+5. **Registry is a plain `dict[str, Tool]`** (Task 3.1): no registry class
+   until something needs one.
+
 ## Global Constraints
 
 - All Stage 1 constraints hold (no control-flow frameworks; plain dicts only

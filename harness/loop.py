@@ -1,4 +1,5 @@
 import json
+from typing import Callable
 
 from harness.llm import LLMClient
 from harness.tools import Tool, definitions
@@ -10,6 +11,7 @@ def run_turn(
     llm: LLMClient,
     tools: dict[str, Tool] | None = None,
     max_iterations: int = 20,  # crude runaway guard; real policy is lesson 8
+    on_tool_call: Callable[[str, dict], None] | None = None,
 ) -> dict:
     tools = tools or {}
     defs = definitions(tools) or None
@@ -22,7 +24,10 @@ def run_turn(
             return reply
         for call in calls:
             fn = call["function"]
-            result = tools[fn["name"]].execute(**json.loads(fn["arguments"]))
+            args = json.loads(fn["arguments"])
+            if on_tool_call is not None:
+                on_tool_call(fn["name"], args)
+            result = tools[fn["name"]].execute(**args)
             messages.append(
                 {"role": "tool", "tool_call_id": call["id"], "content": result}
             )

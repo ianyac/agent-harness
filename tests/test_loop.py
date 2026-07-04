@@ -101,6 +101,30 @@ def test_without_tools_behaves_exactly_like_stage_one():
     assert llm.turns[0]["tools"] is None
 
 
+def test_observer_sees_each_execution_in_order():
+    llm = FakeLLM(
+        [
+            {
+                "type": "tool_calls",
+                "calls": [
+                    {"name": "add", "arguments": {"a": 1, "b": 1}},
+                    {"name": "add", "arguments": {"a": 2, "b": 2}},
+                ],
+            },
+            {"type": "text", "content": "done"},
+        ]
+    )
+    seen = []
+    run_turn(
+        [],
+        "two sums",
+        llm,
+        tools={"add": add_tool()},
+        on_tool_call=lambda name, args: seen.append((name, args)),
+    )
+    assert seen == [("add", {"a": 1, "b": 1}), ("add", {"a": 2, "b": 2})]
+
+
 def test_iteration_cap_raises_instead_of_looping_forever():
     endless = {"type": "tool_calls", "calls": [{"name": "add", "arguments": {"a": 1, "b": 1}}]}
     llm = FakeLLM([endless, endless, endless])

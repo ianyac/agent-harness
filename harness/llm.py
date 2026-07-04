@@ -7,7 +7,9 @@ import httpx
 
 
 class LLMClient(Protocol):
-    def complete(self, messages: list[dict[str, str]]) -> dict[str, str]: ...
+    def complete(
+        self, messages: list[dict], tools: list[dict] | None = None
+    ) -> dict: ...
 
 
 CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
@@ -53,7 +55,11 @@ class CodexAdapter:
             "Accept": "text/event-stream",
         }
 
-    def complete(self, messages: list[dict[str, str]]) -> dict[str, str]:
+    def complete(
+        self, messages: list[dict], tools: list[dict] | None = None
+    ) -> dict:
+        # tools= is accepted but not yet sent; wire translation lands in
+        # task 3.3, and passing tools before then changes nothing
         for m in messages:
             if m["role"] not in ("user", "assistant", "system"):
                 raise ValueError(

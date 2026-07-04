@@ -6,7 +6,7 @@ from tests.fake_llm import FakeLLM
 
 
 def available_clients():
-    clients = [FakeLLM(["scripted reply"])]
+    clients = [FakeLLM([{"type": "text", "content": "scripted reply"}])]
     if os.environ.get("RUN_CODEX_TESTS") == "1":
         from harness.llm import CodexAdapter
 

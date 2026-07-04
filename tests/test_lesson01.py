@@ -3,7 +3,7 @@ from main import run_turn
 
 
 def test_fake_llm_returns_scripted_responses_in_order():
-    llm = FakeLLM(["first", "second"])
+    llm = FakeLLM([{"type": "text", "content": "first"}, {"type": "text", "content": "second"}])
     assert llm.complete([{"role": "user", "content": "hi"}]) == {
         "role": "assistant",
         "content": "first",
@@ -15,13 +15,13 @@ def test_fake_llm_returns_scripted_responses_in_order():
 
 
 def test_fake_llm_records_what_it_was_shown():
-    llm = FakeLLM(["ok"])
+    llm = FakeLLM([{"type": "text", "content": "ok"}])
     llm.complete([{"role": "user", "content": "hi"}])
-    assert llm.calls == [[{"role": "user", "content": "hi"}]]
+    assert llm.turns[0]["messages"] == [{"role": "user", "content": "hi"}]
 
 
 def test_run_turn_appends_user_and_assistant_messages():
-    llm = FakeLLM(["hello there"])
+    llm = FakeLLM([{"type": "text", "content": "hello there"}])
     messages = []
     reply = run_turn(messages, "hi", llm)
     assert messages == [
@@ -32,11 +32,11 @@ def test_run_turn_appends_user_and_assistant_messages():
 
 
 def test_model_sees_full_history_each_turn():
-    llm = FakeLLM(["a", "b"])
+    llm = FakeLLM([{"type": "text", "content": "a"}, {"type": "text", "content": "b"}])
     messages = []
     run_turn(messages, "one", llm)
     run_turn(messages, "two", llm)
-    assert llm.calls[1] == [
+    assert llm.turns[1]["messages"] == [
         {"role": "user", "content": "one"},
         {"role": "assistant", "content": "a"},
         {"role": "user", "content": "two"},

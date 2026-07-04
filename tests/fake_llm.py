@@ -1,14 +1,53 @@
+import json
 from copy import deepcopy
 
 
 class FakeLLM:
-    def __init__(self, script: list[str]):
-        self.script = script
-        self.current_line = 0
-        self.calls = []
+    """Scripted model. Script entries (explicit format, no shorthands):
 
-    def complete(self, messages: list[dict[str, str]]) -> dict[str, str]:
-        self.calls.append(deepcopy(messages))
-        output = {"role": "assistant", "content": self.script[self.current_line]}
+    {"type": "text", "content": "hi"}
+    {"type": "tool_calls", "calls": [{"name": ..., "arguments": {...}}, ...]}
+
+    Each entry is wrapped into a turn record — a full I/O trace of one
+    exchange once played:  {"output": <scripted directive>,
+    "messages": <what was shown>, "tools": <what was offered>}
+    """
+
+    def __init__(self, script: list[dict]):
+        self.turns = [
+            {"output": entry, "messages": None, "tools": None} for entry in script
+        ]
+        self.current_line = 0
+        self._call_counter = 0
+
+    def complete(
+        self, messages: list[dict], tools: list[dict] | None = None
+    ) -> dict:
+        turn = self.turns[self.current_line]
         self.current_line += 1
-        return output
+        turn["messages"] = deepcopy(messages)
+        turn["tools"] = deepcopy(tools)
+        entry = turn["output"]
+        match entry["type"]:
+            case "text":
+                return {"role": "assistant", "content": entry["content"]}
+            case "tool_calls":
+                return {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        self._tool_call(c["name"], c["arguments"])
+                        for c in entry["calls"]
+                    ],
+                }
+            case unknown:
+                raise ValueError(f"unknown FakeLLM script entry type {unknown!r}")
+
+    def _tool_call(self, name: str, arguments: dict) -> dict:
+        call = {
+            "id": f"call_{self._call_counter}",
+            "type": "function",
+            "function": {"name": name, "arguments": json.dumps(arguments)},
+        }
+        self._call_counter += 1
+        return call

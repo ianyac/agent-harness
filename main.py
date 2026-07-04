@@ -1,6 +1,4 @@
-# TEMP: REPL runs on the fake until the codex adapter lands (task 6)
-from tests.fake_llm import FakeLLM
-from harness.llm import LLMClient
+from harness.llm import CodexAdapter, LLMClient
 
 
 def run_turn(
@@ -13,7 +11,7 @@ def run_turn(
 
 
 def main():
-    llm = FakeLLM(["Hello! How can I help you?", "Goodbye!"])
+    llm = CodexAdapter()
     messages = []
     while True:
         try:

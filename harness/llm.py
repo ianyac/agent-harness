@@ -15,21 +15,97 @@ class LLMClient(Protocol):
 CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
 
 
-def normalize(raw: dict) -> dict[str, str]:
+def normalize(raw: dict) -> dict:
     """Reduce a raw /responses payload to a plain assistant message dict.
 
-    The output list holds reasoning items alongside the message; only the
-    message's text crosses into the conversation.
+    Output items: reasoning is dropped, message text becomes content,
+    function_call items become tool_calls. Nothing else crosses into the
+    conversation.
     """
+    content = None
+    tool_calls = []
     for item in raw["output"]:
         if item.get("type") == "message":
-            text = "".join(
+            content = "".join(
                 part["text"]
                 for part in item["content"]
                 if part.get("type") == "output_text"
             )
-            return {"role": "assistant", "content": text}
-    raise ValueError("no message item in codex response output")
+        elif item.get("type") == "function_call":
+            tool_calls.append(
+                {
+                    "id": item["call_id"],
+                    "type": "function",
+                    "function": {
+                        "name": item["name"],
+                        "arguments": item["arguments"],  # stays a JSON string
+                    },
+                }
+            )
+    if content is None and not tool_calls:
+        raise ValueError("codex response output has no message or function_call")
+    message = {"role": "assistant", "content": content}
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+    return message
+
+
+def to_wire_tools(tools: list[dict]) -> list[dict]:
+    """Chat-format tool definitions -> Responses API flat format."""
+    return [
+        {
+            "type": "function",
+            "name": t["function"]["name"],
+            "description": t["function"]["description"],
+            "parameters": t["function"]["parameters"],
+        }
+        for t in tools
+    ]
+
+
+def to_wire_input(messages: list[dict]) -> list[dict]:
+    """Internal message dicts -> Responses API input items."""
+    items = []
+    for m in messages:
+        role = m["role"]
+        if role == "tool":
+            items.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": m["tool_call_id"],
+                    "output": m["content"],
+                }
+            )
+            continue
+        if role not in ("user", "assistant", "system"):
+            raise ValueError(f"unsupported role {role!r}")
+        if m.get("content") is not None:
+            items.append(
+                {
+                    "type": "message",
+                    "role": role,
+                    # assistant history replays as the model's own prior
+                    # output; everything else (user, system) is input
+                    "content": [
+                        {
+                            "type": "output_text"
+                            if role == "assistant"
+                            else "input_text",
+                            "text": m["content"],
+                        }
+                    ],
+                }
+            )
+        for call in m.get("tool_calls", []):
+            items.append(
+                {
+                    "type": "function_call",
+                    "call_id": call["id"],
+                    "name": call["function"]["name"],
+                    "arguments": call["function"]["arguments"],
+                }
+            )
+    return items
 
 
 class CodexAdapter:
@@ -58,37 +134,15 @@ class CodexAdapter:
     def complete(
         self, messages: list[dict], tools: list[dict] | None = None
     ) -> dict:
-        # tools= is accepted but not yet sent; wire translation lands in
-        # task 3.3, and passing tools before then changes nothing
-        for m in messages:
-            if m["role"] not in ("user", "assistant", "system"):
-                raise ValueError(
-                    f"unsupported role {m['role']!r} — the adapter learns tool "
-                    "messages in lesson 3"
-                )
         body = {
             "model": self.model,
             "instructions": self.instructions,
-            "input": [
-                {
-                    "type": "message",
-                    "role": m["role"],
-                    # assistant history replays as the model's own prior
-                    # output; everything else (user, system) is input
-                    "content": [
-                        {
-                            "type": "output_text"
-                            if m["role"] == "assistant"
-                            else "input_text",
-                            "text": m["content"],
-                        }
-                    ],
-                }
-                for m in messages
-            ],
+            "input": to_wire_input(messages),
             "store": False,
             "stream": True,  # the codex endpoint rejects non-streaming requests
         }
+        if tools:
+            body["tools"] = to_wire_tools(tools)
         output_items: list[dict] = []
         final = None
         with httpx.Client(timeout=120) as client:

@@ -1,18 +1,18 @@
 from pathlib import Path
 
 from harness.tools.base import Tool
+from harness.tools.workspace import resolve_in_workspace
 from harness.truncate import truncate
-
-# Deliberately unconfined until lesson 7 (permissions) and lesson 9 (sandbox).
 
 
 def _read_file(
     path: str,
+    workspace: Path | None,
     offset: int | None = None,
     limit: int | None = None,
     char_limit: int = 10000,
 ) -> str:
-    text = Path(path).read_text()
+    text = resolve_in_workspace(path, workspace).read_text()
     # partial read: slice lines and announce the slice so the model knows
     # there is more to read
     if offset is not None or limit is not None:
@@ -26,7 +26,7 @@ def _read_file(
     return truncate(text, char_limit)
 
 
-def read_file_tool() -> Tool:
+def read_file_tool(workspace: Path | None = None) -> Tool:
     return Tool(
         name="read_file",
         description=(
@@ -54,6 +54,8 @@ def read_file_tool() -> Tool:
             },
             "required": ["path"],
         },
-        execute=_read_file,
+        execute=lambda path, offset=None, limit=None: _read_file(
+            path, workspace, offset, limit
+        ),
         read_only=True,
     )

@@ -1,16 +1,16 @@
 from pathlib import Path
 
 from harness.tools.base import Tool
+from harness.tools.workspace import resolve_in_workspace
 
-# Deliberately unconfined until lesson 7 (permissions) and lesson 9 (sandbox).
 
-
-def _write_file(path: str, content: str) -> str:
-    count = Path(path).write_text(content)
+def _write_file(path: str, content: str, workspace: Path | None) -> str:
+    target = resolve_in_workspace(path, workspace)
+    count = target.write_text(content)
     return f"wrote {count} characters to {path}"
 
 
-def write_file_tool() -> Tool:
+def write_file_tool(workspace: Path | None = None) -> Tool:
     return Tool(
         name="write_file",
         description=(
@@ -33,5 +33,5 @@ def write_file_tool() -> Tool:
             },
             "required": ["path", "content"],
         },
-        execute=_write_file,
+        execute=lambda path, content: _write_file(path, content, workspace),
     )

@@ -1,9 +1,11 @@
 import argparse
 import json
+from pathlib import Path
 
 from harness.llm import CodexAdapter
 from harness.loop import run_turn
 from harness.permissions import MODES, PermissionPolicy
+from harness.sandbox import SandboxPolicy, default_sandbox
 from harness.tools.bash import bash_tool
 from harness.tools.list_dir import list_dir_tool
 from harness.tools.read_file import read_file_tool
@@ -28,16 +30,25 @@ def ask_user(name: str, args: dict) -> str:
 def main():
     parser = argparse.ArgumentParser(description="agent-harness REPL")
     parser.add_argument("--mode", choices=MODES, default="default")
+    parser.add_argument(
+        "--workspace",
+        type=Path,
+        default=Path.cwd(),
+        help="root the agent may read/write/run within (default: cwd)",
+    )
     cli_args = parser.parse_args()
+
+    workspace = cli_args.workspace.resolve()
+    sandbox = default_sandbox(SandboxPolicy(workspace))
 
     llm = CodexAdapter()
     tools = {
         tool.name: tool
         for tool in [
-            read_file_tool(),
-            write_file_tool(),
-            list_dir_tool(),
-            bash_tool(),
+            read_file_tool(workspace=workspace),
+            write_file_tool(workspace=workspace),
+            list_dir_tool(workspace=workspace),
+            bash_tool(sandbox=sandbox),
         ]
     }
     policy = PermissionPolicy(cli_args.mode)

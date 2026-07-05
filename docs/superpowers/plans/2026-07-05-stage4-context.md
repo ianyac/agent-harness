@@ -16,8 +16,8 @@ pure transform on the messages list, triggered by a token estimate; the loop
 calls it before each model turn. Both are seams: prompt sections are data,
 the token counter and the compaction summarizer are injectable.
 
-**Tech Stack:** unchanged. Python 3.14, `uv`, `pytest`, no new deps (token
-counting is a cheap heuristic, not `tiktoken` — see decision 3).
+**Tech Stack:** Python 3.14, `uv`, `pytest`, plus `tiktoken` for real token
+counting (added per learner's call, 2026-07-05 — see decision 3).
 
 ## Decisions under review
 
@@ -31,12 +31,17 @@ counting is a cheap heuristic, not `tiktoken` — see decision 3).
    identity, environment (cwd, workspace, OS, date), tool-use guidance. A
    `build_system_prompt(env, extra_sections=[])` function returns the string.
    Sections are data so lesson 15 (skills) can inject skill metadata later.
-3. **Token counting is a heuristic, not a real tokenizer.** `len(text) / 4`
-   as an approximation, behind `estimate_tokens(messages) -> int`. Rationale:
-   a real BPE tokenizer is a heavy dependency and provider-specific; the
-   harness only needs "are we near the limit?", which a 4-chars-per-token
-   estimate answers well enough. The function is swappable if we ever want
-   precision. Named as a deliberate approximation in the lesson.
+3. **Real token counting via `tiktoken`** (learner's call, 2026-07-05,
+   overriding the original `len/4` heuristic). Our backend is
+   OpenAI-compatible (codex/GPT-5.5), so `tiktoken`'s `o200k_base` encoding
+   is the right tokenizer. `count_tokens(messages) -> int` encodes each
+   message's text content and adds the small per-message structural overhead
+   OpenAI's accounting uses (~3–4 tokens/message for role/formatting, per the
+   documented `num_tokens_from_messages` approach), so the count tracks what
+   the provider actually bills — not just raw text length. Still behind a
+   seam (one function) so it stays swappable. Trade-off accepted: a real,
+   compiled dependency, in exchange for accuracy that makes the compaction
+   trigger trustworthy rather than approximate.
 4. **Compaction summarizes the oldest turns, keeps the newest verbatim.**
    `compact(messages, llm, keep_recent=N)`: everything older than the last N
    messages gets replaced by a single summary message (the model summarizes

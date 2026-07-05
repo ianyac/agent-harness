@@ -1,10 +1,13 @@
 import argparse
+import datetime
 import json
+import platform
 from pathlib import Path
 
 from harness.llm import CodexAdapter
 from harness.loop import run_turn
 from harness.permissions import MODES, PermissionPolicy
+from harness.prompts import Environment, build_system_prompt
 from harness.sandbox import SandboxPolicy, default_sandbox
 from harness.tools.bash import bash_tool
 from harness.tools.list_dir import list_dir_tool
@@ -41,6 +44,15 @@ def main():
     workspace = cli_args.workspace.resolve()
     sandbox = default_sandbox(SandboxPolicy(workspace))
 
+    # the one place real-world facts are read; everything below stays pure
+    env = Environment(
+        cwd=str(Path.cwd()),
+        workspace=str(workspace),
+        os=platform.platform(),
+        date=datetime.date.today().isoformat(),
+    )
+    system_prompt = build_system_prompt(env)
+
     llm = CodexAdapter()
     tools = {
         tool.name: tool
@@ -68,6 +80,7 @@ def main():
                 on_tool_call=lambda name, args: print(f"⚙ {name}({json.dumps(args)})"),
                 policy=policy,
                 asker=ask_user,
+                system=system_prompt,
             )
             print("agent:", reply["content"])
         except KeyboardInterrupt:

@@ -32,12 +32,13 @@ def run_turn(
     on_tool_call: Callable[[str, dict], None] | None = None,
     policy: PermissionPolicy | None = None,
     asker: Callable[[str, dict], str] | None = None,
+    system: str | None = None,
 ) -> dict:
     tools = tools or {}
     defs = definitions(tools) or None
     messages.append({"role": "user", "content": user_input})
     for _ in range(max_iterations):
-        reply = llm.complete(messages, tools=defs)
+        reply = llm.complete(messages, tools=defs, system=system)
         messages.append(reply)
         calls = reply.get("tool_calls")
         if not calls:

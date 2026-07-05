@@ -9,7 +9,10 @@ import httpx
 
 class LLMClient(Protocol):
     def complete(
-        self, messages: list[dict], tools: list[dict] | None = None
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        system: str | None = None,
     ) -> dict: ...
 
 
@@ -142,6 +145,28 @@ def to_wire_input(messages: list[dict]) -> list[dict]:
     return items
 
 
+def build_request_body(
+    model: str,
+    instructions: str,
+    messages: list[dict],
+    tools: list[dict] | None = None,
+    system: str | None = None,
+) -> dict:
+    """Pure request assembly, split out so the offline suite can pin it."""
+    body = {
+        "model": model,
+        # per-call system prompt wins outright, even when empty; the
+        # constructor default applies only when none was provided
+        "instructions": system if system is not None else instructions,
+        "input": to_wire_input(messages),
+        "store": False,
+        "stream": True,  # the codex endpoint rejects non-streaming requests
+    }
+    if tools:
+        body["tools"] = to_wire_tools(tools)
+    return body
+
+
 class CodexAdapter:
     def __init__(
         self,
@@ -165,16 +190,15 @@ class CodexAdapter:
             "Accept": "text/event-stream",
         }
 
-    def complete(self, messages: list[dict], tools: list[dict] | None = None) -> dict:
-        body = {
-            "model": self.model,
-            "instructions": self.instructions,
-            "input": to_wire_input(messages),
-            "store": False,
-            "stream": True,  # the codex endpoint rejects non-streaming requests
-        }
-        if tools:
-            body["tools"] = to_wire_tools(tools)
+    def complete(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        system: str | None = None,
+    ) -> dict:
+        body = build_request_body(
+            self.model, self.instructions, messages, tools, system
+        )
         # store=False makes the request idempotent, so a stream that dies
         # mid-way is safely retried from scratch (partials discarded)
         return with_retries(lambda: self._attempt(body))

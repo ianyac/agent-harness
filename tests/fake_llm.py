@@ -10,21 +10,29 @@ class FakeLLM:
 
     Each entry is wrapped into a turn record — a full I/O trace of one
     exchange once played:  {"output": <scripted directive>,
-    "messages": <what was shown>, "tools": <what was offered>}
+    "messages": <what was shown>, "tools": <what was offered>,
+    "system": <the system prompt received>}
     """
 
     def __init__(self, script: list[dict]):
         self.turns = [
-            {"output": entry, "messages": None, "tools": None} for entry in script
+            {"output": entry, "messages": None, "tools": None, "system": None}
+            for entry in script
         ]
         self.current_line = 0
         self._call_counter = 0
 
-    def complete(self, messages: list[dict], tools: list[dict] | None = None) -> dict:
+    def complete(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        system: str | None = None,
+    ) -> dict:
         turn = self.turns[self.current_line]
         self.current_line += 1
         turn["messages"] = deepcopy(messages)
         turn["tools"] = deepcopy(tools)
+        turn["system"] = system
         entry = turn["output"]
         match entry["type"]:
             case "text":

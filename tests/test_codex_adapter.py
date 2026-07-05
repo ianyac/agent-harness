@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from harness.llm import normalize, to_wire_input, to_wire_tools
+from harness.llm import build_request_body, normalize, to_wire_input, to_wire_tools
 
 
 def test_normalize_extracts_a_plain_assistant_message():
@@ -81,3 +81,19 @@ def test_wire_input_translates_a_full_tool_round_trip():
             "content": [{"type": "output_text", "text": "The sum is 3."}],
         },
     ]
+
+
+def test_request_body_uses_default_instructions_when_no_system():
+    body = build_request_body("m", "default instructions", [])
+    assert body["instructions"] == "default instructions"
+
+
+def test_request_body_prefers_the_per_call_system_prompt():
+    body = build_request_body("m", "default instructions", [], system="per-call")
+    assert body["instructions"] == "per-call"
+
+
+def test_request_body_honors_an_explicit_empty_system_prompt():
+    # "" is a provided value, not an absence — it must not fall back
+    body = build_request_body("m", "default instructions", [], system="")
+    assert body["instructions"] == ""

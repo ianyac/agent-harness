@@ -1,10 +1,13 @@
 import argparse
+import datetime
 import json
+import platform
 from pathlib import Path
 
 from harness.llm import CodexAdapter
 from harness.loop import run_turn
 from harness.permissions import MODES, PermissionPolicy
+from harness.prompts import Environment, build_system_prompt
 from harness.sandbox import SandboxPolicy, default_sandbox
 from harness.tools.bash import bash_tool
 from harness.tools.list_dir import list_dir_tool
@@ -25,6 +28,18 @@ def ask_user(name: str, args: dict) -> str:
                 return "always"
             case _:
                 print("  please answer y, n, or a")
+
+
+def current_system_prompt(workspace: Path) -> str:
+    # the one place real-world facts are read; rebuilt each turn so a
+    # session that crosses midnight keeps the right date
+    env = Environment(
+        cwd=str(Path.cwd().resolve()),
+        workspace=str(workspace),
+        os=platform.platform(),
+        date=datetime.date.today().isoformat(),
+    )
+    return build_system_prompt(env)
 
 
 def main():
@@ -68,6 +83,7 @@ def main():
                 on_tool_call=lambda name, args: print(f"⚙ {name}({json.dumps(args)})"),
                 policy=policy,
                 asker=ask_user,
+                system=current_system_prompt(workspace),
             )
             print("agent:", reply["content"])
         except KeyboardInterrupt:

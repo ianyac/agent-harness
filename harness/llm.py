@@ -9,7 +9,10 @@ import httpx
 
 class LLMClient(Protocol):
     def complete(
-        self, messages: list[dict], tools: list[dict] | None = None
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        system: str | None = None,
     ) -> dict: ...
 
 
@@ -165,10 +168,16 @@ class CodexAdapter:
             "Accept": "text/event-stream",
         }
 
-    def complete(self, messages: list[dict], tools: list[dict] | None = None) -> dict:
+    def complete(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        system: str | None = None,
+    ) -> dict:
         body = {
             "model": self.model,
-            "instructions": self.instructions,
+            # per-call system prompt wins; constructor default is the fallback
+            "instructions": system if system is not None else self.instructions,
             "input": to_wire_input(messages),
             "store": False,
             "stream": True,  # the codex endpoint rejects non-streaming requests

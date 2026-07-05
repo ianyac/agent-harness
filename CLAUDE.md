@@ -30,14 +30,22 @@ only inside your lane; read anywhere.
 - Each checkout carries an untracked `.claude/settings.local.json` denying
   writes outside its lane. Recreate it when recreating a worktree.
 
-## Workflow rules (learner-operated)
+## Workflow rules (standing delegation — v3, 2026-07-06)
 
-yc is learning the dev workflow. Sessions do NOT run git/gh/GitHub
-operations (branch, commit, push, PR, merge, tag) unprompted — supply the
-exact command, explain it, and let yc run it. Operations yc has performed
-manually may be delegated when he explicitly asks — and every delegated
-operation must end with a verification command yc runs himself (a
-session's report is a claim, not proof).
+yc focuses on decisions, learning, quizzes, and review. Within a task yc
+has assigned, sessions run branch/stage/commit/push/PR-creation and
+post-merge cleanup (branch deletion, rebase, worktree hop, stash)
+themselves, reporting each operation with a verification command yc may
+spot-check. Per-operation verification is relaxed because the PR gate
+verifies in aggregate: yc reads the full diff and the CI verdict before
+every merge.
+
+Retained by yc, always: PR review, the merge itself, quizzes and tags
+(tag follows quiz, on main's squash commit), approval of constitution
+changes, anything irreversible beyond the repo. Sessions never merge,
+never force-push, never run workflow operations outside an assigned task.
+Operations yc has not yet performed manually still arrive as explained
+runbooks first (manual-first applies to novel ops only).
 
 - `main` is protected: changes land via branch → PR → green CI (`test`) →
   merge. Default merge strategy: squash (check the title box: `<PR title>

@@ -29,8 +29,11 @@ def build_system_prompt(env: Environment, extra_sections: list[str] | None = Non
             "Using tools:\n"
             "- Prefer tools over guessing; read a file before summarizing or "
             "editing it, and list a directory when unsure of a path.\n"
-            "- File and shell access is confined to the workspace root above; "
-            "paths outside it will be refused.\n"
+            "- Relative paths in tool calls resolve against the workspace "
+            "root above, not the working directory.\n"
+            "- File tools refuse paths outside the workspace root. Shell "
+            "commands are blocked from writing outside it where the platform "
+            "supports sandboxing, but may still be able to read elsewhere.\n"
             "- Tool results are the ground truth — trust them over your "
             "assumptions."
         ),

@@ -10,7 +10,8 @@ class FakeLLM:
 
     Each entry is wrapped into a turn record — a full I/O trace of one
     exchange once played:  {"output": <scripted directive>,
-    "messages": <what was shown>, "tools": <what was offered>}
+    "messages": <what was shown>, "tools": <what was offered>,
+    "system": <the system prompt received>}
     """
 
     def __init__(self, script: list[dict]):

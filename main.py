@@ -30,6 +30,18 @@ def ask_user(name: str, args: dict) -> str:
                 print("  please answer y, n, or a")
 
 
+def current_system_prompt(workspace: Path) -> str:
+    # the one place real-world facts are read; rebuilt each turn so a
+    # session that crosses midnight keeps the right date
+    env = Environment(
+        cwd=str(Path.cwd().resolve()),
+        workspace=str(workspace),
+        os=platform.platform(),
+        date=datetime.date.today().isoformat(),
+    )
+    return build_system_prompt(env)
+
+
 def main():
     parser = argparse.ArgumentParser(description="agent-harness REPL")
     parser.add_argument("--mode", choices=MODES, default="default")
@@ -43,15 +55,6 @@ def main():
 
     workspace = cli_args.workspace.resolve()
     sandbox = default_sandbox(SandboxPolicy(workspace))
-
-    # the one place real-world facts are read; everything below stays pure
-    env = Environment(
-        cwd=str(Path.cwd()),
-        workspace=str(workspace),
-        os=platform.platform(),
-        date=datetime.date.today().isoformat(),
-    )
-    system_prompt = build_system_prompt(env)
 
     llm = CodexAdapter()
     tools = {
@@ -80,7 +83,7 @@ def main():
                 on_tool_call=lambda name, args: print(f"⚙ {name}({json.dumps(args)})"),
                 policy=policy,
                 asker=ask_user,
-                system=system_prompt,
+                system=current_system_prompt(workspace),
             )
             print("agent:", reply["content"])
         except KeyboardInterrupt:

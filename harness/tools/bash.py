@@ -1,17 +1,14 @@
 import subprocess
 
+from harness.sandbox import NoSandbox, Sandbox
 from harness.tools.base import Tool
 from harness.truncate import truncate
 
-# Deliberately uncaged: runs arbitrary shell as the process user.
-# Lesson 7 gates it behind permissions; lesson 9 confines it in a sandbox.
 
-
-def _run(command: str, timeout: int, output_limit: int) -> str:
+def _run(command: str, sandbox: Sandbox, timeout: int, output_limit: int) -> str:
     try:
         proc = subprocess.run(
-            command,
-            shell=True,
+            sandbox.wrap(command),  # sandbox decides how the command runs
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -22,7 +19,10 @@ def _run(command: str, timeout: int, output_limit: int) -> str:
     return f"exit code: {proc.returncode}\n{truncate(body, output_limit)}"
 
 
-def bash_tool(timeout: int = 30, output_limit: int = 8000) -> Tool:
+def bash_tool(
+    sandbox: Sandbox | None = None, timeout: int = 30, output_limit: int = 8000
+) -> Tool:
+    sandbox = sandbox or NoSandbox()  # default is uncaged; main.py opts in
     return Tool(
         name="bash",
         description=(
@@ -41,5 +41,5 @@ def bash_tool(timeout: int = 30, output_limit: int = 8000) -> Tool:
             },
             "required": ["command"],
         },
-        execute=lambda command: _run(command, timeout, output_limit),
+        execute=lambda command: _run(command, sandbox, timeout, output_limit),
     )

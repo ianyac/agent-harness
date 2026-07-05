@@ -98,13 +98,35 @@ tool that shells out) via macOS `sandbox-exec`.
 
 ## Lesson 9: Sandboxing
 
-### Task 9.1: bash under sandbox-exec
-- `harness/sandbox.py`: profile builder (workspace write access, /tmp,
-  deny-default writes elsewhere; network deny by default, flag to allow).
-- `bash` tool runs commands via `sandbox-exec -p <profile>`; result string
-  unchanged in shape.
-- Tests: write inside workspace succeeds; write outside → non-zero exit
-  reported in-band; network attempt fails when disabled.
+Design (chosen 2026-07-05): a `Sandbox` seam so the confinement *policy* is
+platform-neutral and testable while OS *enforcement* is one swappable call —
+the `LLMClient` pattern aimed at the OS. Backends built: `MacOSSandbox`
+(sandbox-exec, live-tested), `NoSandbox` (pass-through fallback + unit tests).
+`LinuxSandbox` (bwrap) is a documented `NotImplementedError` stub — building
+an unrunnable/untestable backend would violate the no-unverified-code rule.
+
+### Task 9.1: the Sandbox seam + backends + bash wiring
+- `harness/sandbox.py`:
+  - `Sandbox` Protocol: `wrap(command: str) -> list[str]` (shell command →
+    argv that runs it confined).
+  - `SandboxPolicy(workspace: Path, allow_network: bool = False)` — the
+    platform-neutral confinement policy.
+  - `macos_profile(policy) -> str` — pure function building the sandbox-exec
+    profile string (deny default, allow workspace writes + /tmp, network per
+    flag). Fully unit-tested without invoking the OS.
+  - `MacOSSandbox(policy).wrap(cmd)` → `["sandbox-exec", "-p", profile,
+    "sh", "-c", cmd]`.
+  - `NoSandbox().wrap(cmd)` → `["sh", "-c", cmd]`.
+  - `LinuxSandbox` stub raising `NotImplementedError` with a bwrap TODO.
+  - `default_sandbox(policy)` picks by `sys.platform`.
+- `bash` tool takes an optional `sandbox: Sandbox`; runs `sandbox.wrap(cmd)`
+  via `subprocess.run` (no more `shell=True` — argv comes pre-formed). Result
+  string shape unchanged.
+- Tests: `macos_profile` contents (policy → profile string) cross-platform;
+  `NoSandbox` round-trips a command; bash with `NoSandbox` behaves as today.
+  macOS-only (skipped elsewhere): write inside workspace succeeds; write
+  outside → non-zero exit in-band; network blocked when disabled, allowed
+  when flagged.
 - Review gate, commit.
 
 ### Task 9.2: fs path confinement + stage close
@@ -112,6 +134,21 @@ tool that shells out) via macOS `sandbox-exec`.
   (including `..` and symlink tricks via `Path.resolve`).
 - Live smoke: agent asked to "clean up /tmp" gets refusals it can read.
 - Review gate, quiz, commit, tag `lesson-09`.
+
+## Planned follow-up (deferred, committed 2026-07-05)
+
+**Lesson "9.5": sandbox-first execution + prompt escalation.** Once both
+layers exist independently (this stage), couple them by *escalation*, the
+way Claude Code does: run bash sandboxed-and-silent by default (a contained
+command has bounded blast radius, so no prompt), and only invoke the `asker`
+when a command hits a sandbox wall (needs network, or a write outside the
+workspace). Makes `_permitted` sandbox-aware: try contained → escalate to
+the human only on the genuinely consequential calls. Kills prompt fatigue.
+Pairs naturally with the deferred argument-pattern allowlist (L7 decision 5),
+since both are about prompting the human *less, but smarter*. Deferred
+deliberately: the escalation earns its complexity only once prompt fatigue is
+felt, and it can't be understood until both layers are built and tested alone
+(this stage builds them independent, ANDed — the prerequisite, not a detour).
 
 ## Stage 3 done when
 - Default suite green offline; gated suite green live.

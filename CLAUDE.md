@@ -36,9 +36,10 @@ yc focuses on decisions, learning, quizzes, and review. Within a task yc
 has assigned, sessions run branch/stage/commit/push/PR-creation and
 post-merge cleanup (branch deletion, rebase, worktree hop, stash)
 themselves, reporting each operation with a verification command yc may
-spot-check. Per-operation verification is relaxed because the PR gate
-verifies in aggregate: yc reads the full diff and the CI verdict before
-every merge.
+spot-check. Cleanup belongs to the session that created the PR — whoever
+opens the loop closes it. Per-operation verification is relaxed because
+the PR gate verifies in aggregate: yc reads the full diff and the CI
+verdict before every merge.
 
 Retained by yc, always: PR review, the merge itself, quizzes and tags
 (tag follows quiz, on main's squash commit), approval of constitution

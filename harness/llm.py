@@ -1,7 +1,8 @@
 import json
 import pathlib
+import time
 import uuid
-from typing import Protocol
+from typing import Callable, Protocol
 
 import httpx
 
@@ -13,6 +14,39 @@ class LLMClient(Protocol):
 
 
 CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
+
+RETRYABLE_STATUSES = (429, 500, 502, 503, 504)
+
+
+class RetryableHTTPError(Exception):
+    def __init__(self, status: int, retry_after: float | None = None):
+        super().__init__(f"retryable HTTP {status}")
+        self.status = status
+        self.retry_after = retry_after
+
+
+def with_retries(
+    attempt: Callable[[], dict],
+    max_retries: int = 3,
+    sleep: Callable[[float], None] = time.sleep,
+):
+    """Run attempt(), retrying transient failures with capped backoff.
+
+    Retryable: network-level errors and 429/5xx statuses. Anything else
+    (auth failures, malformed requests) raises immediately — retrying a
+    401 four times just delays the real error message.
+    """
+    for tries_left in range(max_retries, -1, -1):
+        try:
+            return attempt()
+        except (httpx.TransportError, RetryableHTTPError) as error:
+            if tries_left == 0:
+                raise
+            delay = 0.5 * 2 ** (max_retries - tries_left)
+            retry_after = getattr(error, "retry_after", None)
+            if retry_after is not None:
+                delay = max(delay, retry_after)
+            sleep(min(delay, 30.0))
 
 
 def normalize(raw: dict) -> dict:
@@ -141,6 +175,11 @@ class CodexAdapter:
         }
         if tools:
             body["tools"] = to_wire_tools(tools)
+        # store=False makes the request idempotent, so a stream that dies
+        # mid-way is safely retried from scratch (partials discarded)
+        return with_retries(lambda: self._attempt(body))
+
+    def _attempt(self, body: dict) -> dict:
         output_items: list[dict] = []
         final = None
         with httpx.Client(timeout=120) as client:
@@ -150,6 +189,12 @@ class CodexAdapter:
                 headers={**self._headers, "session_id": str(uuid.uuid4())},
                 json=body,
             ) as resp:
+                if resp.status_code in RETRYABLE_STATUSES:
+                    retry_after = resp.headers.get("retry-after")
+                    raise RetryableHTTPError(
+                        resp.status_code,
+                        retry_after=float(retry_after) if retry_after else None,
+                    )
                 if resp.status_code >= 400:
                     detail = resp.read().decode("utf-8", "replace")
                     raise RuntimeError(f"codex HTTP {resp.status_code}: {detail[:500]}")

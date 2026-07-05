@@ -45,6 +45,10 @@ def main():
     while True:
         try:
             user_input = input("You: ")
+        except (EOFError, KeyboardInterrupt):
+            break
+        turn_start = len(messages)
+        try:
             reply = run_turn(
                 messages,
                 user_input,
@@ -55,8 +59,11 @@ def main():
                 asker=ask_user,
             )
             print("agent:", reply["content"])
-        except EOFError:
-            break
+        except KeyboardInterrupt:
+            # drop the half-built exchange: a dangling tool_call in history
+            # would poison every later request
+            del messages[turn_start:]
+            print("\n(turn cancelled — conversation rolled back to last exchange)")
 
 
 if __name__ == "__main__":

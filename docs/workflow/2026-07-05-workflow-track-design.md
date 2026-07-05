@@ -72,8 +72,11 @@ Ownership map (also in CLAUDE.md, which is loaded by every session):
 - **Layered enforcement:** CLAUDE.md states intent → permission denies gate
   the file tools → yc's PR diff review behind protected main is the
   deterministic backstop (catches Bash side-doors and everything else).
-  Hooks (PreToolUse) deliberately deferred to Stage 6, where Claude Code
-  hooks are configured the same week the harness builds its own `hooks.py`.
+  Hooks (PreToolUse) deliberately deferred to Stage 6 — not for lack of
+  value, but because the fences + PR-review backstop already cover the
+  risk, and hooks teach best configured in Claude Code the same week the
+  harness builds its own `hooks.py`: the same fence built twice, once from
+  each side.
 
 ## Cross-stream communication
 
@@ -88,8 +91,8 @@ Ownership map (also in CLAUDE.md, which is loaded by every session):
 
 ## Stage mapping (workflow elements onto the curriculum)
 
-- **W0 — rails (done 2026-07-05):** remote, CI, ruleset, public flip,
-  worktree fleet, fences, first PR.
+- **W0 — rails (2026-07-05):** remote, CI, ruleset, public flip, worktree
+  fleet, fences — done; first PR in flight (the one carrying this doc).
 - **Stage 4 (L10–11):** the PR loop as routine — branch → PR →
   `/code-review` triage → GitHub diff review → merge → tag. Two full reps.
 - **Stage 5 (L12–13):** parallelism — concurrent lesson/ui PRs, deliberate

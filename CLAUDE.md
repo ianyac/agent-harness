@@ -30,23 +30,33 @@ only inside your lane; read anywhere.
 - Each checkout carries an untracked `.claude/settings.local.json` denying
   writes outside its lane. Recreate it when recreating a worktree.
 
-## Workflow rules (standing delegation — v3, 2026-07-06)
+## Workflow rules (full delegation — v4, 2026-07-06)
 
-yc focuses on decisions, learning, quizzes, and review. Within a task yc
-has assigned, sessions run branch/stage/commit/push/PR-creation and
-post-merge cleanup (branch deletion, rebase, worktree hop, stash)
-themselves, reporting each operation with a verification command yc may
-spot-check. Cleanup belongs to the session that created the PR — whoever
-opens the loop closes it. Per-operation verification is relaxed because
-the PR gate verifies in aggregate: yc reads the full diff and the CI
-verdict before every merge.
+yc does judgment only: design decisions, approvals (PR merge,
+constitution changes), quizzes, reading code, reviewing PRs. Everything
+procedural is the sessions' job within an assigned task:
+branch/stage/commit/push/PR-creation, post-merge cleanup (branch
+deletion, worktree hop, prune, stash), and tagging — after yc declares a
+quiz passed, the lesson session tags main's squash commit `lesson-NN`
+and pushes it. Cleanup belongs to the session that created the PR —
+whoever opens the loop closes it. Each operation is reported with a
+verification command yc may spot-check; the PR gate verifies in
+aggregate (yc reads the full diff and CI verdict before every merge).
 
-Retained by yc, always: PR review, the merge itself, quizzes and tags
-(tag follows quiz, on main's squash commit), approval of constitution
-changes, anything irreversible beyond the repo. Sessions never merge,
-never force-push, never run workflow operations outside an assigned task.
-Operations yc has not yet performed manually still arrive as explained
-runbooks first (manual-first applies to novel ops only).
+Operating rhythm (all sessions):
+- Rebase your branch onto main at task start and again before any
+  push or PR.
+- Never rebase, merge, or pull a squash-merged branch — it is a husk;
+  hop to the next branch off `origin/main` and delete it.
+- Conflicts: resolve mechanical ones (imports, adjacent edits) and say
+  so in the op report; escalate semantic ones (both streams changed
+  what a seam means) to yc — that is a decision in conflict clothing.
+- `--force-with-lease` only, only on your own PR branch, only after a
+  mid-PR rebase. Never force-push anything shared.
+
+Hard limits, unchanged: sessions never merge PRs, never run workflow
+operations outside an assigned task, and surface anything irreversible
+beyond the repo before acting.
 
 - `main` is protected: changes land via branch → PR → green CI (`test`) →
   merge. Default merge strategy: squash (check the title box: `<PR title>

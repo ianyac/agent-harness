@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from ui.server.tests.fake_llm import FakeLLM, text_reply, tool_reply
 
 
@@ -20,3 +22,10 @@ def test_tool_reply_shape_matches_harness_expectations():
     assert calls[0]["type"] == "function"
     assert calls[0]["function"]["name"] == "echo"
     assert json.loads(calls[0]["function"]["arguments"]) == {"x": 1}
+
+
+def test_exhausted_replies_raise_a_clear_error():
+    llm = FakeLLM([text_reply("only one")])
+    llm.complete([])
+    with pytest.raises(AssertionError, match="ran out of scripted replies"):
+        llm.complete([])

@@ -10,6 +10,7 @@ from harness.loop import run_turn
 from harness.permissions import MODES, PermissionPolicy
 from harness.prompts import Environment, build_system_prompt
 from harness.sandbox import SandboxPolicy, default_sandbox
+from harness.session import SessionLog
 from harness.tools.agent import agent_tool
 from harness.tools.bash import bash_tool
 from harness.tools.list_dir import list_dir_tool
@@ -91,7 +92,21 @@ def main():
         help="token estimate above which old turns are summarized "
         "(default: 80%% of the model's context window)",
     )
+    parser.add_argument(
+        "--resume",
+        metavar="ID",
+        default=None,
+        help="resume the session with this id (filename stem under .agent/sessions)",
+    )
+    parser.add_argument(
+        "--continue",
+        dest="continue_",
+        action="store_true",
+        help="resume the most recent session in this workspace",
+    )
     cli_args = parser.parse_args()
+    if cli_args.resume and cli_args.continue_:
+        parser.error("--resume and --continue are mutually exclusive")
 
     workspace = cli_args.workspace.resolve()
     if not workspace.is_dir():
@@ -105,11 +120,27 @@ def main():
     # compaction can point at it instead of trusting the summary
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     action_log = workspace / ".agent" / f"actions-{stamp}-{os.getpid()}.jsonl"
+    sessions_dir = workspace / ".agent" / "sessions"
     try:
         action_log.parent.mkdir(exist_ok=True)
         action_log.write_text("")
+        sessions_dir.mkdir(exist_ok=True)
     except OSError as error:
-        parser.error(f"cannot create action log {action_log}: {error}")
+        parser.error(f"cannot prepare {action_log.parent}: {error}")
+
+    if cli_args.continue_:
+        # the stamp prefix makes lexicographic order chronological
+        candidates = sorted(sessions_dir.glob("*.jsonl"))
+        if not candidates:
+            parser.error(f"no sessions to continue in {sessions_dir}")
+        session_path = candidates[-1]
+    elif cli_args.resume:
+        name = cli_args.resume.removesuffix(".jsonl")
+        session_path = sessions_dir / f"{name}.jsonl"
+        if not session_path.exists():
+            parser.error(f"no such session: {session_path}")
+    else:
+        session_path = sessions_dir / f"{stamp}-{os.getpid()}.jsonl"
 
     def record_action(name: str, args: dict) -> None:
         try:
@@ -169,7 +200,31 @@ def main():
         on_tool_call=observe_sub_tool_call,
         compact_threshold=compact_threshold,
     )
-    messages = []
+    session = SessionLog(session_path)
+    try:
+        messages = session.load()
+    except OSError as error:
+        parser.error(f"cannot read session {session_path}: {error}")
+    print(f"(session: {session_path.name})")
+    if messages:
+        print(f"(resumed {len(messages)} messages)")
+
+    def record_turn() -> None:
+        try:
+            session.record_turn(messages)
+        except OSError as error:
+            # persistence is best-effort; it must never kill the session
+            print(f"(session log unavailable: {error})")
+
+    def on_compact(summarized: int) -> None:
+        print(f"[compacted {summarized} messages into a summary]")
+        try:
+            # messages[0] is the freshly spliced-in summary; the cut count
+            # equals what the loop reported
+            session.record_compaction(cut=summarized, summary=messages[0])
+        except OSError as error:
+            print(f"(session log unavailable: {error})")
+
     while True:
         try:
             user_input = input("You: ")
@@ -187,10 +242,11 @@ def main():
                 system=current_system_prompt(workspace),
                 compact_threshold=compact_threshold,
                 keep_recent=KEEP_RECENT,
-                on_compact=lambda n: print(f"[compacted {n} messages into a summary]"),
+                on_compact=on_compact,
                 breadcrumbs=breadcrumb_note,
             )
             print("agent:", reply["content"])
+            record_turn()
         except KeyboardInterrupt:
             # drop the half-built exchange: a dangling tool_call in history
             # would poison every later request. Compaction may have shifted

@@ -8,9 +8,11 @@ import asyncio
 import json
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable
 
 from fastapi import FastAPI, WebSocket
+from fastapi.staticfiles import StaticFiles
 from starlette.websockets import WebSocketDisconnect
 
 from ui.server import events
@@ -185,5 +187,9 @@ def create_app(
             if active_sockets.get(session_id) is ws:
                 sink.detach()
                 del active_sockets[session_id]
+
+    dist = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+    if dist.is_dir():
+        app.mount("/", StaticFiles(directory=dist, html=True), name="frontend")
 
     return app

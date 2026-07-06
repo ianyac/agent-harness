@@ -56,7 +56,34 @@ counting (added per learner's call, 2026-07-05 — see decision 3).
    point can't fall between an assistant `tool_calls` message and its `tool`
    results, or we recreate the dangling-call corruption from lessons 4/8. The
    summarizer snaps the boundary to a safe split point (after a plain
-   assistant message).
+   assistant message) — backward first (keep at least keep_recent), falling
+   forward when tool traffic leaves no boundary there (keep less rather
+   than overflow); a lone leading summary is never re-summarized.
+7. **Breadcrumbs are mechanical and point at a durable action log**
+   (learner's call, 2026-07-06). The model's summary carries judgment
+   sections only (goal, state, decisions, learnings/warnings, unfinished
+   work); `compact()` appends an `[Auto-generated — not summarized]` block
+   from an injected `breadcrumbs` string, so pointers never pass through
+   the summarizer's judgment — and never degrade across repeated
+   compactions. The REPL journals every *executed* tool call (the
+   `on_tool_call` seam fires post-permission-gate, pre-execution) as JSONL
+   to `.agent/actions.jsonl` inside the workspace, truncated at session
+   start, and passes `Action log: <path> (<n> entries)` as the note.
+   Recovery uses the existing tools (bash/read_file) — no dedicated grep
+   tool. Aggregates like "files touched" were dropped: they need per-tool
+   semantics the loop must not have, and they're derivable from the log.
+8. **The default threshold is a fraction of the model's context window**
+   (learner's call, 2026-07-06). `CodexAdapter` carries
+   `context_window` (272k for gpt-5.5 — confirmed by probing the
+   backend's `/codex/models` metadata, which itself models an
+   `auto_compact_token_limit`); `main.py` defaults `--compact-threshold`
+   to 80% of it. The remaining 20% is headroom for output tokens,
+   mid-turn growth (the trigger checks once per turn), and estimate
+   bias. `run_turn` still takes an absolute number — the percentage is
+   policy, computed where the window knowledge lives (the adapter);
+   the loop mechanism stays dumb. Hard-coded rather than fetched: the
+   models route is undocumented and needs a spoofed client_version, so
+   it's provenance for a constant, not a runtime dependency.
 
 ## Lesson 10: The system prompt
 
@@ -96,9 +123,14 @@ counting (added per learner's call, 2026-07-05 — see decision 3).
 
 ### Task 11.2: loop triggers compaction + live smoke
 - `run_turn` (or a wrapper) calls `compact` when `estimate_tokens` exceeds a
-  threshold, before the model turn. Threshold + keep_recent are parameters.
+  threshold, re-checked before every model call in the turn (tool results
+  can balloon the context mid-turn). Threshold + keep_recent are parameters.
 - Observability: an `on_compact` callback (like `on_tool_call`) so the REPL
   can print "[compacted N messages]".
+- `main.py` journals executed tool calls to `.agent/actions.jsonl` via
+  `on_tool_call` (decision 7) and passes the log pointer as `compact`'s
+  `breadcrumbs`. Needs a `.gitignore` entry for `.agent/` — shared file,
+  routed through yc.
 - Live smoke: drive a long conversation past the threshold, confirm it keeps
   working and the model still remembers recent context after a compaction.
 - Review gate, quiz, commit, tag `lesson-11`.

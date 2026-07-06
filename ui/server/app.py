@@ -5,11 +5,15 @@ FakeLLM; __main__.py builds the real deps (CodexAdapter, sandboxed tools).
 """
 
 import asyncio
+import json
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Callable
 
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket
+from starlette.websockets import WebSocketDisconnect
 
+from ui.server import events
 from ui.server.runner import TurnRunner
 from ui.server.store import InMemorySessionStore, Session
 
@@ -99,5 +103,87 @@ def create_app(
             "workspace": deps.workspace,
             "system_prompt": deps.system_prompt(),
         }
+
+    active_sockets: dict[str, WebSocket] = {}
+    # A turn started on one connection must keep running after that
+    # connection drops (protocol requirement), so its worker thread can
+    # outlive the request that spawned it. asyncio.to_thread binds work to
+    # the CURRENT event loop's own default executor; a TestClient websocket
+    # session opens a fresh loop per connection, and closing that loop joins
+    # its default executor's threads — deadlocking if the turn is still
+    # blocked on an unanswered permission from an already-dropped socket.
+    # A pool scoped to the app (not to any one connection's loop) sidesteps
+    # that join entirely.
+    executor = ThreadPoolExecutor()
+
+    async def _drain(queue: asyncio.Queue, ws: WebSocket) -> None:
+        while True:
+            await ws.send_json(await queue.get())
+
+    def _run_turn(runner: TurnRunner, session_id: str, text: str) -> None:
+        runner.run_turn_blocking(text)
+        store.touch(session_id)
+
+    @app.websocket("/api/sessions/{session_id}/ws")
+    async def session_ws(ws: WebSocket, session_id: str) -> None:
+        session = store.get(session_id)
+        if session is None:
+            await ws.accept()
+            await ws.close(code=4404)
+            return
+        await ws.accept()
+        old = active_sockets.pop(session_id, None)
+        if old is not None:
+            await old.close(code=4000)  # latest connection wins
+        active_sockets[session_id] = ws
+
+        runner, sink = get_runner(session)
+        queue: asyncio.Queue = asyncio.Queue()
+        # attach BEFORE snapshotting, and send the snapshot through the
+        # queue: the sender task is the socket's only writer, and any
+        # event racing in lands after the (newer) snapshot anyway —
+        # turn_done self-heals residual drift
+        sink.attach(asyncio.get_running_loop(), queue)
+        queue.put_nowait(
+            events.session_snapshot(
+                list(session.messages),
+                runner.running,
+                runner.pending_permission,
+                runner.streamed_text,
+            )
+        )
+        sender = asyncio.create_task(_drain(queue, ws))
+        try:
+            while True:
+                raw = await ws.receive_text()
+                try:
+                    msg = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue  # malformed: ignore, never crash the socket
+                match msg.get("type"):
+                    case "user_message" if isinstance(msg.get("text"), str):
+                        if runner.try_begin():
+                            asyncio.get_running_loop().run_in_executor(
+                                executor, _run_turn, runner, session_id, msg["text"]
+                            )
+                        else:
+                            sink.push(
+                                events.turn_error("a turn is already running")
+                            )
+                    case "permission_answer" if msg.get("answer") in (
+                        "yes", "no", "always",
+                    ):
+                        runner.answer_permission(msg.get("id"), msg["answer"])
+                    case "cancel":
+                        runner.cancel()
+                    case _:
+                        continue  # unknown type: ignore
+        except WebSocketDisconnect:
+            pass
+        finally:
+            sender.cancel()
+            if active_sockets.get(session_id) is ws:
+                sink.detach()
+                del active_sockets[session_id]
 
     return app

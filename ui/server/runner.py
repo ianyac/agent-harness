@@ -13,6 +13,7 @@ from dataclasses import replace
 from typing import Callable
 
 from harness.loop import run_turn
+from harness.tools.agent import agent_tool
 from harness.tools.base import Tool
 
 from ui.server import events
@@ -25,7 +26,10 @@ class TurnCancelled(Exception):
 class _CancellableLLM:
     """run_turn's llm.complete call sits outside every callback checkpoint;
     wrapping it makes cancel() take effect between model calls — including
-    text-only turns, which otherwise have no checkpoint at all."""
+    text-only turns, which otherwise have no checkpoint at all.
+
+    Forwards only complete(messages, tools, system) — must grow if the
+    LLMClient surface grows (e.g. the future on_text_delta seam)."""
 
     def __init__(self, inner, check: Callable[[], None]):
         self._inner = inner
@@ -66,6 +70,22 @@ class TurnRunner:
         )
         self.messages = messages
         self._tools = {name: self._wrap(tool) for name, tool in tools.items()}
+        if subagent_system_prompt is not None:
+            # snapshot BEFORE inserting: agent_tool filters itself out by
+            # identity, and wrapping would break that check — the copy
+            # guarantees subagents never see an agent tool at all
+            sub_registry = dict(self._tools)
+            agent = agent_tool(
+                self._llm,  # wrapped: subagent model calls honor cancel too
+                sub_registry,
+                policy=policy,
+                asker=self._asker,
+                system=subagent_system_prompt,
+                on_tool_call=self._on_tool_call,
+                compact_threshold=compact_threshold,
+                keep_recent=keep_recent,
+            )
+            self._tools["agent"] = self._wrap(agent)
         self._ids = itertools.count(1)
         self._lock = threading.Lock()
         self.running = False

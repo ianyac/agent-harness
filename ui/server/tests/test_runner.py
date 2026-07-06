@@ -305,3 +305,36 @@ def test_cancel_during_final_tool_execution_cancels_not_completes():
     assert not thread.is_alive()
     assert [e["type"] for e in drain(events_q)][-1] == "turn_cancelled"
     assert messages == []
+
+
+def test_subagent_activity_interleaves_flat():
+    # outer turn delegates; inner turn calls echo once, then answers;
+    # FakeLLM serves outer and inner run_turns from one script, in order
+    llm = FakeLLM([
+        tool_reply(("agent", {"task": "count things"})),   # outer iteration 1
+        tool_reply(("echo", {"x": 2})),                    # inner iteration 1
+        text_reply("sub answer: 2"),                       # inner iteration 2
+        text_reply("the sub said 2"),                      # outer iteration 2
+    ])
+    runner, events_q, messages = make_runner(
+        llm,
+        tools={"echo": echo_tool()},
+        subagent_system_prompt=lambda: "sub system",
+    )
+    run_to_completion(runner, "delegate please")
+    evts = drain(events_q)
+    assert [e["type"] for e in evts] == [
+        "turn_started",
+        "tool_call",      # agent
+        "tool_call",      # echo, inside the sub — flat interleave
+        "tool_result",    # echo
+        "tool_result",    # agent (its final answer as result text)
+        "turn_done",
+    ]
+    assert evts[1]["name"] == "agent"
+    assert evts[4] == {"type": "tool_result", "name": "agent", "result": "sub answer: 2"}
+    # the inner run_turn saw the sub system prompt and a registry sans agent
+    inner_request = llm.requests[1]
+    assert inner_request["system"] == "sub system"
+    assert all(t["function"]["name"] != "agent" for t in inner_request["tools"])
+    assert messages[-1]["content"] == "the sub said 2"

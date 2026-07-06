@@ -36,16 +36,21 @@ export default function App() {
 
   useEffect(() => {
     if (!activeId) return
+    let cancelled = false
     dispatch({ type: 'reset' })
     setSelectedIndex(null)
     const socket = new SessionSocket(wsUrl(activeId), (event) => {
+      if (cancelled) return
       dispatch(event)
       if (event.type === 'turn_error') setRestoredInput(lastSentRef.current)
       if (event.type === 'turn_done') refreshSessions()
     }, setSocketStatus)
     socketRef.current = socket
     socket.connect()
-    return () => socket.close()
+    return () => {
+      cancelled = true
+      socket.close()
+    }
   }, [activeId, refreshSessions])
 
   const createSession = async () => {

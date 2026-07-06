@@ -14,6 +14,8 @@ from harness.tools.list_dir import list_dir_tool
 from harness.tools.read_file import read_file_tool
 from harness.tools.write_file import write_file_tool
 
+KEEP_RECENT = 8  # messages kept verbatim through a compaction
+
 
 def ask_user(name: str, args: dict) -> str:
     print(f"  agent wants to run: {name}({json.dumps(args)})")
@@ -51,10 +53,27 @@ def main():
         default=Path.cwd(),
         help="root the agent may read/write/run within (default: cwd)",
     )
+    parser.add_argument(
+        "--compact-threshold",
+        type=int,
+        default=60_000,
+        help="token estimate above which old turns are summarized",
+    )
     cli_args = parser.parse_args()
 
     workspace = cli_args.workspace.resolve()
     sandbox = default_sandbox(SandboxPolicy(workspace))
+
+    # every executed tool call lands here, fresh per session, so compaction
+    # can point at it instead of trusting the summary to carry the trail
+    action_log = workspace / ".agent" / "actions.jsonl"
+    action_log.parent.mkdir(exist_ok=True)
+    action_log.write_text("")
+
+    def observe_tool_call(name: str, args: dict) -> None:
+        print(f"⚙ {name}({json.dumps(args)})")
+        with action_log.open("a") as log:
+            log.write(json.dumps({"name": name, "args": args}) + "\n")
 
     llm = CodexAdapter()
     tools = {
@@ -73,23 +92,33 @@ def main():
             user_input = input("You: ")
         except (EOFError, KeyboardInterrupt):
             break
-        turn_start = len(messages)
+        entries = action_log.read_text().count("\n")
         try:
             reply = run_turn(
                 messages,
                 user_input,
                 llm,
                 tools=tools,
-                on_tool_call=lambda name, args: print(f"⚙ {name}({json.dumps(args)})"),
+                on_tool_call=observe_tool_call,
                 policy=policy,
                 asker=ask_user,
                 system=current_system_prompt(workspace),
+                compact_threshold=cli_args.compact_threshold,
+                keep_recent=KEEP_RECENT,
+                on_compact=lambda n: print(f"[compacted {n} messages into a summary]"),
+                breadcrumbs=f"Action log: .agent/actions.jsonl ({entries} entries)",
             )
             print("agent:", reply["content"])
         except KeyboardInterrupt:
             # drop the half-built exchange: a dangling tool_call in history
-            # would poison every later request
-            del messages[turn_start:]
+            # would poison every later request. Compaction may have shifted
+            # indices mid-turn, so roll back to the last completed exchange
+            # rather than to a saved position.
+            while messages and not (
+                messages[-1]["role"] == "assistant"
+                and not messages[-1].get("tool_calls")
+            ):
+                messages.pop()
             print("\n(turn cancelled — conversation rolled back to last exchange)")
 
 

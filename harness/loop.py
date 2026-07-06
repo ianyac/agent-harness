@@ -1,6 +1,7 @@
 import json
 from typing import Callable
 
+from harness.compaction import compact, estimate_tokens
 from harness.llm import LLMClient
 from harness.permissions import PermissionPolicy
 from harness.tools.base import Tool, definitions
@@ -33,10 +34,24 @@ def run_turn(
     policy: PermissionPolicy | None = None,
     asker: Callable[[str, dict], str] | None = None,
     system: str | None = None,
+    compact_threshold: int | None = None,
+    keep_recent: int = 8,
+    on_compact: Callable[[int], None] | None = None,
+    breadcrumbs: str | None = None,
 ) -> dict:
     tools = tools or {}
     defs = definitions(tools) or None
     messages.append({"role": "user", "content": user_input})
+    if (
+        compact_threshold is not None
+        and estimate_tokens(messages, defs, system) > compact_threshold
+    ):
+        compacted = compact(messages, llm, keep_recent, breadcrumbs=breadcrumbs)
+        if compacted is not messages:
+            summarized = len(messages) - (len(compacted) - 1)
+            messages[:] = compacted  # in place: the caller owns this list
+            if on_compact is not None:
+                on_compact(summarized)
     for _ in range(max_iterations):
         reply = llm.complete(messages, tools=defs, system=system)
         messages.append(reply)

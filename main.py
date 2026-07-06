@@ -10,7 +10,7 @@ from harness.loop import run_turn
 from harness.permissions import MODES, PermissionPolicy
 from harness.prompts import Environment, build_system_prompt
 from harness.sandbox import SandboxPolicy, default_sandbox
-from harness.session import SessionLog
+from harness.session import SessionLog, lock, unlock
 from harness.tools.agent import agent_tool
 from harness.tools.bash import bash_tool
 from harness.tools.list_dir import list_dir_tool
@@ -23,29 +23,28 @@ KEEP_RECENT = 8  # messages kept verbatim through a compaction
 COMPACT_FRACTION = 0.8
 
 
-def make_asker(actor: str):
-    def ask(name: str, args: dict) -> str:
-        print(f"  {actor} wants to run: {name}({json.dumps(args)})")
-        while True:
-            try:
-                answer = (
-                    input("  allow? [y]es / [n]o / [a]lways for this tool: ")
-                    .strip()
-                    .lower()
-                )
-            except EOFError:
-                return "no"  # Ctrl-D at a prompt is a refusal, not a crash
-            match answer:
-                case "y" | "yes":
-                    return "yes"
-                case "n" | "no":
-                    return "no"
-                case "a" | "always":
-                    return "always"
-                case _:
-                    print("  please answer y, n, or a")
-
-    return ask
+def ask_user(name: str, args: dict) -> str:
+    # only the parent agent ever asks: subagents run in the background and
+    # get denials instead of prompts (plan decision 3, revised)
+    print(f"  agent wants to run: {name}({json.dumps(args)})")
+    while True:
+        try:
+            answer = (
+                input("  allow? [y]es / [n]o / [a]lways for this tool: ")
+                .strip()
+                .lower()
+            )
+        except EOFError:
+            return "no"  # Ctrl-D at a prompt is a refusal, not a crash
+        match answer:
+            case "y" | "yes":
+                return "yes"
+            case "n" | "no":
+                return "no"
+            case "a" | "always":
+                return "always"
+            case _:
+                print("  please answer y, n, or a")
 
 
 def environment(workspace: Path) -> Environment:
@@ -105,7 +104,7 @@ def main():
         help="resume the most recent session in this workspace",
     )
     cli_args = parser.parse_args()
-    if cli_args.resume and cli_args.continue_:
+    if cli_args.resume is not None and cli_args.continue_:
         parser.error("--resume and --continue are mutually exclusive")
 
     workspace = cli_args.workspace.resolve()
@@ -115,39 +114,50 @@ def main():
         parser.error("--compact-threshold must be a positive token count")
     sandbox = default_sandbox(SandboxPolicy(workspace))
 
-    # every executed tool call lands here, one file per session (a second
-    # REPL in the same workspace must not clobber this one's trail), so
-    # compaction can point at it instead of trusting the summary
-    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    action_log = workspace / ".agent" / f"actions-{stamp}-{os.getpid()}.jsonl"
     sessions_dir = workspace / ".agent" / "sessions"
     try:
-        action_log.parent.mkdir(exist_ok=True)
-        action_log.write_text("")
-        sessions_dir.mkdir(exist_ok=True)
+        sessions_dir.mkdir(parents=True, exist_ok=True)
     except OSError as error:
-        parser.error(f"cannot prepare {action_log.parent}: {error}")
+        parser.error(f"cannot prepare {sessions_dir}: {error}")
 
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     if cli_args.continue_:
-        # the stamp prefix makes lexicographic order chronological
-        candidates = sorted(sessions_dir.glob("*.jsonl"))
+        candidates = list(sessions_dir.glob("*.jsonl"))
         if not candidates:
             parser.error(f"no sessions to continue in {sessions_dir}")
-        session_path = candidates[-1]
-    elif cli_args.resume:
+        # most recently used, not most recently created: a resumed old
+        # session must win over a newer-stamped abandoned one
+        session_path = max(candidates, key=lambda p: p.stat().st_mtime)
+    elif cli_args.resume is not None:
         name = cli_args.resume.removesuffix(".jsonl")
+        if not name or Path(name).name != name:
+            parser.error(f"invalid session id: {cli_args.resume!r}")
         session_path = sessions_dir / f"{name}.jsonl"
         if not session_path.exists():
             parser.error(f"no such session: {session_path}")
     else:
         session_path = sessions_dir / f"{stamp}-{os.getpid()}.jsonl"
+    try:
+        lock(session_path)
+    except RuntimeError as error:
+        parser.error(str(error))
 
-    def record_action(name: str, args: dict) -> None:
+    # the action journal is keyed to the session and appended across
+    # resumes, so compaction breadcrumbs written in an earlier process
+    # still point at a log containing those actions
+    action_log = workspace / ".agent" / f"actions-{session_path.stem}.jsonl"
+    try:
+        action_log.touch()
+    except OSError as error:
+        parser.error(f"cannot create action log {action_log}: {error}")
+
+    def record_action(actor: str, name: str, args: dict) -> None:
         try:
             # self-heal: the agent's own tools can delete .agent mid-session
             action_log.parent.mkdir(exist_ok=True)
             with action_log.open("a") as log:
-                log.write(json.dumps({"name": name, "args": args}) + "\n")
+                entry = {"actor": actor, "name": name, "args": args}
+                log.write(json.dumps(entry) + "\n")
         except OSError as error:
             # the journal is observability; it must never kill the session
             print(f"(action log unavailable: {error})")
@@ -165,11 +175,11 @@ def main():
 
     def observe_tool_call(name: str, args: dict) -> None:
         print(f"⚙ {name}({json.dumps(args)})")
-        record_action(name, args)
+        record_action("agent", name, args)
 
     def observe_sub_tool_call(name: str, args: dict) -> None:
         print(f"  ⚙↳ {name}({json.dumps(args)})")
-        record_action(name, args)
+        record_action("subagent", name, args)
 
     llm = CodexAdapter()
     compact_threshold = (
@@ -187,15 +197,12 @@ def main():
         ]
     }
     policy = PermissionPolicy(cli_args.mode)
-    ask_user = make_asker("agent")
-    ask_subagent = make_asker("the subagent")
     # built once: the callable system prompt is re-evaluated per delegation,
     # so the sub's env facts (date, cwd) never go stale anyway
     tools["agent"] = agent_tool(
         llm,
         tools,
         policy=policy,
-        asker=ask_subagent,
         system=lambda: current_subagent_prompt(workspace),
         on_tool_call=observe_sub_tool_call,
         compact_threshold=compact_threshold,
@@ -263,6 +270,10 @@ def main():
                 print(f"\n(turn cancelled — {dropped} unfinished messages dropped)")
             else:
                 print("\n(turn already complete — nothing to roll back)")
+            # an interrupt can land between the reply print and record_turn;
+            # persist whatever completed exchanges the log is still missing
+            record_turn()
+    unlock(session_path)
 
 
 if __name__ == "__main__":

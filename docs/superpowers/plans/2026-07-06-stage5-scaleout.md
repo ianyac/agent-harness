@@ -30,11 +30,19 @@ live in `harness/session.py` as an append-only JSONL event log under
 2. **No recursion, structurally.** The subagent's registry is the parent's
    minus the `agent` tool itself. Not a depth flag to check — a capability
    the inner loop simply doesn't have.
-3. **The sub inherits the parent's safety envelope.** Same sandbox-wrapped
-   tool instances, same `PermissionPolicy` object (session allowlist
-   grants carry over), same asker. Context is isolated; authority is not
-   elevated. `on_tool_call` is forwarded so the REPL can print the sub's
-   tool use with a depth marker.
+3. **Subagents run in the background and never prompt the human**
+   (learner's ruling 2026-07-06, revising the earlier shared-asker
+   design after the lesson-13 review). The sub gets the parent's
+   sandbox-wrapped tools and `PermissionPolicy`, but no asker: a
+   permission decision that would ask resolves to deny, delivered to the
+   sub as an ordinary tool result it reports in its answer. All consent
+   prompts therefore happen at parent level, where the human sees the
+   context they are approving. This closes a consent-scope escalation:
+   delegate a benign-looking task, harvest an "always" at the sub's
+   prompt (which the human mentally scopes to the subtask), then exploit
+   the per-tool, argument-blind grant parent-side. Grants flow down via
+   the shared allowlist; nothing can flow up. `on_tool_call` is still
+   forwarded so the REPL prints the sub's tool use with a depth marker.
 4. **The sub gets its own system prompt through the lesson-10 seam.**
    `build_system_prompt(env, extra_sections=[...])` with a subagent role
    section — the first real customer of `extra_sections` before skills

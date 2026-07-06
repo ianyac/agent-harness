@@ -7,10 +7,12 @@ from harness.tools.base import Tool
 
 _DESCRIPTION = (
     "Delegate a self-contained task to a subagent: a fresh agent with no "
-    "memory of this conversation, the same tools (except this one), and the "
-    "same permissions. It works the task to completion and returns only its "
-    "final answer — use it for exploration or multi-step subtasks whose "
-    "intermediate output would crowd this conversation."
+    "memory of this conversation and the same tools (except this one). It "
+    "runs unattended — it may use read-only tools and anything the user "
+    "already granted, and every other action is denied rather than asked; "
+    "it can never prompt the user. It returns only its final answer — use "
+    "it for exploration or multi-step subtasks whose intermediate output "
+    "would crowd this conversation."
 )
 
 
@@ -21,7 +23,6 @@ def agent_tool(
     # required: the caller must state the sub's authority envelope —
     # None disables the permission gate and has to be an explicit choice
     policy: PermissionPolicy | None,
-    asker: Callable[[str, dict], str] | None,
     system: str | Callable[[], str] | None = None,
     on_tool_call: Callable[[str, dict], None] | None = None,
     max_iterations: int = 20,
@@ -30,9 +31,11 @@ def agent_tool(
 ) -> Tool:
     """A subagent as a plain registry tool: fresh context in, one answer out.
 
-    Context is isolated (the inner run_turn starts on an empty list and only
-    the final reply's text comes back); authority is not elevated (same
-    sandbox-wrapped tools, and whatever policy/asker the caller states).
+    Subagents run in the background and never prompt the human: there is no
+    asker, so permission decisions that would ask resolve to deny, which
+    the sub receives as an ordinary tool result. Consent prompts happen
+    only at parent level, where the human can see what they are approving —
+    grants flow down through the shared policy, and nothing flows up.
     A callable system prompt is evaluated per delegation, so env facts
     never go stale. Note: compact_threshold is forwarded but a sub's
     single-turn transcript has no completed exchange to cut at — its real
@@ -52,7 +55,7 @@ def agent_tool(
             max_iterations=max_iterations,
             on_tool_call=on_tool_call,
             policy=policy,
-            asker=asker,
+            asker=None,  # never interactive: ask-decisions become denials
             system=system() if callable(system) else system,
             compact_threshold=compact_threshold,
             keep_recent=keep_recent,
@@ -83,8 +86,8 @@ def agent_tool(
             "required": ["task"],
         },
         execute=execute,
-        # delegation itself changes nothing; every side effect inside the
-        # sub passes the same permission gate individually
+        # delegation itself changes nothing; the sub's own actions are
+        # gated by the policy (with denial instead of prompting)
         read_only=True,
     )
     return tool

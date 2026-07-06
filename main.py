@@ -66,16 +66,23 @@ def main():
     cli_args = parser.parse_args()
 
     workspace = cli_args.workspace.resolve()
+    if not workspace.is_dir():
+        parser.error(f"workspace is not a directory: {workspace}")
     sandbox = default_sandbox(SandboxPolicy(workspace))
 
     # every executed tool call lands here, fresh per session, so compaction
     # can point at it instead of trusting the summary to carry the trail
     action_log = workspace / ".agent" / "actions.jsonl"
-    action_log.parent.mkdir(exist_ok=True)
+    try:
+        action_log.parent.mkdir(exist_ok=True)
+    except FileExistsError:
+        parser.error(f"{action_log.parent} exists and is not a directory")
     action_log.write_text("")
 
     def observe_tool_call(name: str, args: dict) -> None:
         print(f"⚙ {name}({json.dumps(args)})")
+        # self-heal: the agent's own tools can delete .agent mid-session
+        action_log.parent.mkdir(exist_ok=True)
         with action_log.open("a") as log:
             log.write(json.dumps({"name": name, "args": args}) + "\n")
 
@@ -101,7 +108,7 @@ def main():
             user_input = input("You: ")
         except (EOFError, KeyboardInterrupt):
             break
-        entries = action_log.read_text().count("\n")
+        entries = action_log.read_text().count("\n") if action_log.exists() else 0
         try:
             reply = run_turn(
                 messages,
@@ -115,7 +122,10 @@ def main():
                 compact_threshold=compact_threshold,
                 keep_recent=KEEP_RECENT,
                 on_compact=lambda n: print(f"[compacted {n} messages into a summary]"),
-                breadcrumbs=f"Action log: .agent/actions.jsonl ({entries} entries)",
+                # absolute: read_file resolves against the workspace but
+                # bash resolves against the process cwd — only an absolute
+                # path means the same file to both recovery tools
+                breadcrumbs=f"Action log: {action_log} ({entries} entries)",
             )
             print("agent:", reply["content"])
         except KeyboardInterrupt:
@@ -123,12 +133,17 @@ def main():
             # would poison every later request. Compaction may have shifted
             # indices mid-turn, so roll back to the last completed exchange
             # rather than to a saved position.
+            dropped = 0
             while messages and not (
                 messages[-1]["role"] == "assistant"
                 and not messages[-1].get("tool_calls")
             ):
                 messages.pop()
-            print("\n(turn cancelled — conversation rolled back to last exchange)")
+                dropped += 1
+            if dropped:
+                print(f"\n(turn cancelled — {dropped} unfinished messages dropped)")
+            else:
+                print("\n(turn already complete — nothing to roll back)")
 
 
 if __name__ == "__main__":

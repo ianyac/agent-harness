@@ -1,5 +1,6 @@
 from harness.compaction import DEFAULT_SUMMARY_INSTRUCTION
 from harness.loop import run_turn
+from harness.tools.base import Tool
 from tests.fake_llm import FakeLLM
 
 
@@ -51,6 +52,66 @@ def test_compaction_is_off_by_default():
     llm = FakeLLM([{"type": "text", "content": "reply"}])
     run_turn(messages, "hi", llm)
     assert messages[0]["content"].startswith("question 0")
+
+
+def test_no_compaction_when_history_is_all_tail():
+    # over the threshold but nothing old enough to summarize: the turn must
+    # proceed, on_compact must not fire, and no summarizer call is made
+    # (the single-entry script would crash on a second complete())
+    messages = [
+        {"role": "user", "content": "q1 " + "detail " * 100},
+        {"role": "assistant", "content": "a1 " + "detail " * 100},
+    ]
+    llm = FakeLLM([{"type": "text", "content": "reply"}])
+    compactions = []
+    run_turn(
+        messages,
+        "next",
+        llm,
+        compact_threshold=50,
+        keep_recent=8,
+        on_compact=compactions.append,
+    )
+    assert compactions == []
+    assert messages[0]["content"].startswith("q1")
+
+
+def test_mid_turn_tool_growth_triggers_compaction():
+    # the turn starts under the threshold; a huge tool result pushes it
+    # over between iterations, and the re-check compacts before the next
+    # model call — keeping the in-flight tool exchange intact
+    messages = []
+    for i in range(3):
+        messages.append({"role": "user", "content": f"q{i}"})
+        messages.append({"role": "assistant", "content": f"a{i}"})
+    dump = Tool(
+        name="dump",
+        description="Returns a huge payload, for tests.",
+        parameters={"type": "object", "properties": {}},
+        execute=lambda: "x " * 3000,
+    )
+    llm = FakeLLM(
+        [
+            {"type": "tool_calls", "calls": [{"name": "dump", "arguments": {}}]},
+            {"type": "text", "content": "SUMMARY"},
+            {"type": "text", "content": "done"},
+        ]
+    )
+    compactions = []
+    reply = run_turn(
+        messages,
+        "go",
+        llm,
+        tools={"dump": dump},
+        compact_threshold=2_000,
+        keep_recent=2,
+        on_compact=compactions.append,
+    )
+    assert compactions == [6]
+    assert llm.turns[1]["messages"][-1]["content"] == DEFAULT_SUMMARY_INSTRUCTION
+    assert reply["content"] == "done"
+    # the in-flight exchange survived the mid-turn cut as a pair
+    assert messages[2].get("tool_calls") and messages[3]["role"] == "tool"
 
 
 def test_breadcrumbs_reach_the_summary_message():

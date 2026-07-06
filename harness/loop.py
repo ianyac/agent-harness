@@ -42,17 +42,19 @@ def run_turn(
     tools = tools or {}
     defs = definitions(tools) or None
     messages.append({"role": "user", "content": user_input})
-    if (
-        compact_threshold is not None
-        and estimate_tokens(messages, defs, system) > compact_threshold
-    ):
-        compacted = compact(messages, llm, keep_recent, breadcrumbs=breadcrumbs)
-        if compacted is not messages:
-            summarized = len(messages) - (len(compacted) - 1)
-            messages[:] = compacted  # in place: the caller owns this list
-            if on_compact is not None:
-                on_compact(summarized)
     for _ in range(max_iterations):
+        # re-checked every iteration: tool results can balloon the context
+        # mid-turn, long after the turn-start estimate looked safe
+        if (
+            compact_threshold is not None
+            and estimate_tokens(messages, defs, system) > compact_threshold
+        ):
+            compacted = compact(messages, llm, keep_recent, breadcrumbs=breadcrumbs)
+            if compacted is not messages:
+                summarized = len(messages) - (len(compacted) - 1)
+                messages[:] = compacted  # in place: the caller owns this list
+                if on_compact is not None:
+                    on_compact(summarized)
         reply = llm.complete(messages, tools=defs, system=system)
         messages.append(reply)
         calls = reply.get("tool_calls")

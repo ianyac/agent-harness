@@ -86,6 +86,80 @@ def test_no_breadcrumb_note_by_default():
     assert result[0] == {"role": "assistant", "content": "SUMMARY"}
 
 
+def test_cut_falls_forward_when_the_tail_owns_the_only_boundary():
+    # one tool-heavy turn: the only plain assistant reply sits inside any
+    # keep_recent window — backward snapping alone would strand the
+    # session over threshold forever
+    messages = [{"role": "user", "content": "q1"}]
+    for i in range(5):
+        messages += [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": f"call_{i}",
+                        "type": "function",
+                        "function": {"name": "noop", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": f"call_{i}", "content": "ok"},
+        ]
+    messages.append({"role": "assistant", "content": "a1"})
+    messages.append({"role": "user", "content": "q2"})
+    llm = FakeLLM([{"type": "text", "content": "SUMMARY"}])
+    result = compact(messages, llm, keep_recent=8)
+    # kept fewer than keep_recent: everything before q2 got summarized
+    assert result == [{"role": "assistant", "content": "SUMMARY"}, messages[-1]]
+
+
+def test_a_lone_leading_summary_is_never_resummarized():
+    # guard against the re-summarization loop: [old summary] + a tail with
+    # no other boundary must be left alone, not squeezed again
+    messages = [{"role": "assistant", "content": "OLD SUMMARY"}]
+    messages.append({"role": "user", "content": "q " * 200})
+    for i in range(4):
+        messages += [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": f"call_{i}",
+                        "type": "function",
+                        "function": {"name": "noop", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": f"call_{i}", "content": "x " * 200},
+        ]
+    result = compact(messages, FakeLLM([]), keep_recent=8)
+    assert result is messages
+
+
+def test_summarizer_without_text_aborts_the_compaction():
+    messages = exchange("q1", "a1") + exchange("q2", "a2") + exchange("q3", "a3")
+    # the summarizer misbehaves with a spurious tool call instead of text
+    llm = FakeLLM([{"type": "tool_calls", "calls": [{"name": "noop", "arguments": {}}]}])
+    result = compact(messages, llm, keep_recent=2)
+    assert result is messages
+
+
+def test_summarizer_sees_truncated_content():
+    big = "x " * 5000
+    messages = exchange("q1", "a1") + [
+        {"role": "user", "content": "q2"},
+        {"role": "assistant", "content": big},
+    ] + exchange("q3", "a3")
+    llm = FakeLLM([{"type": "text", "content": "SUMMARY"}])
+    compact(messages, llm, keep_recent=2)
+    sent = llm.turns[0]["messages"]
+    assert "chars truncated" in sent[3]["content"]
+    # truncation applies to the summarizer's copy only — never the history
+    assert messages[3]["content"] == big
+
+
 def test_short_conversation_is_returned_unchanged():
     messages = exchange("q1", "a1")
     # an empty-scripted FakeLLM would crash if the summarizer ran
@@ -97,6 +171,12 @@ def test_no_safe_cut_means_no_compaction():
     messages = tool_exchange("q1", "a1")
     result = compact(messages, FakeLLM([]), keep_recent=2)
     assert result is messages
+
+
+def test_token_estimate_tolerates_special_token_literals():
+    # tiktoken's default rejects special tokens; content is data, not control
+    messages = [{"role": "user", "content": "the corpus ends with <|endoftext|>"}]
+    assert estimate_tokens(messages) > 0
 
 
 def test_token_estimate_grows_with_content():

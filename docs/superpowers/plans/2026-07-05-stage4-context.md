@@ -56,7 +56,9 @@ counting (added per learner's call, 2026-07-05 — see decision 3).
    point can't fall between an assistant `tool_calls` message and its `tool`
    results, or we recreate the dangling-call corruption from lessons 4/8. The
    summarizer snaps the boundary to a safe split point (after a plain
-   assistant message).
+   assistant message) — backward first (keep at least keep_recent), falling
+   forward when tool traffic leaves no boundary there (keep less rather
+   than overflow); a lone leading summary is never re-summarized.
 7. **Breadcrumbs are mechanical and point at a durable action log**
    (learner's call, 2026-07-06). The model's summary carries judgment
    sections only (goal, state, decisions, learnings/warnings, unfinished
@@ -121,7 +123,8 @@ counting (added per learner's call, 2026-07-05 — see decision 3).
 
 ### Task 11.2: loop triggers compaction + live smoke
 - `run_turn` (or a wrapper) calls `compact` when `estimate_tokens` exceeds a
-  threshold, before the model turn. Threshold + keep_recent are parameters.
+  threshold, re-checked before every model call in the turn (tool results
+  can balloon the context mid-turn). Threshold + keep_recent are parameters.
 - Observability: an `on_compact` callback (like `on_tool_call`) so the REPL
   can print "[compacted N messages]".
 - `main.py` journals executed tool calls to `.agent/actions.jsonl` via

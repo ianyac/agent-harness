@@ -107,6 +107,32 @@ def test_malformed_messages_are_ignored():
         collect_until(ws, "turn_done")
 
 
+def test_second_connection_supersedes_first():
+    # Implementation note: since `client` here isn't used as a context
+    # manager, each `websocket_connect()` gets its own anyio portal (its own
+    # thread + event loop) — see starlette.testclient.TestClient._portal_factory.
+    # So connection A and connection B run on genuinely different event
+    # loops, and the supersede code (`await old.close(code=4000)`) executes
+    # on B's loop against a WebSocket object built on A's loop. As with
+    # test_unknown_session_closes_4404, the close surfaces to A as a
+    # WebSocketDisconnect on its next receive_json() rather than a JSON
+    # close frame.
+    deps = make_deps([text_reply("hi")])
+    client = TestClient(create_app(deps))
+    sid = client.post("/api/sessions").json()["id"]
+    with client.websocket_connect(f"/api/sessions/{sid}/ws") as ws_a:
+        ws_a.receive_json()  # snapshot
+        with client.websocket_connect(f"/api/sessions/{sid}/ws") as ws_b:
+            ws_b.receive_json()  # snapshot
+            with pytest.raises(WebSocketDisconnect) as exc_info:
+                ws_a.receive_json()
+            assert exc_info.value.code == 4000
+
+            ws_b.send_json({"type": "user_message", "text": "hello"})
+            done = collect_until(ws_b, "turn_done")
+            assert done["messages"][-1]["content"] == "hi"
+
+
 def test_reconnect_snapshot_carries_pending_permission():
     side_effect = Tool(
         name="touchy",

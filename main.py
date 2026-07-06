@@ -15,6 +15,9 @@ from harness.tools.read_file import read_file_tool
 from harness.tools.write_file import write_file_tool
 
 KEEP_RECENT = 8  # messages kept verbatim through a compaction
+# fraction of the model's context window that triggers compaction; the rest
+# is headroom for output tokens, mid-turn growth, and estimate bias
+COMPACT_FRACTION = 0.8
 
 
 def ask_user(name: str, args: dict) -> str:
@@ -56,8 +59,9 @@ def main():
     parser.add_argument(
         "--compact-threshold",
         type=int,
-        default=60_000,
-        help="token estimate above which old turns are summarized",
+        default=None,
+        help="token estimate above which old turns are summarized "
+        "(default: 80%% of the model's context window)",
     )
     cli_args = parser.parse_args()
 
@@ -76,6 +80,11 @@ def main():
             log.write(json.dumps({"name": name, "args": args}) + "\n")
 
     llm = CodexAdapter()
+    compact_threshold = (
+        cli_args.compact_threshold
+        if cli_args.compact_threshold is not None
+        else int(COMPACT_FRACTION * llm.context_window)
+    )
     tools = {
         tool.name: tool
         for tool in [
@@ -103,7 +112,7 @@ def main():
                 policy=policy,
                 asker=ask_user,
                 system=current_system_prompt(workspace),
-                compact_threshold=cli_args.compact_threshold,
+                compact_threshold=compact_threshold,
                 keep_recent=KEEP_RECENT,
                 on_compact=lambda n: print(f"[compacted {n} messages into a summary]"),
                 breadcrumbs=f"Action log: .agent/actions.jsonl ({entries} entries)",

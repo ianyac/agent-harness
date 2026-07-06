@@ -172,9 +172,13 @@ class CodexAdapter:
         self,
         model: str = "gpt-5.5",
         instructions: str = "You are a helpful assistant.",
+        # gpt-5.5, per the backend's /codex/models metadata (probed 2026-07-06);
+        # not queryable at request time, so it rides as adapter knowledge
+        context_window: int = 272_000,
     ):
         self.model = model
         self.instructions = instructions
+        self.context_window = context_window
         auth = pathlib.Path.home() / ".codex" / "auth.json"
         try:
             tokens = json.loads(auth.read_text())["tokens"]

@@ -70,6 +70,18 @@ counting (added per learner's call, 2026-07-05 — see decision 3).
    Recovery uses the existing tools (bash/read_file) — no dedicated grep
    tool. Aggregates like "files touched" were dropped: they need per-tool
    semantics the loop must not have, and they're derivable from the log.
+8. **The default threshold is a fraction of the model's context window**
+   (learner's call, 2026-07-06). `CodexAdapter` carries
+   `context_window` (272k for gpt-5.5 — confirmed by probing the
+   backend's `/codex/models` metadata, which itself models an
+   `auto_compact_token_limit`); `main.py` defaults `--compact-threshold`
+   to 80% of it. The remaining 20% is headroom for output tokens,
+   mid-turn growth (the trigger checks once per turn), and estimate
+   bias. `run_turn` still takes an absolute number — the percentage is
+   policy, computed where the window knowledge lives (the adapter);
+   the loop mechanism stays dumb. Hard-coded rather than fetched: the
+   models route is undocumented and needs a spoofed client_version, so
+   it's provenance for a constant, not a runtime dependency.
 
 ## Lesson 10: The system prompt
 

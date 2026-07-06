@@ -1,15 +1,15 @@
 import type { Message, PermissionRequest, ServerEvent } from '../types/events'
 
 export type TranscriptItem =
-  | { kind: 'user'; text: string; message?: Message }
-  | { kind: 'assistant'; text: string; streaming: boolean; message?: Message }
+  | { kind: 'user'; text: string; message?: Message; key: string }
+  | { kind: 'assistant'; text: string; streaming: boolean; message?: Message; key: string }
   | { kind: 'tool'; name: string; args: Record<string, unknown>;
-      result: string | null; message?: Message }
+      result: string | null; message?: Message; key: string }
   | { kind: 'permission'; id: string; name: string;
       args: Record<string, unknown>; answer: string | null; message?: undefined;
-      anchor?: number }
-  | { kind: 'compaction'; summarized: number; message?: undefined; anchor?: number }
-  | { kind: 'notice'; text: string; message?: undefined; anchor?: number }
+      anchor?: number; key: string }
+  | { kind: 'compaction'; summarized: number; message?: undefined; anchor?: number; key: string }
+  | { kind: 'notice'; text: string; message?: undefined; anchor?: number; key: string }
 
 export interface SessionState {
   items: TranscriptItem[]
@@ -18,6 +18,7 @@ export interface SessionState {
   pendingPermission: PermissionRequest | null
   turnStartIndex: number
   lastError: string | null
+  nextKey: number
 }
 
 export type Action =
@@ -33,14 +34,15 @@ export const initialState: SessionState = {
   pendingPermission: null,
   turnStartIndex: 0,
   lastError: null,
+  nextKey: 0,
 }
 
 export function buildItemsFromMessages(messages: Message[]): TranscriptItem[] {
   const items: TranscriptItem[] = []
   const toolItemsByCallId = new Map<string, Extract<TranscriptItem, { kind: 'tool' }>>()
-  for (const message of messages) {
+  messages.forEach((message, messageIndex) => {
     if (message.role === 'user' && typeof message.content === 'string') {
-      items.push({ kind: 'user', text: message.content, message })
+      items.push({ kind: 'user', text: message.content, message, key: `msg-${messageIndex}` })
     } else if (message.role === 'assistant') {
       const calls = (message.tool_calls ?? []) as Array<{
         id: string; function: { name: string; arguments: string }
@@ -52,18 +54,20 @@ export function buildItemsFromMessages(messages: Message[]): TranscriptItem[] {
           args: safeParse(call.function.arguments),
           result: null,
           message,
+          key: `msg-${messageIndex}-${call.id}`,
         }
         toolItemsByCallId.set(call.id, item)
         items.push(item)
       }
       if (typeof message.content === 'string' && message.content) {
-        items.push({ kind: 'assistant', text: message.content, streaming: false, message })
+        items.push({ kind: 'assistant', text: message.content, streaming: false, message,
+          key: `msg-${messageIndex}` })
       }
     } else if (message.role === 'tool') {
       const item = toolItemsByCallId.get(message.tool_call_id as string)
       if (item) item.result = String(message.content ?? '')
     }
-  }
+  })
   return items
 }
 
@@ -129,12 +133,15 @@ export function reducer(state: SessionState, action: Action): SessionState {
       return initialState
     case 'session_snapshot': {
       const items = buildItemsFromMessages(action.messages)
+      let nextKey = 0
       if (action.streamed_text) {
-        items.push({ kind: 'assistant', text: action.streamed_text, streaming: true })
+        items.push({ kind: 'assistant', text: action.streamed_text, streaming: true,
+          key: `live-${nextKey}` })
+        nextKey += 1
       }
       if (action.pending_permission) {
         items.push({ ...action.pending_permission, kind: 'permission', answer: null,
-          anchor: messageBackedCount(items) })
+          anchor: messageBackedCount(items), key: action.pending_permission.id })
       }
       return {
         items,
@@ -143,15 +150,17 @@ export function reducer(state: SessionState, action: Action): SessionState {
         pendingPermission: action.pending_permission,
         turnStartIndex: items.length,
         lastError: null,
+        nextKey,
       }
     }
     case 'local_user_message':
       return {
         ...state,
         turnStartIndex: state.items.length,
-        items: [...state.items, { kind: 'user', text: action.text }],
+        items: [...state.items, { kind: 'user', text: action.text, key: `live-${state.nextKey}` }],
         turnRunning: true,
         lastError: null,
+        nextKey: state.nextKey + 1,
       }
     case 'turn_started':
       return { ...state, turnRunning: true }
@@ -163,14 +172,18 @@ export function reducer(state: SessionState, action: Action): SessionState {
       }
       return {
         ...state,
-        items: [...state.items, { kind: 'assistant', text: action.text, streaming: true }],
+        items: [...state.items,
+          { kind: 'assistant', text: action.text, streaming: true, key: `live-${state.nextKey}` }],
+        nextKey: state.nextKey + 1,
       }
     }
     case 'tool_call':
       return {
         ...state,
         items: [...closeStream(state.items),
-          { kind: 'tool', name: action.name, args: action.args, result: null }],
+          { kind: 'tool', name: action.name, args: action.args, result: null,
+            key: `live-${state.nextKey}` }],
+        nextKey: state.nextKey + 1,
       }
     case 'tool_result': {
       const items = [...state.items]
@@ -188,7 +201,8 @@ export function reducer(state: SessionState, action: Action): SessionState {
         ...state,
         items: [...closeStream(state.items),
           { kind: 'permission', id: action.id, name: action.name,
-            args: action.args, answer: null, anchor: messageBackedCount(state.items) }],
+            args: action.args, answer: null, anchor: messageBackedCount(state.items),
+            key: action.id }],
         pendingPermission: { id: action.id, name: action.name, args: action.args },
       }
     case 'local_permission_answer':
@@ -206,7 +220,8 @@ export function reducer(state: SessionState, action: Action): SessionState {
         ...state,
         items: [...closeStream(state.items),
           { kind: 'compaction', summarized: action.summarized,
-            anchor: messageBackedCount(state.items) }],
+            anchor: messageBackedCount(state.items), key: `live-${state.nextKey}` }],
+        nextKey: state.nextKey + 1,
       }
     case 'turn_done': {
       // The backend sends the FULL authoritative message list at turn_done
@@ -235,9 +250,11 @@ export function reducer(state: SessionState, action: Action): SessionState {
       return {
         ...state,
         items: [...prefix,
-          { kind: 'notice', text: 'turn cancelled', anchor: messageBackedCount(prefix) }],
+          { kind: 'notice', text: 'turn cancelled', anchor: messageBackedCount(prefix),
+            key: `live-${state.nextKey}` }],
         turnRunning: false,
         pendingPermission: null,
+        nextKey: state.nextKey + 1,
       }
     }
     case 'turn_error': {
@@ -246,10 +263,11 @@ export function reducer(state: SessionState, action: Action): SessionState {
         ...state,
         items: [...prefix,
           { kind: 'notice', text: `turn failed: ${action.message}`,
-            anchor: messageBackedCount(prefix) }],
+            anchor: messageBackedCount(prefix), key: `live-${state.nextKey}` }],
         turnRunning: false,
         pendingPermission: null,
         lastError: action.message,
+        nextKey: state.nextKey + 1,
       }
     }
     default:

@@ -183,6 +183,30 @@ describe('reducer', () => {
     expect(state.items[3]).toMatchObject({ summarized: 3 })
   })
 
+  it('stable keys: unique across a live turn, permission key unchanged through turn_done', () => {
+    const authoritative: Message[] = [
+      { role: 'user', content: 'do it' },
+      toolCallMessage,
+      toolResultMessage,
+      { role: 'assistant', content: 'all done' },
+    ]
+    const afterAnswer = play([
+      { type: 'local_user_message', text: 'do it' },
+      { type: 'permission_request', id: 'perm-1', name: 'echo', args: { x: 1 } },
+      { type: 'local_permission_answer', id: 'perm-1', answer: 'yes' },
+    ])
+    const permBefore = afterAnswer.items.find((i) => i.kind === 'permission')
+    const state = play([
+      { type: 'tool_call', name: 'echo', args: { x: 1 } },
+      { type: 'tool_result', name: 'echo', result: 'echo:1' },
+      { type: 'turn_done', messages: authoritative },
+    ], afterAnswer)
+    const keys = state.items.map((i) => i.key)
+    expect(new Set(keys).size).toBe(keys.length)
+    const permAfter = state.items.find((i) => i.kind === 'permission')
+    expect(permAfter?.key).toBe(permBefore?.key)
+  })
+
   it('reconnect then finish: exactly one assistant item, no duplicate stub', () => {
     const userMsg: Message = { role: 'user', content: 'question' }
     const state = play([

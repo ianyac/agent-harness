@@ -119,3 +119,78 @@ def test_try_begin_rejects_second_claim():
     assert runner.try_begin() is False
     runner.run_turn_blocking("hello")
     assert runner.try_begin() is True  # slot free again after the turn
+
+
+def run_on_thread(runner, text):
+    assert runner.try_begin()
+    thread = threading.Thread(target=runner.run_turn_blocking, args=(text,))
+    thread.start()
+    return thread
+
+
+def test_permission_yes_runs_the_tool():
+    llm = FakeLLM([tool_reply(("echo", {"x": 1})), text_reply("ok")])
+    runner, events_q, _ = make_runner(
+        llm,
+        tools={"echo": echo_tool(read_only=False)},
+        policy=PermissionPolicy("default"),
+    )
+    thread = run_on_thread(runner, "go")
+    request = wait_for(events_q, "permission_request")
+    assert request["name"] == "echo" and runner.pending_permission["id"] == request["id"]
+    runner.answer_permission(request["id"], "yes")
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    types = [e["type"] for e in drain(events_q)]
+    assert "tool_call" in types and "tool_result" in types and "turn_done" in types
+    assert runner.pending_permission is None
+
+
+def test_permission_no_denies_without_running():
+    executed = []
+    tool = Tool(
+        name="touchy",
+        description="side effect",
+        parameters={"type": "object", "properties": {}},
+        execute=lambda: executed.append(True) or "did it",
+        read_only=False,
+    )
+    llm = FakeLLM([tool_reply(("touchy", {})), text_reply("understood")])
+    runner, events_q, messages = make_runner(
+        llm, tools={"touchy": tool}, policy=PermissionPolicy("default")
+    )
+    thread = run_on_thread(runner, "go")
+    request = wait_for(events_q, "permission_request")
+    runner.answer_permission(request["id"], "no")
+    thread.join(timeout=5)
+    assert executed == []
+    assert any(
+        m.get("role") == "tool" and "Permission denied" in m["content"]
+        for m in messages
+    )
+    assert [e["type"] for e in drain(events_q)][-1] == "turn_done"
+
+
+def test_permission_always_skips_second_prompt():
+    llm = FakeLLM([
+        tool_reply(("echo", {"x": 1})),
+        tool_reply(("echo", {"x": 2})),
+        text_reply("done"),
+    ])
+    runner, events_q, _ = make_runner(
+        llm,
+        tools={"echo": echo_tool(read_only=False)},
+        policy=PermissionPolicy("default"),
+    )
+    thread = run_on_thread(runner, "go")
+    request = wait_for(events_q, "permission_request")
+    runner.answer_permission(request["id"], "always")
+    thread.join(timeout=5)
+    remaining = [e["type"] for e in drain(events_q)]
+    assert remaining.count("permission_request") == 0  # allowlisted after "always"
+    assert remaining.count("tool_result") == 2
+
+
+def test_stale_permission_answer_is_ignored():
+    runner, _, _ = make_runner(FakeLLM([text_reply("hi")]))
+    runner.answer_permission("perm-999", "yes")  # nothing pending: no crash

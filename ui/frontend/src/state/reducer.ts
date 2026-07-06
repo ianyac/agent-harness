@@ -6,9 +6,10 @@ export type TranscriptItem =
   | { kind: 'tool'; name: string; args: Record<string, unknown>;
       result: string | null; message?: Message }
   | { kind: 'permission'; id: string; name: string;
-      args: Record<string, unknown>; answer: string | null; message?: undefined }
-  | { kind: 'compaction'; summarized: number; message?: undefined }
-  | { kind: 'notice'; text: string; message?: undefined }
+      args: Record<string, unknown>; answer: string | null; message?: undefined;
+      anchor?: number }
+  | { kind: 'compaction'; summarized: number; message?: undefined; anchor?: number }
+  | { kind: 'notice'; text: string; message?: undefined; anchor?: number }
 
 export interface SessionState {
   items: TranscriptItem[]
@@ -82,6 +83,46 @@ function closeStream(items: TranscriptItem[]): TranscriptItem[] {
   return items
 }
 
+// Number of message-backed items (user/assistant/tool) present in `items`.
+// Used to anchor live-only items (permission/compaction/notice) to a position
+// in the authoritative message list, since that list's length isn't a stable
+// boundary once compaction can shrink it.
+function messageBackedCount(items: TranscriptItem[]): number {
+  return items.filter((item) =>
+    item.kind === 'user' || item.kind === 'assistant' || item.kind === 'tool').length
+}
+
+type EphemeralItem = Extract<TranscriptItem, { kind: 'permission' | 'compaction' | 'notice' }>
+
+function isEphemeral(item: TranscriptItem): item is EphemeralItem {
+  return item.kind === 'permission' || item.kind === 'compaction' || item.kind === 'notice'
+}
+
+// Re-interleave live-only items into a freshly rebuilt message-backed list,
+// using each live-only item's anchor (the message-backed count at the time
+// it was appended) to place it back at the equivalent position. Items whose
+// anchor is beyond the rebuilt list's length (e.g. a compaction divider
+// whose messages were summarized away) land at the end.
+function reinterleave(rebuilt: TranscriptItem[], ephemeral: EphemeralItem[]): TranscriptItem[] {
+  const merged: TranscriptItem[] = []
+  let ephemeralIndex = 0
+  let count = 0
+  for (const item of rebuilt) {
+    while (ephemeralIndex < ephemeral.length
+      && (ephemeral[ephemeralIndex].anchor ?? Infinity) <= count) {
+      merged.push(ephemeral[ephemeralIndex])
+      ephemeralIndex++
+    }
+    merged.push(item)
+    count++
+  }
+  while (ephemeralIndex < ephemeral.length) {
+    merged.push(ephemeral[ephemeralIndex])
+    ephemeralIndex++
+  }
+  return merged
+}
+
 export function reducer(state: SessionState, action: Action): SessionState {
   switch (action.type) {
     case 'reset':
@@ -92,7 +133,8 @@ export function reducer(state: SessionState, action: Action): SessionState {
         items.push({ kind: 'assistant', text: action.streamed_text, streaming: true })
       }
       if (action.pending_permission) {
-        items.push({ ...action.pending_permission, kind: 'permission', answer: null })
+        items.push({ ...action.pending_permission, kind: 'permission', answer: null,
+          anchor: messageBackedCount(items) })
       }
       return {
         items,
@@ -146,7 +188,7 @@ export function reducer(state: SessionState, action: Action): SessionState {
         ...state,
         items: [...closeStream(state.items),
           { kind: 'permission', id: action.id, name: action.name,
-            args: action.args, answer: null }],
+            args: action.args, answer: null, anchor: messageBackedCount(state.items) }],
         pendingPermission: { id: action.id, name: action.name, args: action.args },
       }
     case 'local_permission_answer':
@@ -163,50 +205,53 @@ export function reducer(state: SessionState, action: Action): SessionState {
       return {
         ...state,
         items: [...closeStream(state.items),
-          { kind: 'compaction', summarized: action.summarized }],
+          { kind: 'compaction', summarized: action.summarized,
+            anchor: messageBackedCount(state.items) }],
       }
     case 'turn_done': {
-      // Rebuild this turn's message-backed items straight from the
-      // authoritative transcript (the diff since the last turn_done),
-      // rather than trying to patch the live, delta-built items in place —
-      // that keeps assistant text/tool pairing correct even in degraded
-      // mode, where no deltas/tool events streamed in before turn_done.
-      // Ephemeral items (permission/compaction/notice) have no message
-      // backing, so they're carried over as-is.
-      const ephemeral = state.items
-        .slice(state.turnStartIndex)
-        .filter((item) =>
-          item.kind === 'permission' || item.kind === 'compaction' || item.kind === 'notice')
-      const newMessages = action.messages.slice(state.rawMessages.length)
+      // The backend sends the FULL authoritative message list at turn_done
+      // (not just this turn's diff), because mid-turn compaction can make it
+      // shorter than rawMessages — a length-based boundary would be invalid.
+      // So we always rebuild message-backed items from scratch, then
+      // re-interleave every live-only item (permission/compaction/notice)
+      // from the whole current item list back in at its anchored position.
+      // A wholesale rebuild also means a stale streaming-assistant stub
+      // (e.g. from a mid-turn reconnect) is never carried over — only the
+      // finalized message from `action.messages` produces an assistant item.
+      const rebuilt = buildItemsFromMessages(action.messages)
+      const ephemeral = state.items.filter(isEphemeral)
+      const merged = reinterleave(rebuilt, ephemeral)
       return {
         ...state,
-        items: [
-          ...state.items.slice(0, state.turnStartIndex),
-          ...buildItemsFromMessages(newMessages),
-          ...ephemeral,
-        ],
+        items: merged,
         rawMessages: action.messages,
+        turnRunning: false,
+        pendingPermission: null,
+        turnStartIndex: merged.length,
+      }
+    }
+    case 'turn_cancelled': {
+      const prefix = state.items.slice(0, state.turnStartIndex)
+      return {
+        ...state,
+        items: [...prefix,
+          { kind: 'notice', text: 'turn cancelled', anchor: messageBackedCount(prefix) }],
         turnRunning: false,
         pendingPermission: null,
       }
     }
-    case 'turn_cancelled':
+    case 'turn_error': {
+      const prefix = state.items.slice(0, state.turnStartIndex)
       return {
         ...state,
-        items: [...state.items.slice(0, state.turnStartIndex),
-          { kind: 'notice', text: 'turn cancelled' }],
-        turnRunning: false,
-        pendingPermission: null,
-      }
-    case 'turn_error':
-      return {
-        ...state,
-        items: [...state.items.slice(0, state.turnStartIndex),
-          { kind: 'notice', text: `turn failed: ${action.message}` }],
+        items: [...prefix,
+          { kind: 'notice', text: `turn failed: ${action.message}`,
+            anchor: messageBackedCount(prefix) }],
         turnRunning: false,
         pendingPermission: null,
         lastError: action.message,
       }
+    }
     default:
       return state
   }

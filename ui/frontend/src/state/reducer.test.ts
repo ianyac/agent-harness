@@ -130,4 +130,69 @@ describe('reducer', () => {
     expect(live.items.map(({ message, ...rest }) => rest))
       .toEqual(replayed.map(({ message, ...rest }) => rest))
   })
+
+  it('permission record survives turn_done in position', () => {
+    const authoritative: Message[] = [
+      { role: 'user', content: 'do it' },
+      toolCallMessage,
+      toolResultMessage,
+      { role: 'assistant', content: 'all done' },
+    ]
+    const state = play([
+      { type: 'local_user_message', text: 'do it' },
+      { type: 'permission_request', id: 'perm-1', name: 'echo', args: { x: 1 } },
+      { type: 'local_permission_answer', id: 'perm-1', answer: 'yes' },
+      { type: 'tool_call', name: 'echo', args: { x: 1 } },
+      { type: 'tool_result', name: 'echo', result: 'echo:1' },
+      { type: 'turn_done', messages: authoritative },
+    ])
+    expect(state.items.map((i) => i.kind)).toEqual(['user', 'permission', 'tool', 'assistant'])
+    const perm = state.items.find((i) => i.kind === 'permission')
+    expect(perm).toMatchObject({ id: 'perm-1', answer: 'yes' })
+  })
+
+  it('compaction-shrunk turn_done preserves the divider without stale items', () => {
+    const firstTurnMessages: Message[] = [
+      { role: 'user', content: 'q1' },
+      toolCallMessage,
+      toolResultMessage,
+      { role: 'assistant', content: 'a1' },
+    ]
+    const seeded = play([
+      { type: 'local_user_message', text: 'q1' },
+      { type: 'turn_started' },
+      { type: 'tool_call', name: 'echo', args: { x: 1 } },
+      { type: 'tool_result', name: 'echo', result: 'echo:1' },
+      { type: 'turn_done', messages: firstTurnMessages },
+    ])
+    const postCompactionMessages: Message[] = [
+      { role: 'assistant', content: 'summary of q1/a1' },
+      { role: 'user', content: 'q2' },
+      { role: 'assistant', content: 'a2' },
+    ]
+    const state = play([
+      { type: 'local_user_message', text: 'q2' },
+      { type: 'compaction', summarized: 3 },
+      { type: 'turn_done', messages: postCompactionMessages },
+    ], seeded)
+    expect(postCompactionMessages.length).toBeLessThan(seeded.rawMessages.length)
+    expect(state.items.map((i) => i.kind)).toEqual(['assistant', 'user', 'assistant', 'compaction'])
+    expect(state.items[0]).toMatchObject({ text: 'summary of q1/a1' })
+    expect(state.items[1]).toMatchObject({ text: 'q2' })
+    expect(state.items[2]).toMatchObject({ text: 'a2' })
+    expect(state.items[3]).toMatchObject({ summarized: 3 })
+  })
+
+  it('reconnect then finish: exactly one assistant item, no duplicate stub', () => {
+    const userMsg: Message = { role: 'user', content: 'question' }
+    const state = play([
+      { type: 'session_snapshot', messages: [userMsg], turn_running: true,
+        pending_permission: null, streamed_text: 'par' },
+      { type: 'text_delta', text: 'tial' },
+      { type: 'turn_done', messages: [userMsg, { role: 'assistant', content: 'partial answer' }] },
+    ])
+    const assistants = state.items.filter((i) => i.kind === 'assistant')
+    expect(assistants).toHaveLength(1)
+    expect(assistants[0]).toMatchObject({ text: 'partial answer', streaming: false })
+  })
 })

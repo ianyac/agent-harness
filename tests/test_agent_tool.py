@@ -24,13 +24,13 @@ def test_subagent_returns_only_the_final_answer():
             {"type": "text", "content": "the answer"},
         ]
     )
-    tool = agent_tool(llm, tools={"noop": noop_tool()}, policy=None, asker=None)
+    tool = agent_tool(llm, tools={"noop": noop_tool()}, policy=None)
     assert tool.execute(task="do the thing") == "the answer"
 
 
 def test_subagent_starts_from_an_empty_context():
     llm = FakeLLM([{"type": "text", "content": "done"}])
-    tool = agent_tool(llm, tools={}, policy=None, asker=None, system="SUB PROMPT")
+    tool = agent_tool(llm, tools={}, policy=None, system="SUB PROMPT")
     tool.execute(task="explore the repo")
     # the sub's first model call: just the task on a fresh transcript,
     # under the subagent's own system prompt
@@ -50,7 +50,7 @@ def test_parent_transcript_never_sees_the_subagents_work():
         ]
     )
     tools = {"noop": noop_tool()}
-    tools["agent"] = agent_tool(llm, tools=tools, policy=None, asker=None)
+    tools["agent"] = agent_tool(llm, tools=tools, policy=None)
     messages = []
     reply = run_turn(messages, "go", llm, tools=tools)
     assert reply["content"] == "parent answer"
@@ -69,7 +69,7 @@ def test_subagent_cannot_spawn_subagents():
         ]
     )
     tools = {"noop": noop_tool()}
-    tools["agent"] = agent_tool(llm, tools=tools, policy=None, asker=None)
+    tools["agent"] = agent_tool(llm, tools=tools, policy=None)
     run_turn([], "go", llm, tools=tools)
     # the sub's model call was offered noop but never the agent tool —
     # recursion is a capability the inner loop simply doesn't have
@@ -97,7 +97,7 @@ def test_subagent_failure_becomes_an_error_result():
         ]
     )
     tools = {}
-    tools["agent"] = agent_tool(llm, tools=tools, policy=None, asker=None)
+    tools["agent"] = agent_tool(llm, tools=tools, policy=None)
     messages = []
     reply = run_turn(messages, "go", llm, tools=tools)
     # the sub blowing up is information for the parent, not a crash
@@ -105,7 +105,7 @@ def test_subagent_failure_becomes_an_error_result():
     assert reply["content"] == "parent answer"
 
 
-def test_always_grant_in_the_sub_carries_back_to_the_policy():
+def test_parent_grants_flow_down_into_the_sub():
     llm = FakeLLM(
         [
             {"type": "tool_calls", "calls": [{"name": "noop", "arguments": {}}]},
@@ -113,19 +113,28 @@ def test_always_grant_in_the_sub_carries_back_to_the_policy():
         ]
     )
     policy = PermissionPolicy("default")
-    asks = []
+    policy.session_allowlist.add("noop")  # granted "always" at a parent prompt
+    tool = agent_tool(llm, tools={"noop": noop_tool(read_only=False)}, policy=policy)
+    assert tool.execute(task="do it") == "done"
+    # the sub's tool result was a real execution, not a denial
+    assert llm.turns[1]["messages"][2]["content"] == "ok"
 
-    def asker(name: str, args: dict) -> str:
-        asks.append(name)
-        return "always"
 
-    tool = agent_tool(
-        llm, tools={"noop": noop_tool(read_only=False)}, policy=policy, asker=asker
+def test_subagents_never_ask_ungranted_actions_are_denied():
+    llm = FakeLLM(
+        [
+            {"type": "tool_calls", "calls": [{"name": "noop", "arguments": {}}]},
+            {"type": "text", "content": "done"},
+        ]
     )
+    policy = PermissionPolicy("default")
+    tool = agent_tool(llm, tools={"noop": noop_tool(read_only=False)}, policy=policy)
     tool.execute(task="do it")
-    # same policy object: the sub asked once, and the grant persists
-    assert asks == ["noop"]
-    assert "noop" in policy.session_allowlist
+    # background subs have no asker: an "ask" decision resolves to denial,
+    # delivered to the sub as an ordinary tool result...
+    assert llm.turns[1]["messages"][2]["content"].startswith("Permission denied")
+    # ...and no grant can ever flow up to the parent's session
+    assert "noop" not in policy.session_allowlist
 
 
 def test_sub_tool_calls_are_observable():
@@ -140,7 +149,6 @@ def test_sub_tool_calls_are_observable():
         llm,
         tools={"noop": noop_tool()},
         policy=None,
-        asker=None,
         on_tool_call=lambda name, args: seen.append(name),
     )
     tool.execute(task="x")
@@ -151,7 +159,7 @@ def test_delegation_itself_is_read_only():
     # the agent tool performs no side effect of its own — every side
     # effect inside the sub passes the same permission gate individually,
     # so the gate belongs on the actions, not on the delegation
-    tool = agent_tool(FakeLLM([]), tools={}, policy=None, asker=None)
+    tool = agent_tool(FakeLLM([]), tools={}, policy=None)
     assert tool.read_only is True
 
 
@@ -166,7 +174,7 @@ def test_an_exhausted_subagent_is_an_error_not_an_answer():
         ]
     )
     tool = agent_tool(
-        llm, tools={"noop": noop_tool()}, policy=None, asker=None, max_iterations=2
+        llm, tools={"noop": noop_tool()}, policy=None, max_iterations=2
     )
     result = tool.execute(task="x")
     assert result.startswith("Error:")
@@ -176,7 +184,7 @@ def test_an_exhausted_subagent_is_an_error_not_an_answer():
 def test_recursion_guard_is_by_identity_not_registry_key():
     llm = FakeLLM([{"type": "text", "content": "done"}])
     tools = {}
-    tool = agent_tool(llm, tools=tools, policy=None, asker=None)
+    tool = agent_tool(llm, tools=tools, policy=None)
     tools["delegate"] = tool  # any key: the filter is on the object
     tool.execute(task="x")
     # the sub was offered no tools at all — its own wrapper included
@@ -192,7 +200,7 @@ def test_subagent_system_prompt_callable_is_evaluated_per_delegation():
     )
     prompts = iter(["FIRST", "SECOND"])
     tool = agent_tool(
-        llm, tools={}, policy=None, asker=None, system=lambda: next(prompts)
+        llm, tools={}, policy=None, system=lambda: next(prompts)
     )
     tool.execute(task="a")
     tool.execute(task="b")

@@ -9,6 +9,7 @@ from harness.loop import run_turn
 from harness.permissions import MODES, PermissionPolicy
 from harness.prompts import Environment, build_system_prompt
 from harness.sandbox import SandboxPolicy, default_sandbox
+from harness.tools.agent import agent_tool
 from harness.tools.bash import bash_tool
 from harness.tools.list_dir import list_dir_tool
 from harness.tools.read_file import read_file_tool
@@ -35,16 +36,32 @@ def ask_user(name: str, args: dict) -> str:
                 print("  please answer y, n, or a")
 
 
-def current_system_prompt(workspace: Path) -> str:
+def environment(workspace: Path) -> Environment:
     # the one place real-world facts are read; rebuilt each turn so a
     # session that crosses midnight keeps the right date
-    env = Environment(
+    return Environment(
         cwd=str(Path.cwd().resolve()),
         workspace=str(workspace),
         os=platform.platform(),
         date=datetime.date.today().isoformat(),
     )
-    return build_system_prompt(env)
+
+
+def current_system_prompt(workspace: Path) -> str:
+    return build_system_prompt(environment(workspace))
+
+
+def current_subagent_prompt(workspace: Path) -> str:
+    # same core prompt, plus the role section — the extra_sections seam
+    return build_system_prompt(
+        environment(workspace),
+        extra_sections=[
+            "You are a subagent: another agent delegated one self-contained "
+            "task to you. Work it to completion and make your final reply "
+            "the complete answer — it is the only thing the delegating "
+            "agent will see."
+        ],
+    )
 
 
 def main():
@@ -79,12 +96,19 @@ def main():
         parser.error(f"{action_log.parent} exists and is not a directory")
     action_log.write_text("")
 
-    def observe_tool_call(name: str, args: dict) -> None:
-        print(f"⚙ {name}({json.dumps(args)})")
+    def record_action(name: str, args: dict) -> None:
         # self-heal: the agent's own tools can delete .agent mid-session
         action_log.parent.mkdir(exist_ok=True)
         with action_log.open("a") as log:
             log.write(json.dumps({"name": name, "args": args}) + "\n")
+
+    def observe_tool_call(name: str, args: dict) -> None:
+        print(f"⚙ {name}({json.dumps(args)})")
+        record_action(name, args)
+
+    def observe_sub_tool_call(name: str, args: dict) -> None:
+        print(f"  ⚙↳ {name}({json.dumps(args)})")
+        record_action(name, args)
 
     llm = CodexAdapter()
     compact_threshold = (
@@ -109,6 +133,16 @@ def main():
         except (EOFError, KeyboardInterrupt):
             break
         entries = action_log.read_text().count("\n") if action_log.exists() else 0
+        # refreshed per turn like the system prompt, so the sub's env facts
+        # (date, cwd) never go stale; the closure shares this same registry
+        tools["agent"] = agent_tool(
+            llm,
+            tools,
+            policy=policy,
+            asker=ask_user,
+            system=current_subagent_prompt(workspace),
+            on_tool_call=observe_sub_tool_call,
+        )
         try:
             reply = run_turn(
                 messages,

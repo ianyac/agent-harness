@@ -57,6 +57,19 @@ counting (added per learner's call, 2026-07-05 — see decision 3).
    results, or we recreate the dangling-call corruption from lessons 4/8. The
    summarizer snaps the boundary to a safe split point (after a plain
    assistant message).
+7. **Breadcrumbs are mechanical and point at a durable action log**
+   (learner's call, 2026-07-06). The model's summary carries judgment
+   sections only (goal, state, decisions, learnings/warnings, unfinished
+   work); `compact()` appends an `[Auto-generated — not summarized]` block
+   from an injected `breadcrumbs` string, so pointers never pass through
+   the summarizer's judgment — and never degrade across repeated
+   compactions. The REPL journals every *executed* tool call (the
+   `on_tool_call` seam fires post-permission-gate, pre-execution) as JSONL
+   to `.agent/actions.jsonl` inside the workspace, truncated at session
+   start, and passes `Action log: <path> (<n> entries)` as the note.
+   Recovery uses the existing tools (bash/read_file) — no dedicated grep
+   tool. Aggregates like "files touched" were dropped: they need per-tool
+   semantics the loop must not have, and they're derivable from the log.
 
 ## Lesson 10: The system prompt
 
@@ -99,6 +112,10 @@ counting (added per learner's call, 2026-07-05 — see decision 3).
   threshold, before the model turn. Threshold + keep_recent are parameters.
 - Observability: an `on_compact` callback (like `on_tool_call`) so the REPL
   can print "[compacted N messages]".
+- `main.py` journals executed tool calls to `.agent/actions.jsonl` via
+  `on_tool_call` (decision 7) and passes the log pointer as `compact`'s
+  `breadcrumbs`. Needs a `.gitignore` entry for `.agent/` — shared file,
+  routed through yc.
 - Live smoke: drive a long conversation past the threshold, confirm it keeps
   working and the model still remembers recent context after a compaction.
 - Review gate, quiz, commit, tag `lesson-11`.

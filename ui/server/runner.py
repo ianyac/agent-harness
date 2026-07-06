@@ -22,6 +22,20 @@ class TurnCancelled(Exception):
     """Raised inside harness callbacks to abort the running turn."""
 
 
+class _CancellableLLM:
+    """run_turn's llm.complete call sits outside every callback checkpoint;
+    wrapping it makes cancel() take effect between model calls — including
+    text-only turns, which otherwise have no checkpoint at all."""
+
+    def __init__(self, inner, check: Callable[[], None]):
+        self._inner = inner
+        self._check = check
+
+    def complete(self, messages, tools=None, system=None):
+        self._check()
+        return self._inner.complete(messages, tools=tools, system=system)
+
+
 class TurnRunner:
     def __init__(
         self,
@@ -36,7 +50,7 @@ class TurnRunner:
         compact_threshold: int | None = None,
         keep_recent: int = 8,
     ):
-        self._llm = llm
+        self._llm = _CancellableLLM(llm, self._check_cancelled)
         self._policy = policy
         self._system_prompt = system_prompt  # re-evaluated per turn, like main.py
         self._emit = emit
@@ -169,7 +183,6 @@ class TurnRunner:
         def execute(**kwargs):
             result = inner(**kwargs)
             self._emit(events.tool_result(tool.name, result))
-            self._check_cancelled()
             return result
 
         return replace(tool, execute=execute)

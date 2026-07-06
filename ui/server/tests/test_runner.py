@@ -163,6 +163,7 @@ def test_permission_no_denies_without_running():
     request = wait_for(events_q, "permission_request")
     runner.answer_permission(request["id"], "no")
     thread.join(timeout=5)
+    assert not thread.is_alive()
     assert executed == []
     assert any(
         m.get("role") == "tool" and "Permission denied" in m["content"]
@@ -186,6 +187,7 @@ def test_permission_always_skips_second_prompt():
     request = wait_for(events_q, "permission_request")
     runner.answer_permission(request["id"], "always")
     thread.join(timeout=5)
+    assert not thread.is_alive()
     remaining = [e["type"] for e in drain(events_q)]
     assert remaining.count("permission_request") == 0  # allowlisted after "always"
     assert remaining.count("tool_result") == 2
@@ -194,3 +196,112 @@ def test_permission_always_skips_second_prompt():
 def test_stale_permission_answer_is_ignored():
     runner, _, _ = make_runner(FakeLLM([text_reply("hi")]))
     runner.answer_permission("perm-999", "yes")  # nothing pending: no crash
+
+
+def test_cancel_during_permission_wait_rolls_back():
+    llm = FakeLLM([tool_reply(("echo", {"x": 1})), text_reply("never sent")])
+    prior = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    runner, events_q, messages = make_runner(
+        llm,
+        messages=list(prior),
+        tools={"echo": echo_tool(read_only=False)},
+        policy=PermissionPolicy("default"),
+    )
+    thread = run_on_thread(runner, "go")
+    wait_for(events_q, "permission_request")
+    runner.cancel()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert [e["type"] for e in drain(events_q)][-1] == "turn_cancelled"
+    assert messages == prior
+
+
+def test_cancel_flag_raises_at_next_callback():
+    runner, _, _ = make_runner(FakeLLM([text_reply("hi")]))
+    assert runner.try_begin()
+    runner.cancel()
+    try:
+        runner._on_tool_call("echo", {})
+        raise AssertionError("expected TurnCancelled")
+    except TurnCancelled:
+        pass
+
+
+def fake_streaming_run_turn(
+    messages, user_input, llm, tools=None, max_iterations=20,
+    on_tool_call=None, policy=None, asker=None, system=None,
+    compact_threshold=None, keep_recent=8, on_compact=None,
+    breadcrumbs=None, on_text_delta=None,
+):
+    """Stand-in for run_turn once the streaming seam lands."""
+    messages.append({"role": "user", "content": user_input})
+    for chunk in ("he", "llo"):
+        if on_text_delta is not None:
+            on_text_delta(chunk)
+    reply = {"role": "assistant", "content": "hello"}
+    messages.append(reply)
+    return reply
+
+
+def test_streaming_run_turn_forwards_deltas():
+    runner, events_q, _ = make_runner(
+        FakeLLM([]), run_turn_fn=fake_streaming_run_turn
+    )
+    run_to_completion(runner, "hi")
+    evts = drain(events_q)
+    assert [e["type"] for e in evts] == [
+        "turn_started", "text_delta", "text_delta", "turn_done",
+    ]
+    assert "".join(e["text"] for e in evts if e["type"] == "text_delta") == "hello"
+    assert runner.streamed_text == ""  # cleared once the turn ends
+
+
+def test_current_harness_run_turn_stays_degraded():
+    runner, events_q, _ = make_runner(FakeLLM([text_reply("whole message")]))
+    run_to_completion(runner, "hi")
+    assert all(e["type"] != "text_delta" for e in drain(events_q))
+
+
+def test_cancel_before_model_call_cancels_text_only_turn():
+    class NeverLLM:
+        def complete(self, messages, tools=None, system=None):
+            raise AssertionError("model must not be called after cancel")
+
+    runner, events_q, messages = make_runner(NeverLLM())
+    assert runner.try_begin()
+    runner.cancel()
+    runner.run_turn_blocking("hello")
+    assert [e["type"] for e in drain(events_q)][-1] == "turn_cancelled"
+    assert messages == []
+
+
+def test_cancel_during_final_tool_execution_cancels_not_completes():
+    started = threading.Event()
+    proceed = threading.Event()
+
+    def slow_execute(x):
+        started.set()
+        proceed.wait(timeout=10)
+        return f"echo:{x}"
+
+    tool = Tool(
+        name="echo",
+        description="echo x back",
+        parameters={"type": "object", "properties": {"x": {"type": "integer"}},
+                    "required": ["x"]},
+        execute=slow_execute,
+        read_only=True,
+    )
+    llm = FakeLLM([tool_reply(("echo", {"x": 1})), text_reply("never sent")])
+    runner, events_q, messages = make_runner(llm, tools={"echo": tool})
+    thread = run_on_thread(runner, "go")
+    assert started.wait(timeout=5)
+    runner.cancel()          # lands while the tool is executing
+    proceed.set()            # tool finishes; proxy must abort before model call 2
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert [e["type"] for e in drain(events_q)][-1] == "turn_cancelled"
+    assert messages == []

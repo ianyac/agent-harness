@@ -23,10 +23,12 @@ export class SessionSocket {
     const ws = this.wsFactory(this.url)
     this.ws = ws
     ws.onopen = () => {
+      if (this.ws !== ws) return
       this.attempts = 0
       this.onStatus('open')
     }
     ws.onmessage = (e) => {
+      if (this.ws !== ws) return
       try {
         this.onEvent(JSON.parse(e.data as string) as ServerEvent)
       } catch {
@@ -34,6 +36,7 @@ export class SessionSocket {
       }
     }
     ws.onclose = (e) => {
+      if (this.ws !== ws) return
       this.onStatus('closed')
       if (this.closed || NO_RECONNECT_CODES.has(e.code)) return
       const delay = Math.min(500 * 2 ** this.attempts, 10_000)

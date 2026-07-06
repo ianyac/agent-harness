@@ -12,7 +12,10 @@ class FakeWebSocket {
     FakeWebSocket.instances.push(this)
   }
   send(data: string) { this.sent.push(data) }
-  close() { this.readyState = 3 }
+  close() {
+    this.readyState = 3
+    setTimeout(() => this.onclose?.({ code: 1000 }), 0)
+  }
   open() { this.readyState = 1; this.onopen?.() }
   serverClose(code: number) { this.readyState = 3; this.onclose?.({ code }) }
   message(payload: unknown) { this.onmessage?.({ data: JSON.stringify(payload) }) }
@@ -76,5 +79,17 @@ describe('SessionSocket', () => {
     FakeWebSocket.instances[1].serverClose(4000)
     vi.advanceTimersByTime(60_000)
     expect(FakeWebSocket.instances).toHaveLength(2)
+  })
+
+  it("ignores the old socket's late close after close()+connect()", () => {
+    socket.connect()
+    FakeWebSocket.instances[0].open()
+    socket.close()
+    socket.connect()               // resets closed=false before old close event lands
+    FakeWebSocket.instances[1].open()
+    vi.runOnlyPendingTimers()      // old socket's queued close event fires now
+    expect(statuses.at(-1)).toBe('open')       // not clobbered to 'closed'
+    vi.advanceTimersByTime(60_000)
+    expect(FakeWebSocket.instances).toHaveLength(2)  // no spurious reconnect socket
   })
 })

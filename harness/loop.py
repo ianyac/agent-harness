@@ -6,6 +6,10 @@ from harness.llm import LLMClient
 from harness.permissions import PermissionPolicy
 from harness.tools.base import Tool, definitions
 
+# prefix of the reply run_turn fabricates when max_iterations is exhausted;
+# wrappers (e.g. the agent tool) detect aborts by it
+ABORTED_PREFIX = "[turn aborted by harness"
+
 
 def _permitted(
     tool: Tool,
@@ -37,7 +41,7 @@ def run_turn(
     compact_threshold: int | None = None,
     keep_recent: int = 8,
     on_compact: Callable[[int], None] | None = None,
-    breadcrumbs: str | None = None,
+    breadcrumbs: str | Callable[[], str] | None = None,
 ) -> dict:
     tools = tools or {}
     defs = definitions(tools) or None
@@ -49,7 +53,14 @@ def run_turn(
             compact_threshold is not None
             and estimate_tokens(messages, defs, system) > compact_threshold
         ):
-            compacted = compact(messages, llm, keep_recent, breadcrumbs=breadcrumbs)
+            compacted = compact(
+                messages,
+                llm,
+                keep_recent,
+                # a callable is evaluated now, at fire time — a note built at
+                # turn start goes stale once this turn's own calls land
+                breadcrumbs=breadcrumbs() if callable(breadcrumbs) else breadcrumbs,
+            )
             if compacted is not messages:
                 summarized = len(messages) - (len(compacted) - 1)
                 messages[:] = compacted  # in place: the caller owns this list
@@ -69,7 +80,7 @@ def run_turn(
     # ends with a plain assistant message, even an unsuccessful one
     reply = {
         "role": "assistant",
-        "content": f"[turn aborted by harness: no final answer after "
+        "content": f"{ABORTED_PREFIX}: no final answer after "
         f"{max_iterations} iterations]",
     }
     messages.append(reply)

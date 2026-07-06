@@ -1,7 +1,7 @@
 from typing import Callable
 
 from harness.llm import LLMClient
-from harness.loop import run_turn
+from harness.loop import ABORTED_PREFIX, run_turn
 from harness.permissions import PermissionPolicy
 from harness.tools.base import Tool
 
@@ -17,24 +17,33 @@ _DESCRIPTION = (
 def agent_tool(
     llm: LLMClient,
     tools: dict[str, Tool],
-    policy: PermissionPolicy | None = None,
-    asker: Callable[[str, dict], str] | None = None,
-    system: str | None = None,
+    *,
+    # required: the caller must state the sub's authority envelope —
+    # None disables the permission gate and has to be an explicit choice
+    policy: PermissionPolicy | None,
+    asker: Callable[[str, dict], str] | None,
+    system: str | Callable[[], str] | None = None,
     on_tool_call: Callable[[str, dict], None] | None = None,
     max_iterations: int = 20,
+    compact_threshold: int | None = None,
+    keep_recent: int = 8,
 ) -> Tool:
     """A subagent as a plain registry tool: fresh context in, one answer out.
 
     Context is isolated (the inner run_turn starts on an empty list and only
     the final reply's text comes back); authority is not elevated (same
-    sandbox-wrapped tools, same policy object, same asker).
+    sandbox-wrapped tools, and whatever policy/asker the caller states).
+    A callable system prompt is evaluated per delegation, so env facts
+    never go stale. Note: compact_threshold is forwarded but a sub's
+    single-turn transcript has no completed exchange to cut at — its real
+    overflow guards are tool-result truncation and max_iterations.
     """
 
     def execute(task: str) -> str:
-        # filtered at call time: the registry dict is shared and gains
-        # "agent" only after this tool is constructed — a subagent must
-        # never find it there (no recursion, structurally)
-        inner = {name: tool for name, tool in tools.items() if name != "agent"}
+        # filtered by identity at call time: whatever key this tool sits
+        # under in the shared registry, a subagent must never find it
+        # (no recursion, structurally)
+        inner = {name: t for name, t in tools.items() if t is not tool}
         reply = run_turn(
             [],  # fresh context: isolation is the whole point
             task,
@@ -44,11 +53,20 @@ def agent_tool(
             on_tool_call=on_tool_call,
             policy=policy,
             asker=asker,
-            system=system,
+            system=system() if callable(system) else system,
+            compact_threshold=compact_threshold,
+            keep_recent=keep_recent,
         )
-        return reply["content"] or ""
+        content = reply["content"] or ""
+        if content.startswith(ABORTED_PREFIX):
+            # an exhausted sub is a failure, not an answer
+            return (
+                f"Error: subagent gave no final answer within "
+                f"{max_iterations} iterations"
+            )
+        return content
 
-    return Tool(
+    tool = Tool(
         name="agent",
         description=_DESCRIPTION,
         parameters={
@@ -69,3 +87,4 @@ def agent_tool(
         # sub passes the same permission gate individually
         read_only=True,
     )
+    return tool

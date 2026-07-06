@@ -114,6 +114,26 @@ def test_mid_turn_tool_growth_triggers_compaction():
     assert messages[2].get("tool_calls") and messages[3]["role"] == "tool"
 
 
+def test_breadcrumbs_callable_is_evaluated_at_fire_time():
+    messages = history(6)
+    llm = FakeLLM(
+        [
+            {"type": "text", "content": "SUMMARY"},
+            {"type": "text", "content": "ok"},
+        ]
+    )
+    notes = iter(["fresh note"])
+    run_turn(
+        messages,
+        "next question",
+        llm,
+        compact_threshold=50,
+        keep_recent=2,
+        breadcrumbs=lambda: next(notes),
+    )
+    assert "fresh note" in messages[0]["content"]
+
+
 def test_breadcrumbs_reach_the_summary_message():
     messages = history(6)
     llm = FakeLLM(

@@ -24,13 +24,13 @@ def test_subagent_returns_only_the_final_answer():
             {"type": "text", "content": "the answer"},
         ]
     )
-    tool = agent_tool(llm, tools={"noop": noop_tool()})
+    tool = agent_tool(llm, tools={"noop": noop_tool()}, policy=None, asker=None)
     assert tool.execute(task="do the thing") == "the answer"
 
 
 def test_subagent_starts_from_an_empty_context():
     llm = FakeLLM([{"type": "text", "content": "done"}])
-    tool = agent_tool(llm, tools={}, system="SUB PROMPT")
+    tool = agent_tool(llm, tools={}, policy=None, asker=None, system="SUB PROMPT")
     tool.execute(task="explore the repo")
     # the sub's first model call: just the task on a fresh transcript,
     # under the subagent's own system prompt
@@ -50,7 +50,7 @@ def test_parent_transcript_never_sees_the_subagents_work():
         ]
     )
     tools = {"noop": noop_tool()}
-    tools["agent"] = agent_tool(llm, tools=tools)
+    tools["agent"] = agent_tool(llm, tools=tools, policy=None, asker=None)
     messages = []
     reply = run_turn(messages, "go", llm, tools=tools)
     assert reply["content"] == "parent answer"
@@ -69,7 +69,7 @@ def test_subagent_cannot_spawn_subagents():
         ]
     )
     tools = {"noop": noop_tool()}
-    tools["agent"] = agent_tool(llm, tools=tools)
+    tools["agent"] = agent_tool(llm, tools=tools, policy=None, asker=None)
     run_turn([], "go", llm, tools=tools)
     # the sub's model call was offered noop but never the agent tool —
     # recursion is a capability the inner loop simply doesn't have
@@ -97,7 +97,7 @@ def test_subagent_failure_becomes_an_error_result():
         ]
     )
     tools = {}
-    tools["agent"] = agent_tool(llm, tools=tools)
+    tools["agent"] = agent_tool(llm, tools=tools, policy=None, asker=None)
     messages = []
     reply = run_turn(messages, "go", llm, tools=tools)
     # the sub blowing up is information for the parent, not a crash
@@ -137,7 +137,11 @@ def test_sub_tool_calls_are_observable():
     )
     seen = []
     tool = agent_tool(
-        llm, tools={"noop": noop_tool()}, on_tool_call=lambda name, args: seen.append(name)
+        llm,
+        tools={"noop": noop_tool()},
+        policy=None,
+        asker=None,
+        on_tool_call=lambda name, args: seen.append(name),
     )
     tool.execute(task="x")
     assert seen == ["noop"]
@@ -147,5 +151,50 @@ def test_delegation_itself_is_read_only():
     # the agent tool performs no side effect of its own — every side
     # effect inside the sub passes the same permission gate individually,
     # so the gate belongs on the actions, not on the delegation
-    tool = agent_tool(FakeLLM([]), tools={})
+    tool = agent_tool(FakeLLM([]), tools={}, policy=None, asker=None)
     assert tool.read_only is True
+
+
+def test_an_exhausted_subagent_is_an_error_not_an_answer():
+    # a sub that hits max_iterations returns the harness abort marker;
+    # the wrapper must convert it to an error string, never relay it as
+    # the subagent's "final answer"
+    llm = FakeLLM(
+        [
+            {"type": "tool_calls", "calls": [{"name": "noop", "arguments": {}}]},
+            {"type": "tool_calls", "calls": [{"name": "noop", "arguments": {}}]},
+        ]
+    )
+    tool = agent_tool(
+        llm, tools={"noop": noop_tool()}, policy=None, asker=None, max_iterations=2
+    )
+    result = tool.execute(task="x")
+    assert result.startswith("Error:")
+    assert "no final answer" in result
+
+
+def test_recursion_guard_is_by_identity_not_registry_key():
+    llm = FakeLLM([{"type": "text", "content": "done"}])
+    tools = {}
+    tool = agent_tool(llm, tools=tools, policy=None, asker=None)
+    tools["delegate"] = tool  # any key: the filter is on the object
+    tool.execute(task="x")
+    # the sub was offered no tools at all — its own wrapper included
+    assert llm.turns[0]["tools"] is None
+
+
+def test_subagent_system_prompt_callable_is_evaluated_per_delegation():
+    llm = FakeLLM(
+        [
+            {"type": "text", "content": "one"},
+            {"type": "text", "content": "two"},
+        ]
+    )
+    prompts = iter(["FIRST", "SECOND"])
+    tool = agent_tool(
+        llm, tools={}, policy=None, asker=None, system=lambda: next(prompts)
+    )
+    tool.execute(task="a")
+    tool.execute(task="b")
+    assert llm.turns[0]["system"] == "FIRST"
+    assert llm.turns[1]["system"] == "SECOND"

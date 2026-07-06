@@ -45,23 +45,24 @@ tool that returns a skill's full body on demand.
    Ordering note: a hook cannot approve what the human denied; it can
    only narrow further. The lesson's thesis: the L7 permission gate is
    just a built-in pre-tool hook — and here is the general mechanism.
-4. **Hooks run inside the bash sandbox and fail closed where closing is
-   possible** (learner's ruling, 2026-07-06). hooks.json travels with the
-   workspace — a cloned repo can ship one, and the agent itself can
-   write one — so hook commands are NOT trusted-user territory: they run
-   under the same sandbox as bash (write-confined), closing the
-   escalation "model writes hooks.json, waits for the next session
-   start, executes unsandboxed". Failure semantics differ by event
-   because the events differ: `pre_tool_use` fails CLOSED (a crashed or
-   timed-out hook blocks the call, failure text as the visible reason —
-   a policy hook must never silently stop enforcing, especially in
-   acceptAll mode where it may be the only gate); `session_start` fails
-   CLOSED (broken startup hook aborts startup with a clean error);
-   `post_tool_use` and `stop` are pure observers with nothing to halt —
-   they fail LOUD (printed warning). Timeout 10s. Residual risk stated
-   honestly: the sandbox contains execution, not persuasion — a hostile
-   session_start hook can still inject prompt content via stdout; trust
-   gating of hooks.json changes is out of scope for the lesson.
+4. **Hooks run UNSANDBOXED; blocking points still fail closed**
+   (learner's ruling 2026-07-06, reverting the same-day sandbox ruling).
+   Rationale for the revert: hook utility lives outside the workspace —
+   notifications, external logs, network calls — and the bash sandbox
+   (workspace-confined writes, no network) would gut most real hooks.
+   Failure semantics unchanged: `pre_tool_use` fails CLOSED (a crashed
+   or timed-out hook blocks the call — a policy hook must never silently
+   stop enforcing, especially in acceptAll mode where it may be the only
+   gate); `session_start` fails CLOSED (aborts startup with a clean
+   error); `post_tool_use` and `stop` are pure observers with nothing to
+   halt — they fail LOUD. Timeout 10s.
+   **Accepted risk, documented:** hooks.json is model-reachable (the
+   agent can write it; a cloned repo can ship it), so unsandboxed hooks
+   are an escalation path from sandboxed model to unsandboxed execution
+   at the next session start. The standard mitigation — a startup
+   approval gate that shows the hook commands and requires a "y" before
+   enabling them (the Claude Code approach to project hooks) — is
+   pending the learner's ruling at the 14.2 review.
 5. **Skills are flat markdown files with minimal frontmatter:**
    `skills/<name>.md` with `---` frontmatter carrying `name:` and
    `description:` as plain strings — parsed by ~15 lines of our own code

@@ -67,3 +67,53 @@ def test_view_skill_on_an_unknown_name_lists_what_exists(tmp_path):
     result = view_skill_tool(discover(tmp_path)).execute(name="nope")
     assert result.startswith("Error")
     assert "commit-style" in result and "review-style" in result
+
+
+def test_frontmatter_tolerates_blank_lines_and_comments(tmp_path):
+    tmp_path.mkdir(exist_ok=True)
+    (tmp_path / "s.md").write_text(
+        "---\nname: s\n\n# a note\ndescription: d\n---\nBody."
+    )
+    (skill,) = discover(tmp_path)
+    assert skill.name == "s" and skill.description == "d"
+
+
+def test_triple_dash_inside_a_value_is_not_a_delimiter(tmp_path):
+    tmp_path.mkdir(exist_ok=True)
+    (tmp_path / "s.md").write_text(
+        "---\nname: s\ndescription: use --- to separate\n---\nReal body."
+    )
+    (skill,) = discover(tmp_path)
+    assert skill.description == "use --- to separate"
+    assert skill.body == "Real body."
+
+
+def test_a_bom_prefixed_file_still_parses(tmp_path):
+    tmp_path.mkdir(exist_ok=True)
+    (tmp_path / "s.md").write_bytes(
+        b"\xef\xbb\xbf---\nname: s\ndescription: d\n---\nBody."
+    )
+    assert [s.name for s in discover(tmp_path)] == ["s"]
+
+
+def test_non_ascii_content_loads(tmp_path):
+    write_skill(tmp_path, "s", "uses an em dash — like this", "Body — with punctuation.")
+    (skill,) = discover(tmp_path)
+    assert "—" in skill.description
+
+
+def test_duplicate_names_keep_the_first_and_warn(tmp_path):
+    tmp_path.mkdir(exist_ok=True)
+    (tmp_path / "a.md").write_text("---\nname: dup\ndescription: first\n---\nA")
+    (tmp_path / "b.md").write_text("---\nname: dup\ndescription: second\n---\nB")
+    warnings = []
+    skills = discover(tmp_path, on_warning=warnings.append)
+    assert len(skills) == 1 and skills[0].body == "A"  # a.md sorts first
+    assert warnings and "duplicate" in warnings[0]
+
+
+def test_discovery_order_follows_names_not_filenames(tmp_path):
+    tmp_path.mkdir(exist_ok=True)
+    (tmp_path / "zzz.md").write_text("---\nname: aaa\ndescription: d\n---\nx")
+    (tmp_path / "mmm.md").write_text("---\nname: mmm\ndescription: d\n---\nx")
+    assert [s.name for s in discover(tmp_path)] == ["aaa", "mmm"]

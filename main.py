@@ -251,16 +251,17 @@ def main():
         if cli_args.compact_threshold is not None
         else int(COMPACT_FRACTION * llm.context_window)
     )
-    tools = {
-        tool.name: tool
-        for tool in [
-            read_file_tool(workspace=workspace),
-            write_file_tool(workspace=workspace),
-            list_dir_tool(workspace=workspace),
-            bash_tool(sandbox=sandbox),
-            view_skill_tool(skills),
-        ]
-    }
+    registry = [
+        read_file_tool(workspace=workspace),
+        write_file_tool(workspace=workspace),
+        list_dir_tool(workspace=workspace),
+        bash_tool(sandbox=sandbox),
+    ]
+    if skills:
+        # only offer view_skill when there is a menu to view — otherwise the
+        # model can waste a turn calling a tool that can only ever error
+        registry.append(view_skill_tool(skills))
+    tools = {tool.name: tool for tool in registry}
     policy = PermissionPolicy(cli_args.mode)
     # built once: the callable system prompt is re-evaluated per delegation,
     # so the sub's env facts (date, cwd) never go stale anyway

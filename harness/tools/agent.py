@@ -43,10 +43,11 @@ def agent_tool(
     """
 
     def execute(task: str) -> str:
-        # filtered by identity at call time: whatever key this tool sits
-        # under in the shared registry, a subagent must never find it
-        # (no recursion, structurally)
-        inner = {name: t for name, t in tools.items() if t is not tool}
+        # filtered by the spawns_subagents field at call time: whatever key
+        # this tool sits under, and however many wrappers (hooks) it wears,
+        # a subagent must never find a delegation tool (no recursion,
+        # structurally)
+        inner = {name: t for name, t in tools.items() if not t.spawns_subagents}
         reply = run_turn(
             [],  # fresh context: isolation is the whole point
             task,
@@ -89,5 +90,6 @@ def agent_tool(
         # delegation itself changes nothing; the sub's own actions are
         # gated by the policy (with denial instead of prompting)
         read_only=True,
+        spawns_subagents=True,
     )
     return tool

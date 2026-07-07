@@ -94,8 +94,9 @@ tool that returns a skill's full body on demand.
   hook to named tools; post-hook receives result JSON; session_start
   stdout comes back for injection; a crashed or timed-out pre-hook
   blocks the call (fail closed); a crashed post-hook warns and proceeds;
-  missing config is an empty HookSet; hook commands run through the
-  sandbox wrapper (a write outside the workspace is refused).
+  missing config is an empty HookSet; malformed config (bad regex,
+  non-string fields, stray keys, unreadable file) fails at load, never
+  at call time.
 - Review gate, commit.
 
 ### Task 14.2: REPL wiring + live smoke

@@ -181,14 +181,37 @@ def test_an_exhausted_subagent_is_an_error_not_an_answer():
     assert "no final answer" in result
 
 
-def test_recursion_guard_is_by_identity_not_registry_key():
+def test_recursion_guard_survives_registry_renaming():
     llm = FakeLLM([{"type": "text", "content": "done"}])
     tools = {}
     tool = agent_tool(llm, tools=tools, policy=None)
-    tools["delegate"] = tool  # any key: the filter is on the object
+    tools["delegate"] = tool  # any key: the filter is on the tool's field
     tool.execute(task="x")
     # the sub was offered no tools at all — its own wrapper included
     assert llm.turns[0]["tools"] is None
+
+
+def test_recursion_guard_survives_hook_wrapping():
+    from harness.hooks import Hook, HookSet, with_hooks
+
+    llm = FakeLLM([{"type": "text", "content": "done"}])
+    tools = {}
+    tools["agent"] = agent_tool(llm, tools=tools, policy=None)
+    # wrapping replaces the Tool object; the spawns_subagents field rides
+    # along, so the guard holds where an identity check would break
+    with_hooks(tools, HookSet(pre_tool_use=[Hook(command="exit 0")]))
+    tools["agent"].execute(task="x")
+    assert llm.turns[0]["tools"] is None
+
+
+def test_hooks_fire_on_the_delegation_itself():
+    from harness.hooks import Hook, HookSet, with_hooks
+
+    llm = FakeLLM([])  # any model call would crash: the block precedes it
+    tools = {}
+    tools["agent"] = agent_tool(llm, tools=tools, policy=None)
+    with_hooks(tools, HookSet(pre_tool_use=[Hook(command="exit 2", matcher="agent")]))
+    assert tools["agent"].execute(task="x").startswith("Blocked by hook")
 
 
 def test_subagent_system_prompt_callable_is_evaluated_per_delegation():

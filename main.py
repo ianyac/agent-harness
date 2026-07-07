@@ -3,6 +3,7 @@ import datetime
 import json
 import os
 import platform
+import sys
 from pathlib import Path
 
 from harness.hooks import (
@@ -65,6 +66,11 @@ def approve_hooks(hookset: HookSet) -> bool:
     ]
     if not commands:
         return True
+    if not sys.stdin.isatty():
+        # no human at the terminal means no one read the listing: piped
+        # input must never be able to approve unsandboxed commands
+        print("(hooks.json present but stdin is not interactive — hooks disabled)")
+        return False
     print("hooks.json wants to run these commands (unsandboxed):")
     for event, command in commands:
         print(f"  {event}: {command}")
@@ -228,7 +234,7 @@ def main():
         print("(hooks disabled for this session)")
         hookset = HookSet()
     try:
-        hook_sections = run_session_start(hookset)
+        hook_sections = run_session_start(hookset, cwd=workspace)
     except HookError as error:
         parser.error(str(error))
 
@@ -247,11 +253,6 @@ def main():
             bash_tool(sandbox=sandbox),
         ]
     }
-    # wrapped BEFORE the agent tool joins: the sub's closure must capture
-    # the hooked registry (no evading a block by delegating), while the
-    # agent tool itself stays unwrapped — rewrapping it would break the
-    # identity-based recursion guard
-    tools = with_hooks(tools, hookset, on_warning=lambda w: print(f"({w})"))
     policy = PermissionPolicy(cli_args.mode)
     # built once: the callable system prompt is re-evaluated per delegation,
     # so the sub's env facts (date, cwd) never go stale anyway
@@ -263,6 +264,11 @@ def main():
         on_tool_call=observe_sub_tool_call,
         compact_threshold=compact_threshold,
     )
+    # wrapped IN PLACE after the agent tool joins: every tool including the
+    # delegation is hooked, the sub's closure sees the hooked registry, and
+    # the spawns_subagents field keeps the recursion guard intact through
+    # the wrapping
+    with_hooks(tools, hookset, on_warning=lambda w: print(f"({w})"), cwd=workspace)
     session = SessionLog(session_path)
     try:
         messages = session.load()
@@ -310,7 +316,7 @@ def main():
             )
             print("agent:", reply["content"])
             record_turn()
-            for warning in run_stop(hookset, reply):
+            for warning in run_stop(hookset, reply, cwd=workspace):
                 print(f"({warning})")
         except KeyboardInterrupt:
             # drop the half-built exchange: a dangling tool_call in history

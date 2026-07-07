@@ -309,6 +309,14 @@ def main():
         except (EOFError, KeyboardInterrupt):
             break
         try:
+            streamed: list[str] = []
+
+            def on_chunk(chunk: str) -> None:
+                if not streamed:
+                    print("agent: ", end="", flush=True)
+                streamed.append(chunk)
+                print(chunk, end="", flush=True)
+
             reply = run_turn(
                 messages,
                 user_input,
@@ -322,8 +330,17 @@ def main():
                 keep_recent=KEEP_RECENT,
                 on_compact=on_compact,
                 breadcrumbs=breadcrumb_note,
+                on_chunk=on_chunk,
             )
-            print("agent:", reply["content"])
+            if streamed:
+                print()  # close the streamed line
+                if "".join(streamed) != reply["content"]:
+                    # a retried stream regenerates: what scrolled by is
+                    # stale — the assembled message is the truth
+                    print("(stream was superseded; full reply:)")
+                    print("agent:", reply["content"])
+            else:
+                print("agent:", reply["content"])
             record_turn()
             for warning in run_stop(hookset, reply, cwd=workspace):
                 print(f"({warning})")

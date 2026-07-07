@@ -89,6 +89,47 @@ def approve_hooks(hookset: HookSet) -> bool:
                 print("  please answer y or n")
 
 
+class StreamLine:
+    """Terminal state for streamed replies. Two jobs: nothing else may
+    print onto a half-painted line, and chunk accumulation tracks only the
+    CURRENT model call — narration streamed before a tool call is not part
+    of the final reply, so tool boundaries reset the buffer."""
+
+    def __init__(self):
+        self.chunks: list[str] = []
+        self.open = False
+
+    def write(self, delta: str) -> None:
+        if not delta:
+            return
+        if not self.open:
+            print("agent: ", end="", flush=True)
+            self.open = True
+        self.chunks.append(delta)
+        print(delta, end="", flush=True)
+
+    def break_line(self) -> None:
+        # a tool call or prompt is about to print: close the painted line
+        # and start fresh accumulation for the next model call
+        if self.open:
+            print()
+            self.open = False
+        self.chunks.clear()
+
+    def close(self) -> str:
+        """End of turn: close the line and return the final call's text."""
+        text = "".join(self.chunks)
+        if self.open:
+            print()
+        self.discard()
+        return text
+
+    def discard(self) -> None:
+        # cancelled turn: the rollback message brings its own newline
+        self.chunks.clear()
+        self.open = False
+
+
 def environment(workspace: Path) -> Environment:
     # the one place real-world facts are read; rebuilt each turn so a
     # session that crosses midnight keeps the right date
@@ -219,11 +260,19 @@ def main():
         # resolves against the process cwd — only absolute means both agree
         return f"Action log: {action_log} ({entries} entries)"
 
+    stream = StreamLine()
+
+    def asker(name: str, args: dict) -> str:
+        stream.break_line()  # never prompt onto a half-painted line
+        return ask_user(name, args)
+
     def observe_tool_call(name: str, args: dict) -> None:
+        stream.break_line()
         print(f"⚙ {name}({json.dumps(args)})")
         record_action("agent", name, args)
 
     def observe_sub_tool_call(name: str, args: dict) -> None:
+        stream.break_line()
         print(f"  ⚙↳ {name}({json.dumps(args)})")
         record_action("subagent", name, args)
 
@@ -309,14 +358,6 @@ def main():
         except (EOFError, KeyboardInterrupt):
             break
         try:
-            streamed: list[str] = []
-
-            def on_chunk(chunk: str) -> None:
-                if not streamed:
-                    print("agent: ", end="", flush=True)
-                streamed.append(chunk)
-                print(chunk, end="", flush=True)
-
             reply = run_turn(
                 messages,
                 user_input,
@@ -324,27 +365,26 @@ def main():
                 tools=tools,
                 on_tool_call=observe_tool_call,
                 policy=policy,
-                asker=ask_user,
+                asker=asker,
                 system=current_system_prompt(workspace, context_sections),
                 compact_threshold=compact_threshold,
                 keep_recent=KEEP_RECENT,
                 on_compact=on_compact,
                 breadcrumbs=breadcrumb_note,
-                on_chunk=on_chunk,
+                on_text_delta=stream.write,
             )
-            if streamed:
-                print()  # close the streamed line
-                if "".join(streamed) != reply["content"]:
-                    # a retried stream regenerates: what scrolled by is
-                    # stale — the assembled message is the truth
+            streamed_text = stream.close()
+            if streamed_text != reply["content"]:
+                if streamed_text:
+                    # a retried stream repainted stale text; correct the
+                    # record out loud — the assembled message is the truth
                     print("(stream was superseded; full reply:)")
-                    print("agent:", reply["content"])
-            else:
                 print("agent:", reply["content"])
             record_turn()
             for warning in run_stop(hookset, reply, cwd=workspace):
                 print(f"({warning})")
         except KeyboardInterrupt:
+            stream.discard()
             # drop the half-built exchange: a dangling tool_call in history
             # would poison every later request. Compaction may have shifted
             # indices mid-turn, so roll back to the last completed exchange

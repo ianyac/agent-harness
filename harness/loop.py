@@ -42,7 +42,7 @@ def run_turn(
     keep_recent: int = 8,
     on_compact: Callable[[int], None] | None = None,
     breadcrumbs: str | Callable[[], str] | None = None,
-    on_chunk: Callable[[str], None] | None = None,
+    on_text_delta: Callable[[str], None] | None = None,
 ) -> dict:
     tools = tools or {}
     defs = definitions(tools) or None
@@ -67,7 +67,10 @@ def run_turn(
                 messages[:] = compacted  # in place: the caller owns this list
                 if on_compact is not None:
                     on_compact(summarized)
-        reply = llm.complete(messages, tools=defs, system=system, on_chunk=on_chunk)
+        # the kwarg travels only when streaming is on: pre-seam LLMClient
+        # implementations keep working until their caller opts in
+        extra = {"on_text_delta": on_text_delta} if on_text_delta is not None else {}
+        reply = llm.complete(messages, tools=defs, system=system, **extra)
         messages.append(reply)
         calls = reply.get("tool_calls")
         if not calls:

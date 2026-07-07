@@ -11,7 +11,7 @@ details never escape `llm.py`) exists so streaming can land; invariant 2
 is the proof that the founding bets were right — both features arrive with
 zero change to the loop's control flow.
 
-**Architecture:** Streaming is an observer callback (`on_chunk`) threaded
+**Architecture:** Streaming is an observer callback (`on_text_delta`) threaded
 through `run_turn` to the adapter exactly like `system` — the adapter
 already consumes an SSE stream internally (the codex endpoint has been
 stream-only since lesson 2; we assemble and discard the liveness), so
@@ -24,7 +24,8 @@ untouched.
 ## Decisions under review
 
 1. **Streaming is observability, not control flow.** `complete()` and
-   `run_turn` gain `on_chunk: Callable[[str], None] | None = None`,
+   `run_turn` gain `on_text_delta: Callable[[str], None] | None = None`
+   (the name the ui stream's seam request proposed and probes for),
    forwarded like `system`. The adapter invokes it per text delta and
    still returns the same assembled message dict — chunks are UX,
    messages remain the unit of truth. The loop's control flow is
@@ -33,9 +34,9 @@ untouched.
    production harnesses but adds parser state for no lesson value; we
    stream what the user watches — prose.
 3. **Only the parent's turns stream.** The subagent's `run_turn` and the
-   compaction summarizer call `complete()` without `on_chunk` — their
+   compaction summarizer call `complete()` without `on_text_delta` — their
    output is internal, and interleaved sub-streams would be noise.
-   FakeLLM emits scripted text through `on_chunk` in fixed chunks so the
+   FakeLLM emits scripted text through `on_text_delta` in fixed chunks so the
    offline suite can pin forwarding and assembly.
 4. **MCP scope: stdio transport, tools only.** Newline-delimited JSON-RPC
    over a child process's stdin/stdout; `initialize` handshake,
@@ -63,13 +64,13 @@ untouched.
 
 ## Lesson 16: Streaming output
 
-### Task 16.1: the on_chunk seam + tests
-- `LLMClient.complete` and `CodexAdapter.complete` gain `on_chunk`;
+### Task 16.1: the on_text_delta seam + tests
+- `LLMClient.complete` and `CodexAdapter.complete` gain `on_text_delta`;
   the adapter fires it per SSE text delta while assembling the reply
   as today. `run_turn` forwards it (pass-through only).
-- FakeLLM: scripted text replies are emitted through `on_chunk` in
+- FakeLLM: scripted text replies are emitted through `on_text_delta` in
   chunks, then returned assembled.
-- Tests: chunks join to exactly the returned content; on_chunk is
+- Tests: chunks join to exactly the returned content; on_text_delta is
   forwarded on every loop iteration; None = no calls (default
   unchanged); the summarizer and subagent paths never receive chunks.
 - Review gate, commit.

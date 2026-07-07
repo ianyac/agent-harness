@@ -1,7 +1,13 @@
 import json
 from pathlib import Path
 
-from harness.llm import build_request_body, normalize, to_wire_input, to_wire_tools
+from harness.llm import (
+    build_request_body,
+    normalize,
+    process_sse_event,
+    to_wire_input,
+    to_wire_tools,
+)
 
 
 def test_normalize_extracts_a_plain_assistant_message():
@@ -81,6 +87,40 @@ def test_wire_input_translates_a_full_tool_round_trip():
             "content": [{"type": "output_text", "text": "The sum is 3."}],
         },
     ]
+
+
+def test_sse_dispatch_forwards_deltas_and_finds_the_final_response():
+    items, chunks = [], []
+    assert (
+        process_sse_event(
+            {"type": "response.output_text.delta", "delta": "hi"}, items, chunks.append
+        )
+        is None
+    )
+    # empty deltas carry nothing and must not reach the consumer
+    process_sse_event(
+        {"type": "response.output_text.delta", "delta": ""}, items, chunks.append
+    )
+    process_sse_event(
+        {"type": "response.output_item.done", "item": {"x": 1}}, items, chunks.append
+    )
+    final = process_sse_event(
+        {"type": "response.completed", "response": {"ok": True}}, items, chunks.append
+    )
+    assert final == {"ok": True}
+    assert items == [{"x": 1}]
+    assert chunks == ["hi"]
+
+
+def test_sse_dispatch_without_a_callback_ignores_deltas():
+    items = []
+    assert (
+        process_sse_event(
+            {"type": "response.output_text.delta", "delta": "hi"}, items, None
+        )
+        is None
+    )
+    assert items == []
 
 
 def test_request_body_uses_default_instructions_when_no_system():

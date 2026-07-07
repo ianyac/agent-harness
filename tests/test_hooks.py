@@ -13,15 +13,7 @@ from harness.hooks import (
     with_hooks,
 )
 from harness.tools.base import Tool
-
-
-def noop_tool() -> Tool:
-    return Tool(
-        name="noop",
-        description="A tool that does nothing, for tests.",
-        parameters={"type": "object", "properties": {}},
-        execute=lambda **args: "ok",
-    )
+from tests.helpers import noop_tool
 
 
 def hooked(hookset: HookSet, **kwargs) -> Tool:

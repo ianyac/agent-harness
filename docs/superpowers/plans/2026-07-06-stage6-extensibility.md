@@ -59,10 +59,13 @@ tool that returns a skill's full body on demand.
    **Accepted risk, documented:** hooks.json is model-reachable (the
    agent can write it; a cloned repo can ship it), so unsandboxed hooks
    are an escalation path from sandboxed model to unsandboxed execution
-   at the next session start. The standard mitigation — a startup
-   approval gate that shows the hook commands and requires a "y" before
-   enabling them (the Claude Code approach to project hooks) — is
-   pending the learner's ruling at the 14.2 review.
+   at the next session start. Mitigation adopted (learner's ruling
+   2026-07-07): a startup approval gate — before ANY hook runs
+   (session_start included), the REPL prints every configured command
+   labeled by event and requires an explicit "y"; decline or EOF
+   disables hooks for the session (the harness still runs). The gate
+   applies in every permission mode: tool consent (acceptAll) and
+   config-as-code consent are different axes.
 5. **Skills are flat markdown files with minimal frontmatter:**
    `skills/<name>.md` with `---` frontmatter carrying `name:` and
    `description:` as plain strings — parsed by ~15 lines of our own code

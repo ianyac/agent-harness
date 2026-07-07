@@ -5,6 +5,15 @@ import os
 import platform
 from pathlib import Path
 
+from harness.hooks import (
+    EVENTS,
+    HookError,
+    HookSet,
+    load_hooks,
+    run_session_start,
+    run_stop,
+    with_hooks,
+)
 from harness.llm import CodexAdapter
 from harness.loop import run_turn
 from harness.permissions import MODES, PermissionPolicy
@@ -47,6 +56,32 @@ def ask_user(name: str, args: dict) -> str:
                 print("  please answer y, n, or a")
 
 
+def approve_hooks(hookset: HookSet) -> bool:
+    """hooks.json is workspace config — a clone can ship it and the agent
+    can write it — so its commands run only after the human reads them.
+    Runs BEFORE any hook executes, session_start included."""
+    commands = [
+        (event, hook.command) for event in EVENTS for hook in getattr(hookset, event)
+    ]
+    if not commands:
+        return True
+    print("hooks.json wants to run these commands (unsandboxed):")
+    for event, command in commands:
+        print(f"  {event}: {command}")
+    while True:
+        try:
+            answer = input("enable these hooks? [y]es / [n]o: ").strip().lower()
+        except EOFError:
+            return False  # no interactive consent = no hooks
+        match answer:
+            case "y" | "yes":
+                return True
+            case "n" | "no":
+                return False
+            case _:
+                print("  please answer y or n")
+
+
 def environment(workspace: Path) -> Environment:
     # the one place real-world facts are read; rebuilt each turn so a
     # session that crosses midnight keeps the right date
@@ -58,20 +93,24 @@ def environment(workspace: Path) -> Environment:
     )
 
 
-def current_system_prompt(workspace: Path) -> str:
-    return build_system_prompt(environment(workspace))
+def current_system_prompt(
+    workspace: Path, extra_sections: list[str] | None = None
+) -> str:
+    return build_system_prompt(environment(workspace), extra_sections=extra_sections)
 
 
-def current_subagent_prompt(workspace: Path) -> str:
+def current_subagent_prompt(
+    workspace: Path, extra_sections: list[str] | None = None
+) -> str:
     # same core prompt, plus the role section — the extra_sections seam
+    role = (
+        "You are a subagent: another agent delegated one self-contained "
+        "task to you. Work it to completion and make your final reply "
+        "the complete answer — it is the only thing the delegating "
+        "agent will see."
+    )
     return build_system_prompt(
-        environment(workspace),
-        extra_sections=[
-            "You are a subagent: another agent delegated one self-contained "
-            "task to you. Work it to completion and make your final reply "
-            "the complete answer — it is the only thing the delegating "
-            "agent will see."
-        ],
+        environment(workspace), extra_sections=[role] + (extra_sections or [])
     )
 
 
@@ -181,6 +220,18 @@ def main():
         print(f"  ⚙↳ {name}({json.dumps(args)})")
         record_action("subagent", name, args)
 
+    try:
+        hookset = load_hooks(workspace / "hooks.json")
+    except (ValueError, json.JSONDecodeError) as error:
+        parser.error(f"hooks.json: {error}")
+    if not approve_hooks(hookset):
+        print("(hooks disabled for this session)")
+        hookset = HookSet()
+    try:
+        hook_sections = run_session_start(hookset)
+    except HookError as error:
+        parser.error(str(error))
+
     llm = CodexAdapter()
     compact_threshold = (
         cli_args.compact_threshold
@@ -196,6 +247,11 @@ def main():
             bash_tool(sandbox=sandbox),
         ]
     }
+    # wrapped BEFORE the agent tool joins: the sub's closure must capture
+    # the hooked registry (no evading a block by delegating), while the
+    # agent tool itself stays unwrapped — rewrapping it would break the
+    # identity-based recursion guard
+    tools = with_hooks(tools, hookset, on_warning=lambda w: print(f"({w})"))
     policy = PermissionPolicy(cli_args.mode)
     # built once: the callable system prompt is re-evaluated per delegation,
     # so the sub's env facts (date, cwd) never go stale anyway
@@ -203,7 +259,7 @@ def main():
         llm,
         tools,
         policy=policy,
-        system=lambda: current_subagent_prompt(workspace),
+        system=lambda: current_subagent_prompt(workspace, hook_sections),
         on_tool_call=observe_sub_tool_call,
         compact_threshold=compact_threshold,
     )
@@ -246,7 +302,7 @@ def main():
                 on_tool_call=observe_tool_call,
                 policy=policy,
                 asker=ask_user,
-                system=current_system_prompt(workspace),
+                system=current_system_prompt(workspace, hook_sections),
                 compact_threshold=compact_threshold,
                 keep_recent=KEEP_RECENT,
                 on_compact=on_compact,
@@ -254,6 +310,8 @@ def main():
             )
             print("agent:", reply["content"])
             record_turn()
+            for warning in run_stop(hookset, reply):
+                print(f"({warning})")
         except KeyboardInterrupt:
             # drop the half-built exchange: a dangling tool_call in history
             # would poison every later request. Compaction may have shifted

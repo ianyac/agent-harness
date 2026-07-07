@@ -78,8 +78,10 @@ class TurnRunner:
             agent = agent_tool(
                 self._llm,  # wrapped: subagent model calls honor cancel too
                 sub_registry,
+                # lesson 13: subagents never prompt — no asker; the harness
+                # denies ask-decisions inside a sub, and "always" grants
+                # flow down through the shared policy
                 policy=policy,
-                asker=self._asker,
                 system=subagent_system_prompt,
                 on_tool_call=self._on_tool_call,
                 compact_threshold=compact_threshold,

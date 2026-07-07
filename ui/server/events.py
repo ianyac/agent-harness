@@ -50,9 +50,12 @@ def turn_done(messages: list[dict]) -> dict:
     return {"type": "turn_done", "messages": messages}
 
 
-def turn_cancelled() -> dict:
-    return {"type": "turn_cancelled"}
+def turn_cancelled(messages: list[dict]) -> dict:
+    # carries the post-rollback authoritative list so a client that
+    # reconnected mid-turn (snapshot included the now-rolled-back turn)
+    # self-heals instead of keeping phantom items
+    return {"type": "turn_cancelled", "messages": messages}
 
 
-def turn_error(message: str) -> dict:
-    return {"type": "turn_error", "message": message}
+def turn_error(message: str, messages: list[dict]) -> dict:
+    return {"type": "turn_error", "message": message, "messages": messages}

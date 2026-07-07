@@ -7,7 +7,7 @@ from harness.tools.base import Tool
 from starlette.websockets import WebSocketDisconnect
 
 from ui.server.app import create_app
-from ui.server.tests.fake_llm import FakeLLM, text_reply, tool_reply
+from ui.server.tests.fake_llm import text_reply, tool_reply
 from ui.server.tests.test_app import make_deps
 
 

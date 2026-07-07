@@ -122,9 +122,11 @@ class TurnRunner:
     # -- worker thread -------------------------------------------------------
     def run_turn_blocking(self, text: str) -> None:
         self.streamed_text = ""
-        self._emit(events.turn_started())
         extra = {"on_text_delta": self._on_text_delta} if self._streaming else {}
         try:
+            # inside the try: if emit ever raises (e.g. closed loop during
+            # teardown), the finally must still free the turn slot
+            self._emit(events.turn_started())
             self._run_turn(
                 self.messages,
                 text,
@@ -141,10 +143,12 @@ class TurnRunner:
             )
         except TurnCancelled:
             self._rollback()
-            self._emit(events.turn_cancelled())
+            self._emit(events.turn_cancelled(list(self.messages)))
         except Exception as error:  # noqa: BLE001 — surfaced to the browser
             self._rollback()
-            self._emit(events.turn_error(f"{type(error).__name__}: {error}"))
+            self._emit(
+                events.turn_error(f"{type(error).__name__}: {error}", list(self.messages))
+            )
         else:
             self._emit(events.turn_done(list(self.messages)))
         finally:

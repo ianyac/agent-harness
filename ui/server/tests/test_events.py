@@ -13,8 +13,8 @@ def test_every_event_has_a_type_and_serializes():
         events.permission_request("perm-1", "bash", {"command": "rm x"}),
         events.compaction(12),
         events.turn_done([{"role": "assistant", "content": "done"}]),
-        events.turn_cancelled(),
-        events.turn_error("RuntimeError: boom"),
+        events.turn_cancelled([]),
+        events.turn_error("RuntimeError: boom", []),
     ]
     types = [e["type"] for e in all_events]
     assert types == [
@@ -39,4 +39,8 @@ def test_payload_keys():
     assert (perm["id"], perm["name"], perm["args"]) == ("perm-2", "bash", {"command": "ls"})
     assert events.compaction(3)["summarized"] == 3
     assert events.turn_done([{"role": "user", "content": "q"}])["messages"] == [{"role": "user", "content": "q"}]
-    assert events.turn_error("boom")["message"] == "boom"
+    history = [{"role": "assistant", "content": "kept"}]
+    cancelled = events.turn_cancelled(history)
+    assert cancelled["messages"] == history
+    error = events.turn_error("boom", history)
+    assert (error["message"], error["messages"]) == ("boom", history)

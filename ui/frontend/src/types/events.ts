@@ -16,8 +16,8 @@ export type ServerEvent =
   | { type: 'permission_request'; id: string; name: string; args: Record<string, unknown> }
   | { type: 'compaction'; summarized: number }
   | { type: 'turn_done'; messages: Message[] }
-  | { type: 'turn_cancelled' }
-  | { type: 'turn_error'; message: string }
+  | { type: 'turn_cancelled'; messages: Message[] }
+  | { type: 'turn_error'; message: string; messages: Message[] }
 
 export type ClientMessage =
   | { type: 'user_message'; text: string }

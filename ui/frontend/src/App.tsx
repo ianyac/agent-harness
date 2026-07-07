@@ -22,8 +22,12 @@ export default function App() {
   const [inspectorOpen, setInspectorOpen] = useState(false)
   const [selectedIndex, setSelectedIndex] = useState<number | null>(null)
   const [restoredInput, setRestoredInput] = useState('')
+  const [errorDismissed, setErrorDismissed] = useState(false)
   const socketRef = useRef<SessionSocket | null>(null)
   const lastSentRef = useRef('')
+
+  // a new error un-dismisses the banner
+  useEffect(() => setErrorDismissed(false), [state.lastError])
 
   const refreshSessions = useCallback(async () => {
     setSessions(await (await fetch('/api/sessions')).json())
@@ -95,6 +99,12 @@ export default function App() {
                 args={state.pendingPermission.args}
                 answer={null} onAnswer={answer}
               />
+            )}
+            {state.lastError && !errorDismissed && (
+              <div className="error-banner">
+                turn failed: {state.lastError}
+                <button onClick={() => setErrorDismissed(true)}>dismiss</button>
+              </div>
             )}
             <Composer
               disabled={state.turnRunning || socketStatus !== 'open'}

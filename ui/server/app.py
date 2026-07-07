@@ -7,7 +7,7 @@ FakeLLM; __main__.py builds the real deps (CodexAdapter, sandboxed tools).
 import asyncio
 import json
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
@@ -53,6 +53,7 @@ class HarnessDeps:
     mode: str
     workspace: str
     compact_threshold: int | None = None
+    keep_recent: int = 8  # messages kept verbatim through a compaction
 
 
 def _session_meta(session: Session) -> dict:
@@ -82,6 +83,7 @@ def create_app(
                 emit=sink.push,
                 subagent_system_prompt=deps.subagent_system_prompt,
                 compact_threshold=deps.compact_threshold,
+                keep_recent=deps.keep_recent,
             )
             runners[session.id] = (runner, sink)
         return runners[session.id]
@@ -136,7 +138,10 @@ def create_app(
         await ws.accept()
         old = active_sockets.pop(session_id, None)
         if old is not None:
-            await old.close(code=4000)  # latest connection wins
+            try:
+                await old.close(code=4000)  # latest connection wins
+            except Exception:  # noqa: BLE001
+                pass  # a dead old socket must not kill the new connection
         active_sockets[session_id] = ws
 
         runner, sink = get_runner(session)
@@ -170,7 +175,10 @@ def create_app(
                             )
                         else:
                             sink.push(
-                                events.turn_error("a turn is already running")
+                                events.turn_error(
+                                    "a turn is already running",
+                                    list(session.messages),
+                                )
                             )
                     case "permission_answer" if msg.get("answer") in (
                         "yes", "no", "always",

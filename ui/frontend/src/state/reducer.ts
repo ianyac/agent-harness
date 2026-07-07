@@ -127,6 +127,36 @@ function reinterleave(rebuilt: TranscriptItem[], ephemeral: EphemeralItem[]): Tr
   return merged
 }
 
+// turn_cancelled / turn_error carry the post-rollback authoritative list
+// (like turn_done), so a client that reconnected mid-turn — whose snapshot
+// included the now-rolled-back turn — self-heals instead of keeping phantom
+// items. Ephemera anchored beyond the rebuilt list belonged to the
+// rolled-back turn and are dropped with it; the notice lands at the end.
+function terminalRebuild(
+  state: SessionState,
+  messages: Message[],
+  noticeText: string,
+  lastError: string | null,
+): SessionState {
+  const rebuilt = buildItemsFromMessages(messages)
+  const survivingCount = messageBackedCount(rebuilt)
+  const ephemeral = state.items.filter(isEphemeral)
+    .filter((item) => (item.anchor ?? Infinity) <= survivingCount)
+  const merged = reinterleave(rebuilt, ephemeral)
+  merged.push({ kind: 'notice', text: noticeText, anchor: survivingCount,
+    key: `live-${state.nextKey}` })
+  return {
+    ...state,
+    items: merged,
+    rawMessages: messages,
+    turnRunning: false,
+    pendingPermission: null,
+    turnStartIndex: merged.length,
+    lastError,
+    nextKey: state.nextKey + 1,
+  }
+}
+
 export function reducer(state: SessionState, action: Action): SessionState {
   switch (action.type) {
     case 'reset':
@@ -245,31 +275,11 @@ export function reducer(state: SessionState, action: Action): SessionState {
         turnStartIndex: merged.length,
       }
     }
-    case 'turn_cancelled': {
-      const prefix = state.items.slice(0, state.turnStartIndex)
-      return {
-        ...state,
-        items: [...prefix,
-          { kind: 'notice', text: 'turn cancelled', anchor: messageBackedCount(prefix),
-            key: `live-${state.nextKey}` }],
-        turnRunning: false,
-        pendingPermission: null,
-        nextKey: state.nextKey + 1,
-      }
-    }
-    case 'turn_error': {
-      const prefix = state.items.slice(0, state.turnStartIndex)
-      return {
-        ...state,
-        items: [...prefix,
-          { kind: 'notice', text: `turn failed: ${action.message}`,
-            anchor: messageBackedCount(prefix), key: `live-${state.nextKey}` }],
-        turnRunning: false,
-        pendingPermission: null,
-        lastError: action.message,
-        nextKey: state.nextKey + 1,
-      }
-    }
+    case 'turn_cancelled':
+      return terminalRebuild(state, action.messages, 'turn cancelled', null)
+    case 'turn_error':
+      return terminalRebuild(
+        state, action.messages, `turn failed: ${action.message}`, action.message)
     default:
       return state
   }

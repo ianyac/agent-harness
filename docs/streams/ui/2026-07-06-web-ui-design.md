@@ -70,9 +70,9 @@ Server → client:
 | `tool_result` | name, result text | UI-side `Tool.execute` wrapper |
 | `permission_request` | id, tool name, args | `asker` bridge |
 | `compaction` | count of messages summarized | `on_compact` |
-| `turn_done` | this turn's messages slice (authoritative dicts) | runner |
-| `turn_cancelled` | — | runner |
-| `turn_error` | error message | runner |
+| `turn_done` | full authoritative messages list | runner |
+| `turn_cancelled` | full authoritative (post-rollback) messages list | runner |
+| `turn_error` | error message, full authoritative (post-rollback) messages list | runner |
 
 There is deliberately no `assistant_message` event: no existing seam fires
 per assistant reply mid-turn. Instead, deltas accumulate into an open

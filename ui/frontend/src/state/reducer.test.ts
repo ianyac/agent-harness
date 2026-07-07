@@ -95,21 +95,46 @@ describe('reducer', () => {
   })
 
   it('cancel and error drop the turn items and leave a notice', () => {
+    const history: Message[] = [
+      { role: 'user', content: 'q1' }, { role: 'assistant', content: 'a1' },
+    ]
     const base: Action[] = [
       { type: 'local_user_message', text: 'q1' },
       { type: 'turn_started' },
-      { type: 'turn_done', messages: [
-        { role: 'user', content: 'q1' }, { role: 'assistant', content: 'a1' },
-      ]},
+      { type: 'turn_done', messages: history },
       { type: 'local_user_message', text: 'q2' },
       { type: 'turn_started' },
       { type: 'tool_call', name: 'echo', args: { x: 1 } },
     ]
-    const cancelled = play([...base, { type: 'turn_cancelled' }])
+    const cancelled = play([...base, { type: 'turn_cancelled', messages: history }])
     expect(cancelled.items.map((i) => i.kind)).toEqual(['user', 'assistant', 'notice'])
-    const failed = play([...base, { type: 'turn_error', message: 'RuntimeError: boom' }])
+    const failed = play([...base,
+      { type: 'turn_error', message: 'RuntimeError: boom', messages: history }])
     expect(failed.items.map((i) => i.kind)).toEqual(['user', 'assistant', 'notice'])
     expect(failed.lastError).toBe('RuntimeError: boom')
+  })
+
+  it('cancel after a mid-turn reconnect removes the phantom turn', () => {
+    // the snapshot arrived mid-turn, so it already contains the running
+    // turn's partial messages; the server then rolls that turn back
+    const state = play([
+      { type: 'session_snapshot',
+        messages: [
+          { role: 'user', content: 'q1' }, { role: 'assistant', content: 'a1' },
+          { role: 'user', content: 'q2' },
+          { role: 'assistant', content: null,
+            tool_calls: [{ id: 'call-1', type: 'function',
+              function: { name: 'echo', arguments: '{"x":1}' } }] },
+        ],
+        turn_running: true, pending_permission: null, streamed_text: '' },
+      { type: 'turn_cancelled', messages: [
+        { role: 'user', content: 'q1' }, { role: 'assistant', content: 'a1' },
+      ]},
+    ])
+    expect(state.items.map((i) => i.kind)).toEqual(['user', 'assistant', 'notice'])
+    expect(state.items[0]).toMatchObject({ text: 'q1' })
+    expect(state.rawMessages).toHaveLength(2)
+    expect(state.turnRunning).toBe(false)
   })
 
   it('replay equals live for the message-backed items', () => {

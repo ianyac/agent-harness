@@ -76,6 +76,7 @@ def main() -> None:
         mode=args.mode,
         workspace=str(workspace),
         compact_threshold=int(COMPACT_FRACTION * llm.context_window),
+        keep_recent=KEEP_RECENT,
     )
     uvicorn.run(create_app(deps), host=args.host, port=args.port)
 

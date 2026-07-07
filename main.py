@@ -21,6 +21,7 @@ from harness.permissions import MODES, PermissionPolicy
 from harness.prompts import Environment, build_system_prompt
 from harness.sandbox import SandboxPolicy, default_sandbox
 from harness.session import SessionLog, lock, unlock
+from harness.skills import discover, skills_section, view_skill_tool
 from harness.tools.agent import agent_tool
 from harness.tools.bash import bash_tool
 from harness.tools.list_dir import list_dir_tool
@@ -238,21 +239,29 @@ def main():
     except HookError as error:
         parser.error(str(error))
 
+    # extra prompt sections, in order: hook-injected context, then the
+    # skills menu (metadata only — bodies load on demand via view_skill)
+    skills = discover(workspace / "skills")
+    section = skills_section(skills)
+    context_sections = hook_sections + ([section] if section else [])
+
     llm = CodexAdapter()
     compact_threshold = (
         cli_args.compact_threshold
         if cli_args.compact_threshold is not None
         else int(COMPACT_FRACTION * llm.context_window)
     )
-    tools = {
-        tool.name: tool
-        for tool in [
-            read_file_tool(workspace=workspace),
-            write_file_tool(workspace=workspace),
-            list_dir_tool(workspace=workspace),
-            bash_tool(sandbox=sandbox),
-        ]
-    }
+    registry = [
+        read_file_tool(workspace=workspace),
+        write_file_tool(workspace=workspace),
+        list_dir_tool(workspace=workspace),
+        bash_tool(sandbox=sandbox),
+    ]
+    if skills:
+        # only offer view_skill when there is a menu to view — otherwise the
+        # model can waste a turn calling a tool that can only ever error
+        registry.append(view_skill_tool(skills))
+    tools = {tool.name: tool for tool in registry}
     policy = PermissionPolicy(cli_args.mode)
     # built once: the callable system prompt is re-evaluated per delegation,
     # so the sub's env facts (date, cwd) never go stale anyway
@@ -260,7 +269,7 @@ def main():
         llm,
         tools,
         policy=policy,
-        system=lambda: current_subagent_prompt(workspace, hook_sections),
+        system=lambda: current_subagent_prompt(workspace, context_sections),
         on_tool_call=observe_sub_tool_call,
         compact_threshold=compact_threshold,
     )
@@ -308,7 +317,7 @@ def main():
                 on_tool_call=observe_tool_call,
                 policy=policy,
                 asker=ask_user,
-                system=current_system_prompt(workspace, hook_sections),
+                system=current_system_prompt(workspace, context_sections),
                 compact_threshold=compact_threshold,
                 keep_recent=KEEP_RECENT,
                 on_compact=on_compact,

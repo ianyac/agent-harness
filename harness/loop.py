@@ -42,6 +42,7 @@ def run_turn(
     keep_recent: int = 8,
     on_compact: Callable[[int], None] | None = None,
     breadcrumbs: str | Callable[[], str] | None = None,
+    on_chunk: Callable[[str], None] | None = None,
 ) -> dict:
     tools = tools or {}
     defs = definitions(tools) or None
@@ -66,7 +67,7 @@ def run_turn(
                 messages[:] = compacted  # in place: the caller owns this list
                 if on_compact is not None:
                     on_compact(summarized)
-        reply = llm.complete(messages, tools=defs, system=system)
+        reply = llm.complete(messages, tools=defs, system=system, on_chunk=on_chunk)
         messages.append(reply)
         calls = reply.get("tool_calls")
         if not calls:

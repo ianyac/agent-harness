@@ -84,7 +84,7 @@ def test_subagent_failure_becomes_an_error_result():
             self.inner = FakeLLM(script)
             self.calls = 0
 
-        def complete(self, messages, tools=None, system=None):
+        def complete(self, messages, tools=None, system=None, on_chunk=None):
             self.calls += 1
             if self.calls == 2:  # the sub's one and only model call
                 raise RuntimeError("backend down")

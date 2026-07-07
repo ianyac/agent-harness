@@ -13,6 +13,7 @@ class LLMClient(Protocol):
         messages: list[dict],
         tools: list[dict] | None = None,
         system: str | None = None,
+        on_chunk: Callable[[str], None] | None = None,
     ) -> dict: ...
 
 
@@ -201,15 +202,21 @@ class CodexAdapter:
         messages: list[dict],
         tools: list[dict] | None = None,
         system: str | None = None,
+        on_chunk: Callable[[str], None] | None = None,
     ) -> dict:
         body = build_request_body(
             self.model, self.instructions, messages, tools, system
         )
         # store=False makes the request idempotent, so a stream that dies
-        # mid-way is safely retried from scratch (partials discarded)
-        return with_retries(lambda: self._attempt(body))
+        # mid-way is safely retried from scratch (partials discarded).
+        # Caveat for streaming: a retry regenerates from scratch, so chunks
+        # already shown from the dead attempt are stale — the assembled
+        # message (the box, not the texts) is the only source of truth.
+        return with_retries(lambda: self._attempt(body, on_chunk))
 
-    def _attempt(self, body: dict) -> dict:
+    def _attempt(
+        self, body: dict, on_chunk: Callable[[str], None] | None = None
+    ) -> dict:
         output_items: list[dict] = []
         final = None
         with httpx.Client(timeout=120) as client:
@@ -239,6 +246,11 @@ class CodexAdapter:
                         output_items.append(event["item"])
                     elif event.get("type") == "response.completed":
                         final = event["response"]
+                    elif event.get("type") == "response.output_text.delta":
+                        # the deltas were always here; lesson 16 finally
+                        # forwards them instead of dropping the liveness
+                        if on_chunk is not None:
+                            on_chunk(event.get("delta", ""))
         if final is None:
             raise RuntimeError("codex stream ended without response.completed")
         if not final.get("output"):

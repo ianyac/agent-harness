@@ -1,5 +1,6 @@
 import json
 from copy import deepcopy
+from typing import Callable
 
 
 class FakeLLM:
@@ -27,6 +28,7 @@ class FakeLLM:
         messages: list[dict],
         tools: list[dict] | None = None,
         system: str | None = None,
+        on_chunk: Callable[[str], None] | None = None,
     ) -> dict:
         turn = self.turns[self.current_line]
         self.current_line += 1
@@ -36,6 +38,11 @@ class FakeLLM:
         entry = turn["output"]
         match entry["type"]:
             case "text":
+                if on_chunk is not None:
+                    # emit the scripted text in small slices, like a real
+                    # stream — chunks must join to exactly the content
+                    for i in range(0, len(entry["content"]), 5):
+                        on_chunk(entry["content"][i : i + 5])
                 return {"role": "assistant", "content": entry["content"]}
             case "tool_calls":
                 return {

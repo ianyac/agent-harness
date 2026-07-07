@@ -21,6 +21,7 @@ from harness.permissions import MODES, PermissionPolicy
 from harness.prompts import Environment, build_system_prompt
 from harness.sandbox import SandboxPolicy, default_sandbox
 from harness.session import SessionLog, lock, unlock
+from harness.skills import discover, skills_section, view_skill_tool
 from harness.tools.agent import agent_tool
 from harness.tools.bash import bash_tool
 from harness.tools.list_dir import list_dir_tool
@@ -238,6 +239,12 @@ def main():
     except HookError as error:
         parser.error(str(error))
 
+    # extra prompt sections, in order: hook-injected context, then the
+    # skills menu (metadata only — bodies load on demand via view_skill)
+    skills = discover(workspace / "skills")
+    section = skills_section(skills)
+    context_sections = hook_sections + ([section] if section else [])
+
     llm = CodexAdapter()
     compact_threshold = (
         cli_args.compact_threshold
@@ -251,6 +258,7 @@ def main():
             write_file_tool(workspace=workspace),
             list_dir_tool(workspace=workspace),
             bash_tool(sandbox=sandbox),
+            view_skill_tool(skills),
         ]
     }
     policy = PermissionPolicy(cli_args.mode)
@@ -260,7 +268,7 @@ def main():
         llm,
         tools,
         policy=policy,
-        system=lambda: current_subagent_prompt(workspace, hook_sections),
+        system=lambda: current_subagent_prompt(workspace, context_sections),
         on_tool_call=observe_sub_tool_call,
         compact_threshold=compact_threshold,
     )
@@ -308,7 +316,7 @@ def main():
                 on_tool_call=observe_tool_call,
                 policy=policy,
                 asker=ask_user,
-                system=current_system_prompt(workspace, hook_sections),
+                system=current_system_prompt(workspace, context_sections),
                 compact_threshold=compact_threshold,
                 keep_recent=KEEP_RECENT,
                 on_compact=on_compact,

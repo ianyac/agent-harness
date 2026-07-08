@@ -49,6 +49,13 @@ untouched.
    the same startup approval gate as hooks: listed, explicit "y",
    non-tty = disabled. Servers run unsandboxed (they are long-lived
    subprocesses with their own needs); the gate is the mitigation.
+   *Amended at the lesson 17 quiz (2026-07-08, yc):* a server that fails
+   to start or discover degrades — closed, reported, session continues
+   without its tools. A server is a capability, not policy: hooks fail
+   closed because skipping them changes what is allowed; skipping a
+   server only shrinks what is possible (same rule as an unparsable
+   skill). Malformed `mcp.json` itself remains a startup hard error — a
+   typo'd key must not silently disable a server.
 6. **MCP tools join the registry namespaced `<server>__<tool>`** to
    avoid colliding with builtins or each other. `read_only` honors the
    server's declared `readOnlyHint` annotation when present, else

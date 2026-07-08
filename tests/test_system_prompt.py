@@ -1,15 +1,6 @@
 from harness.loop import run_turn
-from harness.tools.base import Tool
 from tests.fake_llm import FakeLLM
-
-
-def noop_tool() -> Tool:
-    return Tool(
-        name="noop",
-        description="A tool that does nothing, for tests.",
-        parameters={"type": "object", "properties": {}},
-        execute=lambda: "ok",
-    )
+from tests.helpers import noop_tool
 
 
 def test_run_turn_forwards_system_to_every_model_call():

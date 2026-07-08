@@ -5,16 +5,7 @@ from harness.permissions import PermissionPolicy
 from harness.tools.agent import agent_tool
 from harness.tools.base import Tool
 from tests.fake_llm import FakeLLM
-
-
-def noop_tool(read_only: bool = True) -> Tool:
-    return Tool(
-        name="noop",
-        description="A tool that does nothing, for tests.",
-        parameters={"type": "object", "properties": {}},
-        execute=lambda: "ok",
-        read_only=read_only,
-    )
+from tests.helpers import noop_tool
 
 
 def test_subagent_returns_only_the_final_answer():
@@ -84,7 +75,7 @@ def test_subagent_failure_becomes_an_error_result():
             self.inner = FakeLLM(script)
             self.calls = 0
 
-        def complete(self, messages, tools=None, system=None):
+        def complete(self, messages, tools=None, system=None, on_text_delta=None):
             self.calls += 1
             if self.calls == 2:  # the sub's one and only model call
                 raise RuntimeError("backend down")

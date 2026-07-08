@@ -13,6 +13,7 @@ class LLMClient(Protocol):
         messages: list[dict],
         tools: list[dict] | None = None,
         system: str | None = None,
+        on_text_delta: Callable[[str], None] | None = None,
     ) -> dict: ...
 
 
@@ -167,6 +168,26 @@ def build_request_body(
     return body
 
 
+def process_sse_event(
+    event: dict,
+    output_items: list[dict],
+    on_text_delta: Callable[[str], None] | None,
+) -> dict | None:
+    """Dispatch one SSE event: collect finished items, forward text deltas
+    (the liveness lesson 16 finally surfaces), and return the final
+    response when it arrives. Pure, so the offline suite can pin it."""
+    kind = event.get("type")
+    if kind == "response.output_item.done":
+        output_items.append(event["item"])
+    elif kind == "response.completed":
+        return event["response"]
+    elif kind == "response.output_text.delta":
+        delta = event.get("delta", "")
+        if delta and on_text_delta is not None:  # empty deltas carry nothing
+            on_text_delta(delta)
+    return None
+
+
 # context window per model slug, from the backend's /codex/models metadata
 # (probed 2026-07-06); not queryable at request time, so it rides here
 CONTEXT_WINDOWS = {"gpt-5.5": 272_000}
@@ -201,15 +222,21 @@ class CodexAdapter:
         messages: list[dict],
         tools: list[dict] | None = None,
         system: str | None = None,
+        on_text_delta: Callable[[str], None] | None = None,
     ) -> dict:
         body = build_request_body(
             self.model, self.instructions, messages, tools, system
         )
         # store=False makes the request idempotent, so a stream that dies
-        # mid-way is safely retried from scratch (partials discarded)
-        return with_retries(lambda: self._attempt(body))
+        # mid-way is safely retried from scratch (partials discarded).
+        # Caveat for streaming: a retry regenerates from scratch, so chunks
+        # already shown from the dead attempt are stale — the assembled
+        # message (the box, not the texts) is the only source of truth.
+        return with_retries(lambda: self._attempt(body, on_text_delta))
 
-    def _attempt(self, body: dict) -> dict:
+    def _attempt(
+        self, body: dict, on_text_delta: Callable[[str], None] | None
+    ) -> dict:
         output_items: list[dict] = []
         final = None
         with httpx.Client(timeout=120) as client:
@@ -235,10 +262,9 @@ class CodexAdapter:
                     if data == "[DONE]":
                         break
                     event = json.loads(data)
-                    if event.get("type") == "response.output_item.done":
-                        output_items.append(event["item"])
-                    elif event.get("type") == "response.completed":
-                        final = event["response"]
+                    result = process_sse_event(event, output_items, on_text_delta)
+                    if result is not None:
+                        final = result
         if final is None:
             raise RuntimeError("codex stream ended without response.completed")
         if not final.get("output"):

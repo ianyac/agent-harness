@@ -1,3 +1,4 @@
+import json
 import sys
 import time
 from pathlib import Path
@@ -5,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from harness.loop import run_turn
-from harness.mcp import MCPError, MCPServer, mcp_tools
+from harness.mcp import MCPError, MCPServer, load_config, mcp_tools
 from tests.fake_llm import FakeLLM
 
 FAKE = Path(__file__).parent / "fake_mcp_server.py"
@@ -127,3 +128,29 @@ def test_a_server_that_speaks_garbage_fails_at_startup():
 def test_a_server_that_dies_immediately_fails_at_startup():
     with pytest.raises(MCPError):
         MCPServer("gone", "true").start()
+
+
+def test_missing_config_means_no_servers(tmp_path):
+    assert load_config(tmp_path / "absent.json") == {}
+
+
+def test_config_parses_names_to_commands(tmp_path):
+    path = tmp_path / "mcp.json"
+    path.write_text(json.dumps({"servers": {"fake": {"command": "run me"}}}))
+    assert load_config(path) == {"fake": "run me"}
+
+
+def test_malformed_config_fails_at_load(tmp_path):
+    path = tmp_path / "mcp.json"
+    for bad in [
+        "not json",
+        json.dumps({"Servers": {}}),  # typo'd key must not read as empty
+        json.dumps({"servers": []}),
+        json.dumps({"servers": {"fake": {"cmd": "x"}}}),
+        json.dumps({"servers": {"fake": {"command": ""}}}),
+        json.dumps({"servers": {"fake": {"command": 42}}}),
+        json.dumps({"servers": {"": {"command": "x"}}}),
+    ]:
+        path.write_text(bad)
+        with pytest.raises(ValueError):
+            load_config(path)

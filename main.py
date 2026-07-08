@@ -17,6 +17,7 @@ from harness.hooks import (
 )
 from harness.llm import CodexAdapter
 from harness.loop import run_turn
+from harness.mcp import MCPError, MCPServer, load_config, mcp_tools
 from harness.permissions import MODES, PermissionPolicy
 from harness.prompts import Environment, build_system_prompt
 from harness.sandbox import SandboxPolicy, default_sandbox
@@ -58,28 +59,25 @@ def ask_user(name: str, args: dict) -> str:
                 print("  please answer y, n, or a")
 
 
-def approve_hooks(hookset: HookSet) -> bool:
-    """hooks.json is workspace config — a clone can ship it and the agent
-    can write it — so its commands run only after the human reads them.
-    Runs BEFORE any hook executes, session_start included."""
-    commands = [
-        (event, hook.command) for event in EVENTS for hook in getattr(hookset, event)
-    ]
+def approve_commands(source: str, noun: str, commands: list[str]) -> bool:
+    """Workspace config (hooks.json, mcp.json) is clone-shippable and
+    model-writable, so its commands run only after the human reads them
+    on a real terminal. Runs BEFORE any listed command executes."""
     if not commands:
         return True
     if not sys.stdin.isatty():
         # no human at the terminal means no one read the listing: piped
         # input must never be able to approve unsandboxed commands
-        print("(hooks.json present but stdin is not interactive — hooks disabled)")
+        print(f"({source} present but stdin is not interactive — {noun} disabled)")
         return False
-    print("hooks.json wants to run these commands (unsandboxed):")
-    for event, command in commands:
-        print(f"  {event}: {command}")
+    print(f"{source} wants to run these commands (unsandboxed):")
+    for line in commands:
+        print(f"  {line}")
     while True:
         try:
-            answer = input("enable these hooks? [y]es / [n]o: ").strip().lower()
+            answer = input(f"enable these {noun}? [y]es / [n]o: ").strip().lower()
         except EOFError:
-            return False  # no interactive consent = no hooks
+            return False  # no interactive consent = nothing runs
         match answer:
             case "y" | "yes":
                 return True
@@ -87,6 +85,20 @@ def approve_hooks(hookset: HookSet) -> bool:
                 return False
             case _:
                 print("  please answer y or n")
+
+
+def approve_hooks(hookset: HookSet) -> bool:
+    commands = [
+        f"{event}: {hook.command}"
+        for event in EVENTS
+        for hook in getattr(hookset, event)
+    ]
+    return approve_commands("hooks.json", "hooks", commands)
+
+
+def approve_mcp(servers: dict[str, str]) -> bool:
+    commands = [f"{name}: {command}" for name, command in servers.items()]
+    return approve_commands("mcp.json", "servers", commands)
 
 
 class StreamLine:
@@ -294,6 +306,30 @@ def main():
     section = skills_section(skills)
     context_sections = hook_sections + ([section] if section else [])
 
+    try:
+        server_commands = load_config(workspace / "mcp.json")
+    except ValueError as error:
+        parser.error(f"mcp.json: {error}")
+    if not approve_mcp(server_commands):
+        print("(MCP servers disabled for this session)")
+        server_commands = {}
+    mcp_servers: list[MCPServer] = []
+    foreign_tools = []
+    for name, command in server_commands.items():
+        server = MCPServer(name, command)
+        mcp_servers.append(server)  # before start: close() is None-safe
+        try:
+            server.start()
+            discovered = mcp_tools(server)
+        except MCPError as error:
+            # a configured server that can't serve is a startup error, but
+            # its already-running siblings must not outlive the process
+            for running in mcp_servers:
+                running.close()
+            parser.error(f"MCP server {name!r}: {error}")
+        foreign_tools.extend(discovered)
+        print(f"(mcp: {name} serves {len(discovered)} tools)")
+
     llm = CodexAdapter()
     compact_threshold = (
         cli_args.compact_threshold
@@ -310,6 +346,9 @@ def main():
         # only offer view_skill when there is a menu to view — otherwise the
         # model can waste a turn calling a tool that can only ever error
         registry.append(view_skill_tool(skills))
+    # foreign tools join before the agent tool: subagents inherit them, and
+    # the in-place hook wrapping below covers them like any native tool
+    registry.extend(foreign_tools)
     tools = {tool.name: tool for tool in registry}
     policy = PermissionPolicy(cli_args.mode)
     # built once: the callable system prompt is re-evaluated per delegation,
@@ -404,6 +443,8 @@ def main():
             # persist whatever completed exchanges the log is still missing
             record_turn()
     unlock(session_path)
+    for server in mcp_servers:
+        server.close()
 
 
 if __name__ == "__main__":

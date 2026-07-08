@@ -31,6 +31,41 @@ class MCPError(Exception):
     pass
 
 
+def load_config(path) -> dict[str, str]:
+    """Parse mcp.json into {server name: command}.
+
+    Missing file = no servers. Anything else malformed is a ValueError —
+    the hooks.json rule: config mistakes die at startup, never
+    mid-conversation, and a typo'd key must not silently disable a server.
+    """
+    try:
+        raw = path.read_text()
+    except FileNotFoundError:
+        return {}
+    except OSError as error:
+        raise ValueError(f"cannot read {path}: {error}")
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"invalid JSON in {path}: {error}")
+    if not isinstance(data, dict) or set(data) - {"servers"}:
+        raise ValueError(f'{path}: expected {{"servers": {{name: {{"command": ...}}}}}}')
+    servers = data.get("servers", {})
+    if not isinstance(servers, dict):
+        raise ValueError(f'{path}: "servers" must be an object')
+    commands = {}
+    for name, spec in servers.items():
+        if not name:
+            raise ValueError(f"{path}: server names must be non-empty")
+        if not isinstance(spec, dict) or set(spec) - {"command"}:
+            raise ValueError(f'{path}: server {name!r} must be {{"command": "..."}}')
+        command = spec.get("command")
+        if not isinstance(command, str) or not command.strip():
+            raise ValueError(f"{path}: server {name!r} needs a non-empty command string")
+        commands[name] = command
+    return commands
+
+
 class MCPServer:
     """One stdio MCP server: a child process we speak JSON-RPC to."""
 

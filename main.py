@@ -1,4 +1,5 @@
 import argparse
+import atexit
 import datetime
 import json
 import os
@@ -313,11 +314,15 @@ def main():
     if not approve_mcp(server_commands):
         print("(MCP servers disabled for this session)")
         server_commands = {}
-    mcp_servers: list[MCPServer] = []
     foreign_tools = []
     for name, command in server_commands.items():
-        server = MCPServer(name, command)
-        mcp_servers.append(server)  # before start: close() is None-safe
+        # commands resolve in the workspace — the config the human read —
+        # not wherever the harness happened to launch (the hooks rule)
+        server = MCPServer(name, command, cwd=str(workspace))
+        # registered at spawn: parser.error and a crash escaping run_turn
+        # must not orphan an approved unsandboxed process (close is
+        # idempotent, so the normal path costs nothing)
+        atexit.register(server.close)
         try:
             server.start()
             discovered = mcp_tools(server)
@@ -348,10 +353,16 @@ def main():
         # only offer view_skill when there is a menu to view — otherwise the
         # model can waste a turn calling a tool that can only ever error
         registry.append(view_skill_tool(skills))
+    tools = {tool.name: tool for tool in registry}
     # foreign tools join before the agent tool: subagents inherit them, and
     # the in-place hook wrapping below covers them like any native tool
-    registry.extend(foreign_tools)
-    tools = {tool.name: tool for tool in registry}
+    for tool in foreign_tools:
+        if tool.name in tools:
+            # keep-first-warn (the skills rule): a duplicate name must not
+            # silently reroute calls approved under the first identity
+            print(f"(mcp: duplicate tool name {tool.name!r} — keeping the first)")
+            continue
+        tools[tool.name] = tool
     policy = PermissionPolicy(cli_args.mode)
     # built once: the callable system prompt is re-evaluated per delegation,
     # so the sub's env facts (date, cwd) never go stale anyway
@@ -445,8 +456,6 @@ def main():
             # persist whatever completed exchanges the log is still missing
             record_turn()
     unlock(session_path)
-    for server in mcp_servers:
-        server.close()
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-from harness.skills import Skill, discover, skills_section, view_skill_tool
+from harness.skills import Skill, discover, skills_section, view_skill_tool, cmd_blocks, has_cmd_blocks, expand_body
 
 
 def write_skill(skills_dir, name, description, body):
@@ -117,3 +117,40 @@ def test_discovery_order_follows_names_not_filenames(tmp_path):
     (tmp_path / "zzz.md").write_text("---\nname: aaa\ndescription: d\n---\nx")
     (tmp_path / "mmm.md").write_text("---\nname: mmm\ndescription: d\n---\nx")
     assert [s.name for s in discover(tmp_path)] == ["aaa", "mmm"]
+
+
+def test_cmd_blocks_extracts_commands_in_order():
+    assert cmd_blocks("a !`one` b !`two`") == ["one", "two"]
+
+
+def test_has_cmd_blocks_detects_presence():
+    assert has_cmd_blocks("x !`pwd` y") is True
+    assert has_cmd_blocks("plain prose, no blocks") is False
+
+
+def test_expand_body_substitutes_command_output():
+    out = expand_body("diff:\n!`git diff`", run=lambda cmd: f"<{cmd}>")
+    assert out == "diff:\n<git diff>"
+
+
+def test_expand_body_substitutes_every_block():
+    out = expand_body("!`a` and !`b`", run=lambda cmd: cmd.upper())
+    assert out == "A and B"
+
+
+def test_expand_body_leaves_a_body_without_blocks_unchanged():
+    body = "just prose, no bang-backtick here"
+    assert expand_body(body, run=lambda cmd: "X") == body
+
+
+def test_expand_body_ignores_a_bare_code_span_and_bare_bang():
+    body = "a `code span` and a bare ! and !not-a-block"
+    assert expand_body(body, run=lambda cmd: "RAN") == body  # no !`...` pattern
+
+
+def test_expand_body_turns_a_failing_run_into_an_inline_marker():
+    def boom(cmd):
+        raise RuntimeError("sandbox down")
+
+    out = expand_body("!`whoami`", run=boom)
+    assert out == "[skill command failed: sandbox down]"

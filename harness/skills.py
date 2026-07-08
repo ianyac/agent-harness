@@ -1,3 +1,4 @@
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -74,6 +75,35 @@ def skills_section(skills: list[Skill]) -> str | None:
     lines = ["Available skills (call view_skill to load one in full):"]
     lines += [f"- {s.name}: {s.description}" for s in skills]
     return "\n".join(lines)
+
+
+_CMD = re.compile(r"!`([^`]*)`")  # !`cmd` — a bang, then a backtick-quoted command
+
+
+def cmd_blocks(body: str) -> list[str]:
+    """The commands a body will run, in order."""
+    return _CMD.findall(body)
+
+
+def has_cmd_blocks(body: str) -> bool:
+    """Does this body execute anything? Pure-prose skills answer False and so
+    need no execution approval."""
+    return _CMD.search(body) is not None
+
+
+def expand_body(body: str, run: Callable[[str], str]) -> str:
+    """Replace each !`cmd` with run(cmd), at invocation time so the output is
+    live, not a startup snapshot. A raising run becomes an inline marker rather
+    than sinking the load — one bad block must not cost the whole skill (the
+    discover() rule)."""
+
+    def replace(match: "re.Match[str]") -> str:
+        try:
+            return run(match.group(1))
+        except Exception as error:  # a bad block degrades to a note, never raises
+            return f"[skill command failed: {error}]"
+
+    return _CMD.sub(replace, body)
 
 
 def view_skill_tool(skills: list[Skill]) -> Tool:

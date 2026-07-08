@@ -322,11 +322,13 @@ def main():
             server.start()
             discovered = mcp_tools(server)
         except MCPError as error:
-            # a configured server that can't serve is a startup error, but
-            # its already-running siblings must not outlive the process
-            for running in mcp_servers:
-                running.close()
-            parser.error(f"MCP server {name!r}: {error}")
+            # a server is a capability, not policy: one that won't serve
+            # costs its own tools, loudly, and the session continues.
+            # (hooks fail closed because skipping them changes what is
+            # ALLOWED; skipping a server only shrinks what is POSSIBLE)
+            server.close()
+            print(f"(mcp: {name} unavailable — {error})")
+            continue
         foreign_tools.extend(discovered)
         print(f"(mcp: {name} serves {len(discovered)} tools)")
 

@@ -1,4 +1,4 @@
-from harness.skills import Skill, discover, skills_section, view_skill_tool, cmd_blocks, has_cmd_blocks, expand_body
+from harness.skills import Skill, discover, skills_section, skill_tool, cmd_blocks, has_cmd_blocks, expand_body
 
 
 def write_skill(skills_dir, name, description, body):
@@ -50,23 +50,44 @@ def test_no_skills_means_no_section(tmp_path):
     assert skills_section([]) is None
 
 
-def test_view_skill_returns_the_full_body(tmp_path):
+def _noop(cmd):  # a run that is never called (bodies here have no !`cmd`)
+    raise AssertionError(f"run should not have been called, got {cmd!r}")
+
+
+def test_skill_returns_the_full_body(tmp_path):
     write_skill(tmp_path, "commit-style", "how to write commits", "Use imperative mood.")
-    tool = view_skill_tool(discover(tmp_path))
+    tool = skill_tool(discover(tmp_path), run=_noop)
     assert "Use imperative mood." in tool.execute(name="commit-style")
 
 
-def test_view_skill_is_read_only(tmp_path):
+def test_skill_is_not_read_only(tmp_path):
     write_skill(tmp_path, "x", "d", "b")
-    assert view_skill_tool(discover(tmp_path)).read_only is True
+    assert skill_tool(discover(tmp_path), run=_noop).read_only is False
 
 
-def test_view_skill_on_an_unknown_name_lists_what_exists(tmp_path):
+def test_skill_on_an_unknown_name_lists_what_exists(tmp_path):
     write_skill(tmp_path, "commit-style", "d", "b")
     write_skill(tmp_path, "review-style", "d", "b")
-    result = view_skill_tool(discover(tmp_path)).execute(name="nope")
+    result = skill_tool(discover(tmp_path), run=_noop).execute(name="nope")
     assert result.startswith("Error")
     assert "commit-style" in result and "review-style" in result
+
+
+def test_skill_injects_command_output_at_invocation(tmp_path):
+    write_skill(tmp_path, "ctx", "gathers context", "user is !`whoami` now")
+    tool = skill_tool(discover(tmp_path), run=lambda cmd: f"[{cmd}]")
+    assert tool.execute(name="ctx") == "user is [whoami] now"
+
+
+def test_skill_executes_a_real_command_through_the_sandbox_runner(tmp_path):
+    from harness.tools.bash import run_sandboxed
+    from harness.sandbox import NoSandbox
+
+    write_skill(tmp_path, "greet", "greets", "says: !`echo tester`")
+    tool = skill_tool(discover(tmp_path), run=lambda cmd: run_sandboxed(cmd, NoSandbox()))
+    out = tool.execute(name="greet")
+    assert "tester" in out
+    assert "exit code: 0" in out
 
 
 def test_frontmatter_tolerates_blank_lines_and_comments(tmp_path):

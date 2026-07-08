@@ -57,7 +57,7 @@ def discover(
             on_warning(f"skipping skill {path.name}: {error}")
             continue
         if name in seen:
-            # a duplicate name would shadow the first in view_skill's lookup;
+            # a duplicate name would shadow the first in the skill tool's lookup;
             # keep the first, never silently serve the wrong body
             on_warning(f"skipping skill {path.name}: duplicate name {name!r}")
             continue
@@ -68,11 +68,11 @@ def discover(
 
 def skills_section(skills: list[Skill]) -> str | None:
     """The always-present metadata block: name + description only. Full
-    bodies are pulled in on demand via view_skill, so an unused skill costs
+    bodies are pulled in on demand by the skill tool, so an unused skill costs
     one line, not its whole content."""
     if not skills:
         return None
-    lines = ["Available skills (call view_skill to load one in full):"]
+    lines = ["Available skills (call the skill tool to load one in full):"]
     lines += [f"- {s.name}: {s.description}" for s in skills]
     return "\n".join(lines)
 
@@ -106,21 +106,21 @@ def expand_body(body: str, run: Callable[[str], str]) -> str:
     return _CMD.sub(replace, body)
 
 
-def view_skill_tool(skills: list[Skill]) -> Tool:
+def skill_tool(skills: list[Skill], run: Callable[[str], str]) -> Tool:
     bodies = {s.name: s.body for s in skills}
 
     def execute(name: str) -> str:
         if name not in bodies:
             available = ", ".join(sorted(bodies)) or "none"
             return f"Error: no skill named {name!r}. Available skills: {available}"
-        return bodies[name]
+        return expand_body(bodies[name], run)  # inject live command output
 
     return Tool(
-        name="view_skill",
+        name="skill",
         description=(
-            "Load the full instructions for one of the available skills "
-            "(listed in the system prompt) by name. Do this before a task "
-            "the skill governs."
+            "Load and run one of the available skills (listed in the system "
+            "prompt) by name. Do this before a task the skill governs. Some "
+            "skills run shell commands to gather live context."
         ),
         parameters={
             "type": "object",
@@ -130,5 +130,4 @@ def view_skill_tool(skills: list[Skill]) -> Tool:
             "required": ["name"],
         },
         execute=execute,
-        read_only=True,
-    )
+    )  # read_only now defaults False — this tool can run commands

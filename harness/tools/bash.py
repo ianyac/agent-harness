@@ -5,7 +5,9 @@ from harness.tools.base import Tool
 from harness.truncate import truncate
 
 
-def _run(command: str, sandbox: Sandbox, timeout: int, output_limit: int) -> str:
+def run_sandboxed(
+    command: str, sandbox: Sandbox, timeout: int = 30, output_limit: int = 8000
+) -> str:
     try:
         proc = subprocess.run(
             sandbox.wrap(command),  # sandbox decides how the command runs
@@ -41,5 +43,5 @@ def bash_tool(
             },
             "required": ["command"],
         },
-        execute=lambda command: _run(command, sandbox, timeout, output_limit),
+        execute=lambda command: run_sandboxed(command, sandbox, timeout, output_limit),
     )

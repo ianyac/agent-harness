@@ -169,41 +169,52 @@ def substitute_args(body: str, args: str) -> str:
     return _ARG.sub(repl, body)
 
 
-def skill_tool(skills: list[Skill], run: Callable[[str], str] | None = None) -> Tool:
-    """The skill tool. With `run`, a skill body's !`cmd` blocks execute at load
-    time. Without `run` (the default), bodies are returned verbatim — the
-    lesson-15 behavior."""
-    bodies = {s.name: s.body for s in skills}
+def skill_tool(
+    skills: list[Skill],
+    run: Callable[[str], str] | None = None,
+    fork_run: Callable[[str, str | None, list[str] | None], str] | None = None,
+) -> Tool:
+    """The skill tool. `execute(name, args)` substitutes $ARGUMENTS/$1..$9, then
+    runs the body's !`cmd` (if `run` is wired). A `context: fork` skill runs as a
+    subagent via `fork_run` (returning its answer); other skills inject the text."""
+    by_name = {s.name: s for s in skills}
 
-    def execute(name: str) -> str:
-        if name not in bodies:
-            available = ", ".join(sorted(bodies)) or "none"
+    def execute(name: str, args: str = "") -> str:
+        if name not in by_name:
+            available = ", ".join(sorted(by_name)) or "none"
             return f"Error: no skill named {name!r}. Available skills: {available}"
-        body = bodies[name]
-        return body if run is None else expand_body(body, run)
+        skill = by_name[name]
+        processed = substitute_args(skill.body, args)
+        if run is not None:
+            processed = expand_body(processed, run)
+        if skill.fork:
+            if fork_run is None:
+                return "Error: this skill runs as a subagent, which is unavailable here."
+            return fork_run(processed, skill.model, skill.allowed_tools)
+        return processed
 
     return Tool(
         name="skill",
         description=(
             "Load and run one of the available skills (listed in the system "
-            "prompt) by name. Do this before a task the skill governs. Some "
-            "skills run shell commands to gather live context."
+            "prompt) by name, optionally passing `args`. Do this before a task "
+            "the skill governs. Some skills run shell commands to gather live "
+            "context; some run as a subagent and return its result."
         ),
         parameters={
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "The skill's name."}
+                "name": {"type": "string", "description": "The skill's name."},
+                "args": {
+                    "type": "string",
+                    "description": "Optional arguments, substituted as $ARGUMENTS / $1..$9.",
+                },
             },
             "required": ["name"],
         },
         execute=execute,
-        # always read_only: the tool call itself only injects preprocessed
-        # text. A body's !`cmd` blocks are session-approved config shell
-        # (gated once at startup, like a hook), run before/independent of
-        # per-call governance — so the *call* carries no per-call prompt and
-        # is available in every --mode, exactly like loading a skill in
-        # lesson 15.
-        read_only=True,
+        read_only=True,          # the call injects text or delegates; sub actions are policy-gated
+        spawns_subagents=True,   # a fork skill delegates — keep it out of subagents (no nested fork)
     )
 
 

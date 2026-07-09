@@ -374,3 +374,40 @@ def test_a_plain_skill_has_no_fork_or_policy(tmp_path):
     write_skill(tmp_path, "plain", "d", "b")
     (skill,) = discover(tmp_path)
     assert skill.fork is False and skill.model is None and skill.allowed_tools is None
+
+
+def test_skill_tool_substitutes_args_when_injecting(tmp_path):
+    write_skill(tmp_path, "greet", "d", "hello $1, args=$ARGUMENTS")
+    tool = skill_tool(discover(tmp_path))
+    assert tool.execute(name="greet", args="world x") == "hello world, args=world x"
+
+
+def test_skill_tool_forks_and_returns_the_subagent_answer(tmp_path):
+    (tmp_path / "r").mkdir()
+    (tmp_path / "r" / "SKILL.md").write_text(
+        "---\nname: r\ndescription: d\ncontext: fork\nmodel: gpt-5.4-mini\n"
+        "allowed-tools: read_file\n---\nresearch $1"
+    )
+    calls = {}
+    def fake_fork(task, model, allowed_tools):
+        calls.update(task=task, model=model, allowed_tools=allowed_tools)
+        return "SUBAGENT ANSWER"
+    tool = skill_tool(discover(tmp_path), fork_run=fake_fork)
+    out = tool.execute(name="r", args="pdfs")
+    assert out == "SUBAGENT ANSWER"
+    assert calls == {"task": "research pdfs", "model": "gpt-5.4-mini", "allowed_tools": ["read_file"]}
+
+
+def test_skill_tool_is_read_only_and_bars_nested_fork(tmp_path):
+    write_skill(tmp_path, "x", "d", "b")
+    t = skill_tool(discover(tmp_path))
+    assert t.read_only is True and t.spawns_subagents is True
+
+
+def test_a_fork_skill_without_fork_run_reports_an_error(tmp_path):
+    (tmp_path / "r").mkdir()
+    (tmp_path / "r" / "SKILL.md").write_text(
+        "---\nname: r\ndescription: d\ncontext: fork\n---\nBody."
+    )
+    tool = skill_tool(discover(tmp_path))  # no fork_run
+    assert tool.execute(name="r").startswith("Error")

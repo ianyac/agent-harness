@@ -2,7 +2,7 @@ import json
 
 from harness.loop import run_turn
 from harness.permissions import PermissionPolicy
-from harness.tools.agent import agent_tool
+from harness.tools.agent import agent_tool, run_subagent
 from harness.tools.base import Tool
 from tests.fake_llm import FakeLLM
 from tests.helpers import noop_tool
@@ -220,3 +220,38 @@ def test_subagent_system_prompt_callable_is_evaluated_per_delegation():
     tool.execute(task="b")
     assert llm.turns[0]["system"] == "FIRST"
     assert llm.turns[1]["system"] == "SECOND"
+
+
+# run_subagent is the extracted function agent_tool.execute delegates to;
+# the tests above already exercise it indirectly through agent_tool, so
+# these call it directly to pin its own contract.
+
+
+def test_run_subagent_returns_the_final_answer():
+    llm = FakeLLM([{"type": "text", "content": "the answer"}])
+    assert run_subagent("do it", llm, tools={}, policy=None) == "the answer"
+
+
+def test_run_subagent_excludes_spawns_subagents_tools():
+    llm = FakeLLM([{"type": "text", "content": "done"}])
+    tools = {"noop": noop_tool()}
+    # agent_tool's own tool is the canonical spawns_subagents=True case
+    tools["agent"] = agent_tool(FakeLLM([]), tools={}, policy=None)
+    run_subagent("do it", llm, tools, policy=None)
+    names = [d["function"]["name"] for d in llm.turns[0]["tools"]]
+    assert "noop" in names
+    assert "agent" not in names
+
+
+def test_run_subagent_exhaustion_becomes_an_error_string():
+    llm = FakeLLM(
+        [
+            {"type": "tool_calls", "calls": [{"name": "noop", "arguments": {}}]},
+            {"type": "tool_calls", "calls": [{"name": "noop", "arguments": {}}]},
+        ]
+    )
+    result = run_subagent(
+        "do it", llm, tools={"noop": noop_tool()}, policy=None, max_iterations=2
+    )
+    assert result.startswith("Error:")
+    assert "no final answer" in result

@@ -91,22 +91,23 @@ def run_turn(
     return reply
 
 
-def run_tool(
-    name: str,
-    args: dict,
+def _run_one_call(
+    call: dict,
     tools: dict[str, Tool],
     policy: PermissionPolicy | None,
     asker: Callable[[str, dict], str] | None,
     on_tool_call: Callable[[str, dict], None] | None,
 ) -> str:
-    """Run one already-parsed tool call through the governed path: permission,
-    journal, then the (hook-wrapped) tool. A tool may call this to delegate to
-    another governed tool — the skill tool runs its embedded !`cmd` as a bash
-    call here, so --mode, hooks, and the journal apply exactly as they would to
-    a bash call the model made itself."""
+    """Execute one tool call, converting every failure into result text —
+    each call must produce a result, or the transcript corrupts."""
+    name = call["function"]["name"]
     if name not in tools:
         available = ", ".join(tools) or "none"
         return f"Error: unknown tool {name!r}. Available tools: {available}"
+    try:
+        args = json.loads(call["function"]["arguments"])
+    except json.JSONDecodeError as error:
+        return f"Error: arguments are not valid JSON ({error}). Retry the call."
     if not _permitted(tools[name], args, policy, asker):
         return (
             f"Permission denied: {name} was not allowed. "
@@ -118,19 +119,3 @@ def run_tool(
         return tools[name].execute(**args)
     except Exception as error:  # noqa: BLE001 — the model handles it from here
         return f"Error: {type(error).__name__}: {error}"
-
-
-def _run_one_call(
-    call: dict,
-    tools: dict[str, Tool],
-    policy: PermissionPolicy | None,
-    asker: Callable[[str, dict], str] | None,
-    on_tool_call: Callable[[str, dict], None] | None,
-) -> str:
-    """Parse one wire-format tool call, then run it through run_tool."""
-    name = call["function"]["name"]
-    try:
-        args = json.loads(call["function"]["arguments"])
-    except json.JSONDecodeError as error:
-        return f"Error: arguments are not valid JSON ({error}). Retry the call."
-    return run_tool(name, args, tools, policy, asker, on_tool_call)

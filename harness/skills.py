@@ -85,6 +85,16 @@ def skills_section(skills: list[Skill]) -> str | None:
 _CMD = re.compile(r"(?<![^\s])(\\?)!`([^`]+)`")
 
 
+def cmd_blocks(body: str) -> list[str]:
+    """The commands a body will actually run, in order (escaped `\\!`x`` excluded)."""
+    return [m.group(2) for m in _CMD.finditer(body) if not m.group(1)]
+
+
+def has_cmd_blocks(body: str) -> bool:
+    """True iff the body contains at least one real (unescaped) command."""
+    return any(not m.group(1) for m in _CMD.finditer(body))
+
+
 def expand_body(body: str, run: Callable[[str], str]) -> str:
     """Replace each !`cmd` with run(cmd) at invocation time. `\\!`cmd`` is a
     literal — the backslash is stripped and the command is NOT run, so a skill
@@ -104,9 +114,9 @@ def expand_body(body: str, run: Callable[[str], str]) -> str:
 
 
 def skill_tool(skills: list[Skill], run: Callable[[str], str] | None = None) -> Tool:
-    """The skill tool. With `run`, a skill body's !`cmd` blocks execute and the
-    body is not verbatim (read_only False). Without `run` (the default), bodies
-    are returned verbatim and the tool is read-only — the lesson-15 behavior."""
+    """The skill tool. With `run`, a skill body's !`cmd` blocks execute at load
+    time. Without `run` (the default), bodies are returned verbatim — the
+    lesson-15 behavior."""
     bodies = {s.name: s.body for s in skills}
 
     def execute(name: str) -> str:
@@ -131,7 +141,13 @@ def skill_tool(skills: list[Skill], run: Callable[[str], str] | None = None) -> 
             "required": ["name"],
         },
         execute=execute,
-        read_only=run is None,
+        # always read_only: the tool call itself only injects preprocessed
+        # text. A body's !`cmd` blocks are session-approved config shell
+        # (gated once at startup, like a hook), run before/independent of
+        # per-call governance — so the *call* carries no per-call prompt and
+        # is available in every --mode, exactly like loading a skill in
+        # lesson 15.
+        read_only=True,
     )
 
 

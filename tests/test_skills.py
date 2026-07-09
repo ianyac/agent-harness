@@ -1,7 +1,9 @@
 from harness.skills import (
     Skill,
+    cmd_blocks,
     discover,
     expand_body,
+    has_cmd_blocks,
     skill_tool,
     skills_section,
     view_skill_tool,
@@ -57,6 +59,29 @@ def test_no_skills_means_no_section(tmp_path):
     assert skills_section([]) is None
 
 
+def test_cmd_blocks_extracts_commands_in_order():
+    assert cmd_blocks("a !`one` b !`two`") == ["one", "two"]
+
+
+def test_cmd_blocks_excludes_an_escaped_command():
+    # the session gate must not list a literal the skill only documents
+    assert cmd_blocks(r"a \!`one` b !`two`") == ["two"]
+
+
+def test_cmd_blocks_is_empty_for_an_escaped_only_body():
+    assert cmd_blocks(r"docs: \!`git diff`") == []
+
+
+def test_has_cmd_blocks_detects_presence():
+    assert has_cmd_blocks("x !`pwd` y") is True
+    assert has_cmd_blocks("plain prose, no blocks") is False
+
+
+def test_has_cmd_blocks_is_false_for_an_escaped_only_body():
+    # an escaped-only body needs no execution approval — it runs nothing
+    assert has_cmd_blocks(r"docs: \!`git diff`") is False
+
+
 def _noop(cmd):  # a run that is never called (bodies here have no !`cmd`)
     raise AssertionError(f"run should not have been called, got {cmd!r}")
 
@@ -67,9 +92,11 @@ def test_skill_returns_the_full_body(tmp_path):
     assert "Use imperative mood." in tool.execute(name="commit-style")
 
 
-def test_skill_is_not_read_only(tmp_path):
+def test_skill_tool_with_run_is_still_read_only(tmp_path):
+    # the tool call only injects preprocessed text; a body's !`cmd` blocks are
+    # session-approved config shell, not something this call governs
     write_skill(tmp_path, "x", "d", "b")
-    assert skill_tool(discover(tmp_path), run=_noop).read_only is False
+    assert skill_tool(discover(tmp_path), run=_noop).read_only is True
 
 
 def test_skill_tool_with_run_none_is_read_only_and_returns_body_verbatim(tmp_path):

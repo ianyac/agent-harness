@@ -204,3 +204,27 @@ def test_expand_body_lookbehind_prevents_a_code_spans_bang_from_matching_into_la
 def test_expand_body_does_not_match_an_empty_command():
     body = "nothing to run: !``"
     assert expand_body(body, run=_noop) == body
+
+
+def test_expand_body_does_not_execute_a_bang_ending_a_code_span():
+    # a bang glued to the end of an inline-code span, with a later code span,
+    # must NOT read the text between them as a command
+    body = "Run the `foo!` command, then check `bar`."
+    assert expand_body(body, run=_noop) == body
+
+
+def test_expand_body_does_not_match_bang_bang_inside_a_code_span():
+    body = "press `!!` twice then run `code`"
+    assert expand_body(body, run=_noop) == body
+
+
+def test_expand_body_requires_a_token_boundary_before_the_bang():
+    # a bang glued to a word is prose, not a command
+    body = "excited about foo!`bar` today"
+    assert expand_body(body, run=_noop) == body
+
+
+def test_expand_body_escape_is_not_defeated_by_a_preceding_backtick():
+    # a backtick immediately before the escape must not re-enable execution
+    body = r"see `\!`git diff`"
+    assert expand_body(body, run=_noop) == body  # unchanged: run never called

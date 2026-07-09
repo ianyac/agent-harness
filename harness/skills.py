@@ -77,10 +77,12 @@ def skills_section(skills: list[Skill]) -> str | None:
     return "\n".join(lines)
 
 
-# !`cmd` — a bang (not inside a code span, not escaped) then a backtick-quoted,
-# non-empty command. `\!`cmd`` is an escaped literal. `(?<!`)` keeps ordinary
-# prose like "the `!` key" from being read as a command.
-_CMD = re.compile(r"(?<!`)(\\?)!`([^`]+)`")
+# !`cmd` — at a token boundary (start of body or after whitespace): a bang, an
+# optional \ escape, then a backtick-quoted non-empty command. The (?<![^\s])
+# anchor keeps a bang buried in prose or an inline-code span — the `!` key,
+# `foo!` `bar`, `!!` — from being read as a command (a bang glued to a word or
+# backtick is not a command). `\!`cmd`` is a literal the skill can document.
+_CMD = re.compile(r"(?<![^\s])(\\?)!`([^`]+)`")
 
 
 def expand_body(body: str, run: Callable[[str], str]) -> str:

@@ -302,3 +302,22 @@ def test_directory_name_and_frontmatter_name_may_differ(tmp_path):
     (skill,) = discover(tmp_path)
     assert skill.name == "pdf"
     assert skill.dir == tmp_path / "tools"
+
+
+def test_skill_dir_is_substituted_in_the_body(tmp_path):
+    write_dir_skill(tmp_path, "pdf", "pdf", "d", "schema: ${SKILL_DIR}/references/api.md")
+    (skill,) = discover(tmp_path)
+    assert "${SKILL_DIR}" not in skill.body
+    assert f"{tmp_path / 'pdf'}/references/api.md" in skill.body
+
+
+def test_skill_dir_resolves_inside_a_command_for_the_approval_listing(tmp_path):
+    write_dir_skill(tmp_path, "pdf", "pdf", "d", "run: !`python ${SKILL_DIR}/check.py`")
+    (skill,) = discover(tmp_path)
+    assert cmd_blocks(skill.body) == [f"python {tmp_path / 'pdf'}/check.py"]
+
+
+def test_flat_skill_dir_substitutes_to_the_skills_root(tmp_path):
+    write_skill(tmp_path, "s", "d", "here: ${SKILL_DIR}/x")
+    (skill,) = discover(tmp_path)
+    assert f"{tmp_path}/x" in skill.body

@@ -65,6 +65,7 @@ def discover(
         except (OSError, ValueError, UnicodeDecodeError) as error:
             on_warning(f"skipping skill {entry.name}: {error}")
             continue
+        body = body.replace("${SKILL_DIR}", str(base))  # a fixed path, resolved once
         if name in seen:
             # a duplicate name would shadow the first in the skill tool's lookup;
             # keep the first, never silently serve the wrong body

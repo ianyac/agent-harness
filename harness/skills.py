@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from harness.llm import CONTEXT_WINDOWS
 from harness.tools.base import Tool
 
 
@@ -12,10 +13,13 @@ class Skill:
     description: str
     body: str
     dir: Path
+    fork: bool = False
+    model: str | None = None
+    allowed_tools: list[str] | None = None
 
 
-def _parse(text: str) -> tuple[str, str, str]:
-    """Split a skill file into (name, description, body). Frontmatter is a
+def _parse(text: str) -> tuple[dict, str]:
+    """Split a skill file into (frontmatter dict, body). Frontmatter is a
     leading block delimited by lines that are exactly `---`, holding
     `key: value` pairs — parsed by hand rather than pulling in a YAML
     dependency for two string fields. Liberal in what it accepts (blank
@@ -38,7 +42,7 @@ def _parse(text: str) -> tuple[str, str, str]:
         meta[key.strip()] = value.strip()
     if "name" not in meta or "description" not in meta:
         raise ValueError("frontmatter needs 'name' and 'description'")
-    return meta["name"], meta["description"], "\n".join(lines[end + 1 :]).strip()
+    return meta, "\n".join(lines[end + 1 :]).strip()
 
 
 def discover(
@@ -67,10 +71,15 @@ def discover(
             continue  # unrelated file, or a dir without SKILL.md — not a skill
         try:
             # utf-8-sig: read UTF-8 with or without a BOM (some editors add one)
-            name, description, body = _parse(source.read_text(encoding="utf-8-sig"))
+            meta, body = _parse(source.read_text(encoding="utf-8-sig"))
         except (OSError, ValueError, UnicodeDecodeError) as error:
             on_warning(f"skipping skill {entry.name}: {error}")
             continue
+        model = meta.get("model")
+        if model is not None and model not in CONTEXT_WINDOWS:
+            on_warning(f"skipping skill {entry.name}: unknown model {model!r}")
+            continue
+        name = meta["name"]
         body = body.replace("${SKILL_DIR}", str(base))  # a fixed path, resolved once
         if name in seen:
             # a duplicate name would shadow the first in the skill tool's lookup;
@@ -78,7 +87,19 @@ def discover(
             on_warning(f"skipping skill {entry.name}: duplicate name {name!r}")
             continue
         seen.add(name)
-        skills.append(Skill(name=name, description=description, body=body, dir=base))
+        skills.append(
+            Skill(
+                name=name,
+                description=meta["description"],
+                body=body,
+                dir=base,
+                fork=meta.get("context") == "fork",
+                model=model,
+                allowed_tools=(
+                    meta["allowed-tools"].split() if "allowed-tools" in meta else None
+                ),
+            )
+        )
     return sorted(skills, key=lambda s: s.name)  # menu order = displayed names
 
 
@@ -127,6 +148,25 @@ def expand_body(body: str, run: Callable[[str], str]) -> str:
             return f"[skill command failed: {error}]"
 
     return _CMD.sub(replace, body)
+
+
+_ARG = re.compile(r"\$(ARGUMENTS|[1-9])")
+
+
+def substitute_args(body: str, args: str) -> str:
+    """Replace $ARGUMENTS (the whole string) and $1..$9 (whitespace-split
+    positionals; missing → "") in one pass, so an arg that itself contains a
+    $-token is never re-expanded."""
+    parts = args.split()
+
+    def repl(match: "re.Match[str]") -> str:
+        token = match.group(1)
+        if token == "ARGUMENTS":
+            return args
+        i = int(token)
+        return parts[i - 1] if i <= len(parts) else ""
+
+    return _ARG.sub(repl, body)
 
 
 def skill_tool(skills: list[Skill], run: Callable[[str], str] | None = None) -> Tool:

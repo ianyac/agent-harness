@@ -6,6 +6,7 @@ from harness.skills import (
     has_cmd_blocks,
     skill_tool,
     skills_section,
+    substitute_args,
     view_skill_tool,
 )
 
@@ -330,3 +331,46 @@ def test_flat_skill_dir_substitutes_to_the_skills_root(tmp_path):
     write_skill(tmp_path, "s", "d", "here: ${SKILL_DIR}/x")
     (skill,) = discover(tmp_path)
     assert f"{tmp_path}/x" in skill.body
+
+
+def test_substitute_args_arguments_and_positionals():
+    assert substitute_args("all=$ARGUMENTS first=$1 third=$3", "a b") == "all=a b first=a third="
+
+
+def test_substitute_args_fills_a_positional_inside_a_command():
+    assert substitute_args("!`git log $1`", "HEAD") == "!`git log HEAD`"
+
+
+def test_discover_reads_fork_model_and_allowed_tools(tmp_path):
+    write_dir_skill(
+        tmp_path, "research", "research", "does research",
+        "body",
+        # frontmatter written directly to control the extra keys:
+    )
+    # overwrite SKILL.md with the policy frontmatter
+    (tmp_path / "research" / "SKILL.md").write_text(
+        "---\nname: research\ndescription: d\ncontext: fork\n"
+        "model: gpt-5.4-mini\nallowed-tools: read_file list_dir\n---\nBody."
+    )
+    (skill,) = discover(tmp_path)
+    assert skill.fork is True
+    assert skill.model == "gpt-5.4-mini"
+    assert skill.allowed_tools == ["read_file", "list_dir"]
+
+
+def test_discover_skips_a_skill_with_an_unknown_model(tmp_path):
+    (tmp_path / "bad").mkdir()
+    (tmp_path / "bad" / "SKILL.md").write_text(
+        "---\nname: bad\ndescription: d\nmodel: gpt-9-imaginary\n---\nBody."
+    )
+    write_skill(tmp_path, "good", "d", "b")
+    warnings = []
+    skills = discover(tmp_path, on_warning=warnings.append)
+    assert [s.name for s in skills] == ["good"]
+    assert warnings and "gpt-9-imaginary" in warnings[0]
+
+
+def test_a_plain_skill_has_no_fork_or_policy(tmp_path):
+    write_skill(tmp_path, "plain", "d", "b")
+    (skill,) = discover(tmp_path)
+    assert skill.fork is False and skill.model is None and skill.allowed_tools is None

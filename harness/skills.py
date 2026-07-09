@@ -11,6 +11,7 @@ class Skill:
     name: str
     description: str
     body: str
+    dir: Path
 
 
 def _parse(text: str) -> tuple[str, str, str]:
@@ -43,26 +44,34 @@ def _parse(text: str) -> tuple[str, str, str]:
 def discover(
     skills_dir: Path, on_warning: Callable[[str], None] = print
 ) -> list[Skill]:
-    """Load every skills/*.md file. A malformed skill is skipped with a
-    warning, never fatal — one bad file must not sink the others."""
+    """Load every skill under skills/. A skill is either a flat `<name>.md`
+    file or a `<name>/SKILL.md` directory (which may bundle files referenced
+    from the body via ${SKILL_DIR}). A malformed skill is skipped with a
+    warning, never fatal — one bad skill must not sink the others."""
     skills = []
     seen: set[str] = set()
-    for path in sorted(Path(skills_dir).glob("*.md")):
+    skills_dir = Path(skills_dir)
+    entries = sorted(skills_dir.iterdir()) if skills_dir.is_dir() else []
+    for entry in entries:
+        if entry.is_file() and entry.suffix == ".md":
+            source, base = entry, skills_dir  # flat skill (legacy)
+        elif entry.is_dir() and (entry / "SKILL.md").is_file():
+            source, base = entry / "SKILL.md", entry  # directory skill
+        else:
+            continue  # unrelated file, or a dir without SKILL.md — not a skill
         try:
-            # utf-8-sig: read UTF-8 with or without a BOM (some editors add
-            # one), and never fall back to a locale codec that would drop a
-            # skill over an em dash
-            name, description, body = _parse(path.read_text(encoding="utf-8-sig"))
+            # utf-8-sig: read UTF-8 with or without a BOM (some editors add one)
+            name, description, body = _parse(source.read_text(encoding="utf-8-sig"))
         except (OSError, ValueError, UnicodeDecodeError) as error:
-            on_warning(f"skipping skill {path.name}: {error}")
+            on_warning(f"skipping skill {entry.name}: {error}")
             continue
         if name in seen:
             # a duplicate name would shadow the first in the skill tool's lookup;
             # keep the first, never silently serve the wrong body
-            on_warning(f"skipping skill {path.name}: duplicate name {name!r}")
+            on_warning(f"skipping skill {entry.name}: duplicate name {name!r}")
             continue
         seen.add(name)
-        skills.append(Skill(name=name, description=description, body=body))
+        skills.append(Skill(name=name, description=description, body=body, dir=base))
     return sorted(skills, key=lambda s: s.name)  # menu order = displayed names
 
 

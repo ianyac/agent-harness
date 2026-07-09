@@ -17,6 +17,19 @@ def write_skill(skills_dir, name, description, body):
     )
 
 
+def write_dir_skill(skills_dir, dirname, name, description, body, files=None):
+    d = skills_dir / dirname
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "SKILL.md").write_text(
+        f"---\nname: {name}\ndescription: {description}\n---\n{body}"
+    )
+    for relpath, content in (files or {}).items():
+        f = d / relpath
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(content)
+    return d
+
+
 def test_discover_parses_frontmatter_and_body(tmp_path):
     write_skill(tmp_path, "commit-style", "how to write commits", "Use imperative mood.")
     (skill,) = discover(tmp_path)
@@ -255,3 +268,37 @@ def test_expand_body_escape_is_not_defeated_by_a_preceding_backtick():
     # a backtick immediately before the escape must not re-enable execution
     body = r"see `\!`git diff`"
     assert expand_body(body, run=_noop) == body  # unchanged: run never called
+
+
+def test_discover_reads_a_directory_skill(tmp_path):
+    write_dir_skill(tmp_path, "pdf", "pdf", "work with pdfs", "Body.")
+    (skill,) = discover(tmp_path)
+    assert skill.name == "pdf"
+    assert skill.body == "Body."
+    assert skill.dir == tmp_path / "pdf"
+
+
+def test_flat_skill_dir_is_the_skills_root(tmp_path):
+    write_skill(tmp_path, "commit-style", "d", "Body.")
+    (skill,) = discover(tmp_path)
+    assert skill.dir == tmp_path
+
+
+def test_discover_reads_flat_and_directory_skills_together(tmp_path):
+    write_skill(tmp_path, "flat", "d", "flat body")
+    write_dir_skill(tmp_path, "deep", "deep", "d", "dir body")
+    assert [s.name for s in discover(tmp_path)] == ["deep", "flat"]
+
+
+def test_a_directory_without_skill_md_is_ignored(tmp_path):
+    (tmp_path / "notaskill").mkdir()
+    (tmp_path / "notaskill" / "readme.txt").write_text("nothing here")
+    write_dir_skill(tmp_path, "real", "real", "d", "b")
+    assert [s.name for s in discover(tmp_path)] == ["real"]
+
+
+def test_directory_name_and_frontmatter_name_may_differ(tmp_path):
+    write_dir_skill(tmp_path, "tools", "pdf", "d", "b")  # dir 'tools', name 'pdf'
+    (skill,) = discover(tmp_path)
+    assert skill.name == "pdf"
+    assert skill.dir == tmp_path / "tools"

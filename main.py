@@ -16,7 +16,7 @@ from harness.hooks import (
     run_stop,
     with_hooks,
 )
-from harness.llm import CodexAdapter
+from harness.llm import make_llm
 from harness.loop import run_turn
 from harness.mcp import MCPError, MCPServer, load_config, mcp_tools
 from harness.permissions import MODES, PermissionPolicy
@@ -31,7 +31,7 @@ from harness.skills import (
     skill_tool,
     skills_section,
 )
-from harness.tools.agent import agent_tool
+from harness.tools.agent import agent_tool, run_subagent
 from harness.tools.bash import bash_tool, run_sandboxed
 from harness.tools.list_dir import list_dir_tool
 from harness.tools.read_file import read_file_tool
@@ -365,7 +365,7 @@ def main():
         foreign_tools.extend(discovered)
         print(f"(mcp: {name} serves {len(discovered)} tools)")
 
-    llm = CodexAdapter()
+    llm = make_llm()  # the main-loop / agent-tool client (gpt-5.5)
     compact_threshold = (
         cli_args.compact_threshold
         if cli_args.compact_threshold is not None
@@ -377,15 +377,6 @@ def main():
         list_dir_tool(workspace=workspace),
         bash_tool(sandbox=sandbox),
     ]
-    if skills:
-        # run executes a skill's !`cmd` as a sandboxed PREPROCESSOR — deliberately
-        # outside the per-call tool path (no permission prompt, no PreToolUse
-        # hooks, not journaled as a tool call), because the command is config-
-        # authored and was approved once at session start, exactly like a hook.
-        def run(command: str) -> str:
-            return run_sandboxed(command, sandbox)
-
-        registry.append(skill_tool(skills, run))
     tools = {tool.name: tool for tool in registry}
     # foreign tools join before the agent tool: subagents inherit them, and
     # the in-place hook wrapping below covers them like any native tool
@@ -407,6 +398,32 @@ def main():
         on_tool_call=observe_sub_tool_call,
         compact_threshold=compact_threshold,
     )
+    if skills:
+        # a skill's !`cmd` runs as a sandboxed preprocessor (config-authored,
+        # session-approved — the lesson-18 model)
+        def run(command: str) -> str:
+            return run_sandboxed(command, sandbox)
+
+        # a context:fork skill runs as a subagent: its body is the task, `model`
+        # picks the client, `allowed-tools` filters the tool set. run_subagent
+        # applies the recursion guard and the ask->deny policy.
+        def fork_run(task: str, model: str | None, allowed_tools: list[str] | None) -> str:
+            sub_tools = (
+                tools
+                if allowed_tools is None
+                else {n: t for n, t in tools.items() if n in allowed_tools}
+            )
+            return run_subagent(
+                task,
+                make_llm(model),
+                sub_tools,
+                policy=policy,
+                system=lambda: current_subagent_prompt(workspace, context_sections),
+                on_tool_call=observe_sub_tool_call,
+                compact_threshold=compact_threshold,
+            )
+
+        tools["skill"] = skill_tool(skills, run, fork_run)
     # wrapped IN PLACE after the agent tool joins: every tool including the
     # delegation is hooked, the sub's closure sees the hooked registry, and
     # the spawns_subagents field keeps the recursion guard intact through

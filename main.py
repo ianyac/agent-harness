@@ -392,6 +392,13 @@ def main():
             continue
         tools[tool.name] = tool
     policy = PermissionPolicy(cli_args.mode)
+    if skills:
+        # the session-start gate is the human's pre-consent to skill execution,
+        # so loading a skill must not also prompt per call — an approved hook or
+        # MCP server does not re-prompt either. This honors the "session-approved,
+        # no per-command prompt" decision. (session_allowlist wins over --mode,
+        # matching how explicit human pre-approval already behaves.)
+        policy.session_allowlist.add("skill")
     # built once: the callable system prompt is re-evaluated per delegation,
     # so the sub's env facts (date, cwd) never go stale anyway
     tools["agent"] = agent_tool(

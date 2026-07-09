@@ -297,6 +297,15 @@ def test_a_directory_without_skill_md_is_ignored(tmp_path):
     assert [s.name for s in discover(tmp_path)] == ["real"]
 
 
+def test_a_md_named_directory_without_skill_md_warns(tmp_path):
+    (tmp_path / "typo.md").mkdir()  # a dir named like a flat skill, no SKILL.md
+    write_skill(tmp_path, "good", "d", "b")
+    warnings = []
+    skills = discover(tmp_path, on_warning=warnings.append)
+    assert [s.name for s in skills] == ["good"]
+    assert warnings and "typo.md" in warnings[0]
+
+
 def test_directory_name_and_frontmatter_name_may_differ(tmp_path):
     write_dir_skill(tmp_path, "tools", "pdf", "d", "b")  # dir 'tools', name 'pdf'
     (skill,) = discover(tmp_path)

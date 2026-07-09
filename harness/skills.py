@@ -57,6 +57,12 @@ def discover(
             source, base = entry, skills_dir  # flat skill (legacy)
         elif entry.is_dir() and (entry / "SKILL.md").is_file():
             source, base = entry / "SKILL.md", entry  # directory skill
+        elif entry.suffix == ".md":
+            # a .md-named entry that is not a readable file (a directory or a
+            # dangling symlink named foo.md) — pre-lesson-19 this warned via
+            # read_text; keep the signal rather than silently dropping a typo
+            on_warning(f"skipping skill {entry.name}: expected a readable .md file")
+            continue
         else:
             continue  # unrelated file, or a dir without SKILL.md — not a skill
         try:

@@ -411,3 +411,27 @@ def test_a_fork_skill_without_fork_run_reports_an_error(tmp_path):
     )
     tool = skill_tool(discover(tmp_path))  # no fork_run
     assert tool.execute(name="r").startswith("Error")
+
+
+def test_args_cannot_introduce_a_command_into_a_prose_skill(tmp_path):
+    write_skill(tmp_path, "notes", "d", "Notes: $ARGUMENTS")
+    ran = []
+    tool = skill_tool(discover(tmp_path), run=lambda cmd: ran.append(cmd) or "RAN")
+    out = tool.execute(name="notes", args="!`echo pwned`")
+    assert ran == []                       # nothing executed
+    assert out == "Notes: !`echo pwned`"   # the injection is inert prose
+
+
+def test_args_fill_an_approved_template_command(tmp_path):
+    write_skill(tmp_path, "log", "d", "log:\n!`git log $1`")
+    tool = skill_tool(discover(tmp_path), run=lambda cmd: f"<{cmd}>")
+    assert tool.execute(name="log", args="HEAD") == "log:\n<git log HEAD>"
+
+
+def test_args_injected_command_is_inert_even_beside_a_real_one(tmp_path):
+    write_skill(tmp_path, "x", "d", "a= !`echo one` b=$1")
+    ran = []
+    tool = skill_tool(discover(tmp_path), run=lambda cmd: ran.append(cmd) or f"[{cmd}]")
+    out = tool.execute(name="x", args="!`echo-two`")
+    assert ran == ["echo one"]             # only the template's command ran
+    assert out == "a= [echo one] b=!`echo-two`"

@@ -132,24 +132,6 @@ def has_cmd_blocks(body: str) -> bool:
     return any(not m.group(1) for m in _CMD.finditer(body))
 
 
-def expand_body(body: str, run: Callable[[str], str]) -> str:
-    """Replace each !`cmd` with run(cmd) at invocation time. `\\!`cmd`` is a
-    literal — the backslash is stripped and the command is NOT run, so a skill
-    can document the syntax. A raising run degrades to an inline marker rather
-    than sinking the load."""
-
-    def replace(match: "re.Match[str]") -> str:
-        escaped, command = match.group(1), match.group(2)
-        if escaped:
-            return f"!`{command}`"  # literal: drop the backslash, do not run
-        try:
-            return run(command)
-        except Exception as error:  # a bad block degrades, never raises
-            return f"[skill command failed: {error}]"
-
-    return _CMD.sub(replace, body)
-
-
 _ARG = re.compile(r"\$(ARGUMENTS|[1-9])")
 
 
@@ -169,6 +151,31 @@ def substitute_args(body: str, args: str) -> str:
     return _ARG.sub(repl, body)
 
 
+def expand_body(body: str, run: Callable[[str], str] | None, args: str = "") -> str:
+    """Expand a skill body at invocation. `!`cmd`` spans are located on THIS body
+    — the template the human approved at session start — then each command has
+    $args filled and is run via `run`. Prose between commands gets $args but is
+    NOT re-scanned for commands, so an arg containing !`...` lands in prose,
+    inert: args can FILL an approved command but never INTRODUCE a new one.
+    `\\!`cmd`` is a literal; run=None leaves commands unrun (verbatim)."""
+    out: list[str] = []
+    last = 0
+    for match in _CMD.finditer(body):
+        out.append(substitute_args(body[last : match.start()], args))  # prose: args, never a command
+        escaped, command = match.group(1), match.group(2)
+        filled = substitute_args(command, args)
+        if escaped or run is None:
+            out.append(f"!`{filled}`")  # literal (escaped) or non-executing
+        else:
+            try:
+                out.append(run(filled))
+            except Exception as error:  # a bad block degrades, never raises
+                out.append(f"[skill command failed: {error}]")
+        last = match.end()
+    out.append(substitute_args(body[last:], args))
+    return "".join(out)
+
+
 def skill_tool(
     skills: list[Skill],
     run: Callable[[str], str] | None = None,
@@ -184,9 +191,7 @@ def skill_tool(
             available = ", ".join(sorted(by_name)) or "none"
             return f"Error: no skill named {name!r}. Available skills: {available}"
         skill = by_name[name]
-        processed = substitute_args(skill.body, args)
-        if run is not None:
-            processed = expand_body(processed, run)
+        processed = expand_body(skill.body, run, args)  # commands come from the template only
         if skill.fork:
             if fork_run is None:
                 return "Error: this skill runs as a subagent, which is unavailable here."

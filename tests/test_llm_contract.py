@@ -11,7 +11,7 @@ def test_context_windows_has_the_api_models():
         assert CONTEXT_WINDOWS[slug] == 272_000
 
 
-def test_make_llm_defaults_to_gpt55_and_caches(monkeypatch):
+def test_make_llm_defaults_to_gpt55_and_caches():
     built = []
 
     def fake_build(slug):

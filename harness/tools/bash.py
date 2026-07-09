@@ -4,9 +4,15 @@ from harness.sandbox import NoSandbox, Sandbox
 from harness.tools.base import Tool
 from harness.truncate import truncate
 
+DEFAULT_TIMEOUT = 30
+DEFAULT_OUTPUT_LIMIT = 8000
+
 
 def run_sandboxed(
-    command: str, sandbox: Sandbox, timeout: int = 30, output_limit: int = 8000
+    command: str,
+    sandbox: Sandbox,
+    timeout: int = DEFAULT_TIMEOUT,
+    output_limit: int = DEFAULT_OUTPUT_LIMIT,
 ) -> str:
     try:
         proc = subprocess.run(
@@ -22,7 +28,9 @@ def run_sandboxed(
 
 
 def bash_tool(
-    sandbox: Sandbox | None = None, timeout: int = 30, output_limit: int = 8000
+    sandbox: Sandbox | None = None,
+    timeout: int = DEFAULT_TIMEOUT,
+    output_limit: int = DEFAULT_OUTPUT_LIMIT,
 ) -> Tool:
     sandbox = sandbox or NoSandbox()  # default is uncaged; main.py opts in
     return Tool(

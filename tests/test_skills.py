@@ -1,4 +1,11 @@
-from harness.skills import Skill, discover, skills_section, skill_tool, cmd_blocks, has_cmd_blocks, expand_body
+from harness.skills import (
+    Skill,
+    discover,
+    expand_body,
+    skill_tool,
+    skills_section,
+    view_skill_tool,
+)
 
 
 def write_skill(skills_dir, name, description, body):
@@ -63,6 +70,20 @@ def test_skill_returns_the_full_body(tmp_path):
 def test_skill_is_not_read_only(tmp_path):
     write_skill(tmp_path, "x", "d", "b")
     assert skill_tool(discover(tmp_path), run=_noop).read_only is False
+
+
+def test_skill_tool_with_run_none_is_read_only_and_returns_body_verbatim(tmp_path):
+    write_skill(tmp_path, "x", "d", "body with !`echo hi` inside")
+    tool = skill_tool(discover(tmp_path))
+    assert tool.read_only is True
+    assert tool.execute(name="x") == "body with !`echo hi` inside"
+
+
+def test_view_skill_tool_alias_returns_a_read_only_tool(tmp_path):
+    write_skill(tmp_path, "x", "d", "body")
+    tool = view_skill_tool(discover(tmp_path))
+    assert tool.read_only is True
+    assert tool.execute(name="x") == "body"
 
 
 def test_skill_on_an_unknown_name_lists_what_exists(tmp_path):
@@ -140,15 +161,6 @@ def test_discovery_order_follows_names_not_filenames(tmp_path):
     assert [s.name for s in discover(tmp_path)] == ["aaa", "mmm"]
 
 
-def test_cmd_blocks_extracts_commands_in_order():
-    assert cmd_blocks("a !`one` b !`two`") == ["one", "two"]
-
-
-def test_has_cmd_blocks_detects_presence():
-    assert has_cmd_blocks("x !`pwd` y") is True
-    assert has_cmd_blocks("plain prose, no blocks") is False
-
-
 def test_expand_body_substitutes_command_output():
     out = expand_body("diff:\n!`git diff`", run=lambda cmd: f"<{cmd}>")
     assert out == "diff:\n<git diff>"
@@ -175,3 +187,20 @@ def test_expand_body_turns_a_failing_run_into_an_inline_marker():
 
     out = expand_body("!`whoami`", run=boom)
     assert out == "[skill command failed: sandbox down]"
+
+
+def test_expand_body_treats_an_escaped_bang_as_a_literal_and_never_calls_run():
+    out = expand_body(r"docs: \!`git diff`", run=_noop)
+    assert out == "docs: !`git diff`"
+
+
+def test_expand_body_lookbehind_prevents_a_code_spans_bang_from_matching_into_later_backticks():
+    # without the (?<!`) lookbehind, "!" inside `!` reads on into the next
+    # code span's backtick as if " key opens " were the command
+    body = "the `!` key opens `settings`"
+    assert expand_body(body, run=_noop) == body
+
+
+def test_expand_body_does_not_match_an_empty_command():
+    body = "nothing to run: !``"
+    assert expand_body(body, run=_noop) == body

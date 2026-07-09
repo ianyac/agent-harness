@@ -17,22 +17,15 @@ from harness.hooks import (
     with_hooks,
 )
 from harness.llm import CodexAdapter
-from harness.loop import run_turn
+from harness.loop import run_tool, run_turn
 from harness.mcp import MCPError, MCPServer, load_config, mcp_tools
 from harness.permissions import MODES, PermissionPolicy
 from harness.prompts import Environment, build_system_prompt
 from harness.sandbox import SandboxPolicy, default_sandbox
 from harness.session import SessionLog, lock, unlock
-from harness.skills import (
-    Skill,
-    cmd_blocks,
-    discover,
-    has_cmd_blocks,
-    skill_tool,
-    skills_section,
-)
+from harness.skills import discover, skill_tool, skills_section
 from harness.tools.agent import agent_tool
-from harness.tools.bash import bash_tool, run_sandboxed
+from harness.tools.bash import bash_tool
 from harness.tools.list_dir import list_dir_tool
 from harness.tools.read_file import read_file_tool
 from harness.tools.write_file import write_file_tool
@@ -67,9 +60,7 @@ def ask_user(name: str, args: dict) -> str:
                 print("  please answer y, n, or a")
 
 
-def approve_commands(
-    source: str, noun: str, commands: list[str], *, sandboxed: bool = False
-) -> bool:
+def approve_commands(source: str, noun: str, commands: list[str]) -> bool:
     """Workspace config (hooks.json, mcp.json) is clone-shippable and
     model-writable, so its commands run only after the human reads them
     on a real terminal. Runs BEFORE any listed command executes."""
@@ -80,8 +71,7 @@ def approve_commands(
         # input must never be able to approve unsandboxed commands
         print(f"({source} present but stdin is not interactive — {noun} disabled)")
         return False
-    kind = "sandboxed" if sandboxed else "unsandboxed"
-    print(f"{source} wants to run these commands ({kind}):")
+    print(f"{source} wants to run these commands (unsandboxed):")
     for line in commands:
         print(f"  {line}")
     while True:
@@ -110,15 +100,6 @@ def approve_hooks(hookset: HookSet) -> bool:
 def approve_mcp(servers: dict[str, str]) -> bool:
     commands = [f"{name}: {command}" for name, command in servers.items()]
     return approve_commands("mcp.json", "servers", commands)
-
-
-def approve_skill_execution(skills: list[Skill]) -> bool:
-    commands = [
-        f"{skill.name}: {command}"
-        for skill in skills
-        for command in cmd_blocks(skill.body)
-    ]
-    return approve_commands("skills/", "skill commands", commands, sandboxed=True)
 
 
 class StreamLine:
@@ -323,12 +304,6 @@ def main():
     # extra prompt sections, in order: hook-injected context, then the
     # skills menu (metadata only — bodies load on demand via the skill tool)
     skills = discover(workspace / "skills")
-    executable = [s for s in skills if has_cmd_blocks(s.body)]
-    if executable and not approve_skill_execution(executable):
-        # a skill is a capability, not policy: decline drops the executable
-        # ones (fail-open, the MCP line) and the session continues on prose
-        print(f"(skill execution declined — dropping {len(executable)} executable skill(s))")
-        skills = [s for s in skills if not has_cmd_blocks(s.body)]
     section = skills_section(skills)
     context_sections = hook_sections + ([section] if section else [])
 
@@ -368,19 +343,13 @@ def main():
         if cli_args.compact_threshold is not None
         else int(COMPACT_FRACTION * llm.context_window)
     )
+    policy = PermissionPolicy(cli_args.mode)
     registry = [
         read_file_tool(workspace=workspace),
         write_file_tool(workspace=workspace),
         list_dir_tool(workspace=workspace),
         bash_tool(sandbox=sandbox),
     ]
-    if skills:
-        # only offer the skill tool when there is a menu to view — otherwise the
-        # model can waste a turn calling a tool that can only ever error
-        def run(command: str) -> str:
-            return run_sandboxed(command, sandbox)
-
-        registry.append(skill_tool(skills, run))
     tools = {tool.name: tool for tool in registry}
     # foreign tools join before the agent tool: subagents inherit them, and
     # the in-place hook wrapping below covers them like any native tool
@@ -391,14 +360,6 @@ def main():
             print(f"(mcp: duplicate tool name {tool.name!r} — keeping the first)")
             continue
         tools[tool.name] = tool
-    policy = PermissionPolicy(cli_args.mode)
-    if skills:
-        # the session-start gate is the human's pre-consent to skill execution,
-        # so loading a skill must not also prompt per call — an approved hook or
-        # MCP server does not re-prompt either. This honors the "session-approved,
-        # no per-command prompt" decision. (session_allowlist wins over --mode,
-        # matching how explicit human pre-approval already behaves.)
-        policy.session_allowlist.add("skill")
     # built once: the callable system prompt is re-evaluated per delegation,
     # so the sub's env facts (date, cwd) never go stale anyway
     tools["agent"] = agent_tool(
@@ -409,6 +370,17 @@ def main():
         on_tool_call=observe_sub_tool_call,
         compact_threshold=compact_threshold,
     )
+    if skills:
+        # an embedded !`cmd` runs as a governed bash call: run_tool applies the
+        # same permission gate (--mode), hooks, and journal that a model-issued
+        # bash call gets. tools["bash"] is looked up at call time so the
+        # hook-wrapped version (after with_hooks) is the one used.
+        def run(command: str) -> str:
+            return run_tool(
+                "bash", {"command": command}, tools, policy, asker, observe_tool_call
+            )
+
+        tools["skill"] = skill_tool(skills, run)
     # wrapped IN PLACE after the agent tool joins: every tool including the
     # delegation is hooked, the sub's closure sees the hooked registry, and
     # the spawns_subagents field keeps the recursion guard intact through

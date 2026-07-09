@@ -77,43 +77,42 @@ def skills_section(skills: list[Skill]) -> str | None:
     return "\n".join(lines)
 
 
-_CMD = re.compile(r"!`([^`]*)`")  # !`cmd` — a bang, then a backtick-quoted command
-
-
-def cmd_blocks(body: str) -> list[str]:
-    """The commands a body will run, in order."""
-    return _CMD.findall(body)
-
-
-def has_cmd_blocks(body: str) -> bool:
-    """Does this body execute anything? Pure-prose skills answer False and so
-    need no execution approval."""
-    return _CMD.search(body) is not None
+# !`cmd` — a bang (not inside a code span, not escaped) then a backtick-quoted,
+# non-empty command. `\!`cmd`` is an escaped literal. `(?<!`)` keeps ordinary
+# prose like "the `!` key" from being read as a command.
+_CMD = re.compile(r"(?<!`)(\\?)!`([^`]+)`")
 
 
 def expand_body(body: str, run: Callable[[str], str]) -> str:
-    """Replace each !`cmd` with run(cmd), at invocation time so the output is
-    live, not a startup snapshot. A raising run becomes an inline marker rather
-    than sinking the load — one bad block must not cost the whole skill (the
-    discover() rule)."""
+    """Replace each !`cmd` with run(cmd) at invocation time. `\\!`cmd`` is a
+    literal — the backslash is stripped and the command is NOT run, so a skill
+    can document the syntax. A raising run degrades to an inline marker rather
+    than sinking the load."""
 
     def replace(match: "re.Match[str]") -> str:
+        escaped, command = match.group(1), match.group(2)
+        if escaped:
+            return f"!`{command}`"  # literal: drop the backslash, do not run
         try:
-            return run(match.group(1))
-        except Exception as error:  # a bad block degrades to a note, never raises
+            return run(command)
+        except Exception as error:  # a bad block degrades, never raises
             return f"[skill command failed: {error}]"
 
     return _CMD.sub(replace, body)
 
 
-def skill_tool(skills: list[Skill], run: Callable[[str], str]) -> Tool:
+def skill_tool(skills: list[Skill], run: Callable[[str], str] | None = None) -> Tool:
+    """The skill tool. With `run`, a skill body's !`cmd` blocks execute and the
+    body is not verbatim (read_only False). Without `run` (the default), bodies
+    are returned verbatim and the tool is read-only — the lesson-15 behavior."""
     bodies = {s.name: s.body for s in skills}
 
     def execute(name: str) -> str:
         if name not in bodies:
             available = ", ".join(sorted(bodies)) or "none"
             return f"Error: no skill named {name!r}. Available skills: {available}"
-        return expand_body(bodies[name], run)  # inject live command output
+        body = bodies[name]
+        return body if run is None else expand_body(body, run)
 
     return Tool(
         name="skill",
@@ -130,4 +129,11 @@ def skill_tool(skills: list[Skill], run: Callable[[str], str]) -> Tool:
             "required": ["name"],
         },
         execute=execute,
-    )  # read_only now defaults False — this tool can run commands
+        read_only=run is None,
+    )
+
+
+# Deprecated compat alias: the ui lane still imports view_skill_tool. Calling it
+# with no `run` yields the non-executing, read-only lesson-15 tool. The ui lane
+# should migrate to skill_tool; tracked as a cross-lane coordination item.
+view_skill_tool = skill_tool

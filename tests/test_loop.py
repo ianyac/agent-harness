@@ -1,4 +1,7 @@
-from harness.loop import run_turn
+import json
+
+from harness.loop import _run_one_call, run_tool, run_turn
+from harness.permissions import PermissionPolicy
 from harness.tools.base import Tool
 from tests.fake_llm import FakeLLM
 
@@ -132,3 +135,38 @@ def test_iteration_cap_ends_the_turn_gracefully():
     assert reply["role"] == "assistant"
     assert "3 iterations" in reply["content"]
     assert messages[-1] == reply
+
+
+def test_run_tool_denies_a_non_read_only_tool_under_read_only_mode():
+    # run_tool is the governed dispatch a tool can delegate to (the skill
+    # tool's embedded !`cmd`), so it must enforce the permission gate itself.
+    policy = PermissionPolicy("readOnly")
+    result = run_tool(
+        "add", {"a": 1, "b": 1}, {"add": add_tool()}, policy, asker=None, on_tool_call=None
+    )
+    assert result.startswith("Permission denied")
+
+
+def test_run_tool_invokes_on_tool_call_once_when_permitted():
+    seen = []
+    result = run_tool(
+        "add",
+        {"a": 2, "b": 3},
+        {"add": add_tool()},
+        policy=None,
+        asker=None,
+        on_tool_call=lambda name, args: seen.append((name, args)),
+    )
+    assert result == "5"
+    assert seen == [("add", {"a": 2, "b": 3})]
+
+
+def test_run_tool_unknown_tool_name_returns_error():
+    result = run_tool("nope", {}, {}, policy=None, asker=None, on_tool_call=None)
+    assert result.startswith("Error: unknown tool")
+
+
+def test_run_one_call_still_parses_json_args_and_delegates_to_run_tool():
+    call = {"function": {"name": "add", "arguments": json.dumps({"a": 4, "b": 5})}}
+    result = _run_one_call(call, {"add": add_tool()}, policy=None, asker=None, on_tool_call=None)
+    assert result == "9"

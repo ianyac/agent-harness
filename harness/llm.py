@@ -190,7 +190,7 @@ def process_sse_event(
 
 # context window per model slug, from the backend's /codex/models metadata
 # (probed 2026-07-06); not queryable at request time, so it rides here
-CONTEXT_WINDOWS = {"gpt-5.5": 272_000}
+CONTEXT_WINDOWS = {"gpt-5.5": 272_000, "gpt-5.4": 272_000, "gpt-5.4-mini": 272_000}
 
 
 class CodexAdapter:
@@ -270,3 +270,17 @@ class CodexAdapter:
         if not final.get("output"):
             final["output"] = output_items  # terminal event arrives with empty output
         return normalize(final)
+
+
+_LLM_CACHE: dict[str, LLMClient] = {}
+
+
+def make_llm(slug: str | None = None, *, build: Callable[[str], LLMClient] = CodexAdapter) -> LLMClient:
+    """Return a client for `slug` (default gpt-5.5), one per slug for the whole
+    process so repeated forks reuse a client. `build` is injectable so the
+    offline suite can exercise the factory without constructing a real
+    CodexAdapter (whose __init__ reads ~/.codex/auth.json)."""
+    slug = slug or "gpt-5.5"
+    if slug not in _LLM_CACHE:
+        _LLM_CACHE[slug] = build(slug)
+    return _LLM_CACHE[slug]

@@ -28,6 +28,7 @@ from harness.skills import (
     cmd_blocks,
     discover,
     has_cmd_blocks,
+    parse_slash,
     skill_tool,
     skills_section,
 )
@@ -437,6 +438,8 @@ def main():
     print(f"(session: {session_path.name})")
     if messages:
         print(f"(resumed {len(messages)} messages)")
+    if skills:
+        print(f"({len(skills)} skills — /name to run one, / to list)")
 
     def record_turn() -> None:
         try:
@@ -459,6 +462,22 @@ def main():
             user_input = input("You: ")
         except (EOFError, KeyboardInterrupt):
             break
+        if user_input.startswith("/"):
+            names = sorted(s.name for s in skills)
+            if "skill" not in tools or not names:
+                print("(no skills available)")
+                continue
+            parsed = parse_slash(user_input)
+            if parsed is None:  # a bare "/" — list what's callable
+                print(f"(skills: {', '.join(names)})")
+                continue
+            name, args = parsed
+            if name not in names:
+                print(f"(unknown skill {name!r}; skills: {', '.join(names)})")
+                continue
+            print(f"(running /{name})")
+            # reuse the model-facing tool: args, !`cmd`, ${SKILL_DIR}, fork/inject
+            user_input = tools["skill"].execute(name=name, args=args)
         try:
             reply = run_turn(
                 messages,

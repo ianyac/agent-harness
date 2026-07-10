@@ -1,6 +1,10 @@
 from harness.tools.base import Tool
 
-MODES = ("default", "acceptAll", "readOnly", "plan")
+# modes a session may START in (via --mode). "plan" is deliberately NOT here:
+# it is a per-turn mode entered mid-session with /plan, never selected at
+# startup — starting in "plan" would make base_mode "plan" and trap the session.
+STARTUP_MODES = ("default", "acceptAll", "readOnly")
+MODES = (*STARTUP_MODES, "plan")  # all valid modes (PermissionPolicy + decide)
 
 
 class PermissionPolicy:

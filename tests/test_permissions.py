@@ -1,5 +1,5 @@
 from harness.loop import run_turn
-from harness.permissions import MODES, PermissionPolicy
+from harness.permissions import MODES, STARTUP_MODES, PermissionPolicy
 from harness.tools.base import Tool
 from tests.fake_llm import FakeLLM
 
@@ -167,7 +167,8 @@ def test_ask_with_no_asker_degrades_to_denial():
 
 
 def test_plan_is_a_valid_mode_and_base_mode_is_recorded():
-    assert "plan" in MODES
+    assert "plan" in MODES              # valid for PermissionPolicy / decide
+    assert "plan" not in STARTUP_MODES  # but never selectable at startup (--mode)
     p = PermissionPolicy("plan")
     assert p.mode == "plan" and p.base_mode == "plan"
     assert PermissionPolicy("default").base_mode == "default"

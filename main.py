@@ -19,7 +19,7 @@ from harness.hooks import (
 from harness.llm import make_llm
 from harness.loop import run_turn
 from harness.mcp import MCPError, MCPServer, load_config, mcp_tools
-from harness.permissions import MODES, PermissionPolicy
+from harness.permissions import STARTUP_MODES, PermissionPolicy
 from harness.prompts import Environment, PLAN_MODE, build_system_prompt
 from harness.sandbox import NoSandbox, SandboxPolicy, default_sandbox
 from harness.session import SessionLog, lock, unlock
@@ -198,7 +198,7 @@ def current_subagent_prompt(
 
 def main():
     parser = argparse.ArgumentParser(description="agent-harness REPL")
-    parser.add_argument("--mode", choices=MODES, default="default")
+    parser.add_argument("--mode", choices=STARTUP_MODES, default="default")
     parser.add_argument(
         "--workspace",
         type=Path,

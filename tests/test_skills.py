@@ -4,6 +4,7 @@ from harness.skills import (
     discover,
     expand_body,
     has_cmd_blocks,
+    parse_slash,
     skill_tool,
     skills_section,
     substitute_args,
@@ -435,3 +436,29 @@ def test_args_injected_command_is_inert_even_beside_a_real_one(tmp_path):
     out = tool.execute(name="x", args="!`echo-two`")
     assert ran == ["echo one"]             # only the template's command ran
     assert out == "a= [echo one] b=!`echo-two`"
+
+
+def test_parse_slash_name_and_args():
+    assert parse_slash("/commit-style HEAD") == ("commit-style", "HEAD")
+
+
+def test_parse_slash_name_only():
+    assert parse_slash("/x") == ("x", "")
+
+
+def test_parse_slash_args_is_remainder_after_first_space():
+    assert parse_slash("/x  a b  ") == ("x", "a b")
+
+
+def test_parse_slash_name_is_the_first_token_only():
+    assert parse_slash("/write a poem") == ("write", "a poem")
+
+
+def test_parse_slash_bare_slash_is_none():
+    assert parse_slash("/") is None
+    assert parse_slash("/   ") is None
+
+
+def test_parse_slash_non_slash_is_none():
+    assert parse_slash("not a command") is None
+    assert parse_slash("") is None

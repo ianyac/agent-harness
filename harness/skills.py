@@ -114,6 +114,19 @@ def skills_section(skills: list[Skill]) -> str | None:
     return "\n".join(lines)
 
 
+def parse_slash(text: str) -> tuple[str, str] | None:
+    """Parse a slash command '/name args' into (name, args): the name is the
+    first token after the '/', args the stripped remainder. A bare '/' (or any
+    text not starting with '/') returns None — not a command."""
+    if not text.startswith("/"):
+        return None
+    rest = text[1:].strip()
+    if not rest:
+        return None
+    name, _, args = rest.partition(" ")
+    return name, args.strip()
+
+
 # !`cmd` — at a token boundary (start of body or after whitespace): a bang, an
 # optional \ escape, then a backtick-quoted non-empty command. The (?<![^\s])
 # anchor keeps a bang buried in prose or an inline-code span — the `!` key,

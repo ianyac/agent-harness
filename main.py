@@ -20,7 +20,12 @@ from harness.llm import make_llm
 from harness.loop import run_turn
 from harness.mcp import MCPError, MCPServer, load_config, mcp_tools
 from harness.permissions import STARTUP_MODES, PermissionPolicy
-from harness.prompts import Environment, PLAN_MODE, build_system_prompt
+from harness.prompts import (
+    Environment,
+    PLAN_MODE,
+    PLAN_MODE_SUBAGENT,
+    build_system_prompt,
+)
 from harness.sandbox import NoSandbox, SandboxPolicy, default_sandbox
 from harness.session import SessionLog, lock, unlock
 from harness.skills import (
@@ -329,13 +334,26 @@ def main():
     # so it is gated once here like hooks.json/mcp.json — not per call. Decline
     # drops the executable skills (a capability, not policy); prose skills stay.
     executable = [s for s in skills if has_cmd_blocks(s.body)]
-    if executable and not approve_skill_execution(
-        executable, sandboxed=not isinstance(sandbox, NoSandbox)
-    ):
-        print(f"(skill execution declined — dropping {len(executable)} executable skill(s))")
-        skills = [s for s in skills if not has_cmd_blocks(s.body)]
+    if executable:
+        if isinstance(sandbox, NoSandbox):
+            # no sandbox backend on this platform: skill commands are refused
+            # at run time (they render as inert skip-notices), so there is
+            # nothing dangerous to approve. Keep the skills — their prose and
+            # args still work — and say the commands won't run.
+            print(
+                f"(no sandbox here — {len(executable)} skill(s) with commands "
+                "will not run those commands)"
+            )
+        elif not approve_skill_execution(executable, sandboxed=True):
+            print(f"(skill execution declined — dropping {len(executable)} executable skill(s))")
+            skills = [s for s in skills if not has_cmd_blocks(s.body)]
     section = skills_section(skills)
     context_sections = hook_sections + ([section] if section else [])
+    # subagents never get the skill tool (spawns_subagents keeps it out), so
+    # they must NOT get the skills menu that tells them to "call the skill
+    # tool" — they would only call a tool they don't have. Hook context still
+    # applies; the plan-mode note is added per-turn below.
+    subagent_sections = hook_sections
 
     try:
         server_commands = load_config(workspace / "mcp.json")
@@ -392,18 +410,43 @@ def main():
     policy = PermissionPolicy(cli_args.mode)
     # built once: the callable system prompt is re-evaluated per delegation,
     # so the sub's env facts (date, cwd) never go stale anyway
+    def subagent_prompt() -> str:
+        # no skills menu; add the read-only plan note when this delegation
+        # happens inside a plan-mode turn (the sub shares the plan policy but
+        # cannot exit plan mode, so PLAN_MODE_SUBAGENT — not PLAN_MODE)
+        extra = subagent_sections + ([PLAN_MODE_SUBAGENT] if policy.mode == "plan" else [])
+        return current_subagent_prompt(workspace, extra)
+
     tools["agent"] = agent_tool(
         llm,
         tools,
         policy=policy,
-        system=lambda: current_subagent_prompt(workspace, context_sections),
+        system=subagent_prompt,
         on_tool_call=observe_sub_tool_call,
         compact_threshold=compact_threshold,
     )
     if skills:
+        # validate each fork skill's allowed-tools against the tools a subagent
+        # could actually receive (spawns_subagents tools are filtered out for
+        # subs anyway). A typo would otherwise yield a sub silently missing
+        # tools, with no warning — unlike the model: field, which is checked.
+        sub_capable = {n for n, t in tools.items() if not t.spawns_subagents}
+        for s in skills:
+            unknown = [t for t in (s.allowed_tools or []) if t not in sub_capable]
+            if unknown:
+                print(
+                    f"(skill {s.name!r}: allowed-tools not available to a "
+                    f"subagent: {', '.join(unknown)})"
+                )
+
         # a skill's !`cmd` runs as a sandboxed preprocessor (config-authored,
         # session-approved — the lesson-18 model)
         def run(command: str) -> str:
+            # require a real sandbox: model-influenced args reach sh -c, so an
+            # unsandboxed run is refused outright. (expand_body's shell-quoting
+            # is the other half of this defense — belt and suspenders.)
+            if isinstance(sandbox, NoSandbox):
+                return "[skill command not run: no sandbox backend on this platform]"
             return run_sandboxed(command, sandbox)
 
         # a context:fork skill runs as a subagent: its body is the task, `model`
@@ -420,7 +463,7 @@ def main():
                 make_llm(model),
                 sub_tools,
                 policy=policy,
-                system=lambda: current_subagent_prompt(workspace, context_sections),
+                system=subagent_prompt,  # no skills menu; plan note when planning
                 on_tool_call=observe_sub_tool_call,
                 compact_threshold=compact_threshold,
             )
@@ -437,7 +480,10 @@ def main():
             return False, ""
         if answer in ("y", "yes"):
             return True, ""
-        feedback = input("feedback for the revision (optional): ").strip()
+        try:
+            feedback = input("feedback for the revision (optional): ").strip()
+        except EOFError:
+            feedback = ""  # Ctrl-D at the feedback prompt is still a rejection
         return False, feedback
 
     tools["exit_plan_mode"] = exit_plan_mode_tool(policy, approve_plan)
@@ -475,33 +521,54 @@ def main():
 
     plan_armed = False
     while True:
-        policy.mode = "plan" if plan_armed else policy.base_mode
-        plan_armed = False
         try:
             user_input = input("You: ")
         except (EOFError, KeyboardInterrupt):
             break
+        # only a real turn consumes the arming; a non-turn interaction (listing,
+        # arming) must NOT silently disarm plan mode before the next message
+        run_in_plan = plan_armed
         if user_input.startswith("/"):
             parsed = parse_slash(user_input)
             names = sorted(s.name for s in skills)
-            if parsed is None:  # a bare "/" — list what's callable
+            if parsed is None:  # a bare "/" — list; arming (if any) is preserved
                 print(f"(commands: /plan; skills: {', '.join(names) or 'none'})")
                 continue
             name, args = parsed
             if name == "plan":  # built-in — resolves before skill names, works with 0 skills
+                plan_armed = False  # an explicit /plan supersedes any prior arming
                 if args:
-                    policy.mode = "plan"       # run this turn in plan mode
+                    run_in_plan = True         # run this turn in plan mode
                     user_input = args
                 else:
                     plan_armed = True          # arm the next turn
                     print("(plan mode armed — your next message runs in plan mode)")
                     continue
-            elif "skill" not in tools or name not in names:
-                print(f"(unknown skill {name!r}; skills: {', '.join(names) or 'none'})")
-                continue
-            else:
+            elif "skill" in tools and name in names:
+                # a real turn: set the mode before executing (a fork skill
+                # spawns a subagent that reads policy.mode)
+                policy.mode = "plan" if run_in_plan else policy.base_mode
+                plan_armed = False
                 print(f"(running /{name})")
-                user_input = tools["skill"].execute(name=name, args=args)
+                # journal it like a model-invoked skill call, and guard the
+                # execute: a fork skill's LLM/tool failure, or Ctrl-C mid-fork,
+                # must not crash the whole REPL
+                record_action("agent", "skill", {"name": name, "args": args})
+                try:
+                    user_input = tools["skill"].execute(name=name, args=args)
+                except KeyboardInterrupt:
+                    print("\n(skill cancelled)")
+                    continue
+                except Exception as error:  # noqa: BLE001 — surface, don't die
+                    print(f"(skill {name!r} failed: {error})")
+                    continue
+            # else: an unknown /name is not a command — fall through and send
+            # the original message to the model rather than swallowing it
+            # (e.g. "/etc/hosts has a stale entry, can you check it?")
+        # commit to a turn: fix the mode (idempotent if the skill branch set it)
+        # and consume any arming
+        policy.mode = "plan" if run_in_plan else policy.base_mode
+        plan_armed = False
         try:
             reply = run_turn(
                 messages,
@@ -511,7 +578,10 @@ def main():
                 on_tool_call=observe_tool_call,
                 policy=policy,
                 asker=asker,
-                system=current_system_prompt(
+                # a callable, re-read each iteration: when exit_plan_mode is
+                # approved mid-turn, policy.mode flips and the PLAN_MODE section
+                # drops for the rest of the turn
+                system=lambda: current_system_prompt(
                     workspace,
                     context_sections + ([PLAN_MODE] if policy.mode == "plan" else []),
                 ),

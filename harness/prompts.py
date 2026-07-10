@@ -8,6 +8,15 @@ PLAN_MODE = (
     "user to approve before doing anything."
 )
 
+# Subagents share the plan-mode policy but cannot exit it (exit_plan_mode is
+# top-level only), so they get this note instead of PLAN_MODE: read-only,
+# report — no mention of a gate tool they don't have.
+PLAN_MODE_SUBAGENT = (
+    "This is a read-only planning turn: use only read-only tools (read files, "
+    "list directories, search). Any attempt to modify files or run mutating "
+    "commands is denied. Investigate and report what you find — do not act."
+)
+
 
 @dataclass
 class Environment:

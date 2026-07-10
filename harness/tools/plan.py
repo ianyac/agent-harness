@@ -19,6 +19,14 @@ def exit_plan_mode_tool(
         approved, feedback = approve(plan)
         if approved:
             policy.mode = policy.base_mode
+            if policy.base_mode == "readOnly":
+                # the session itself is read-only, so restoring base still
+                # denies every mutation — don't tell the model it may act
+                return (
+                    "Plan approved, but the session is read-only: you still "
+                    "cannot modify files or run commands. Report the plan for "
+                    "the user to carry out."
+                )
             return "Plan approved. Proceeding — you may now take the actions above."
         return f"Plan not approved; stay read-only and revise. Feedback: {feedback or '(none)'}"
 

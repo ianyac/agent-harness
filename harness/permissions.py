@@ -1,6 +1,6 @@
 from harness.tools.base import Tool
 
-MODES = ("default", "acceptAll", "readOnly")
+MODES = ("default", "acceptAll", "readOnly", "plan")
 
 
 class PermissionPolicy:
@@ -11,6 +11,7 @@ class PermissionPolicy:
         if mode not in MODES:
             raise ValueError(f"unknown permission mode {mode!r}; choose from {MODES}")
         self.mode = mode
+        self.base_mode = mode  # the mode to restore to when leaving plan mode
         self.session_allowlist: set[str] = set()
 
     def decide(self, tool: Tool) -> str:
@@ -20,7 +21,7 @@ class PermissionPolicy:
         match self.mode:
             case "acceptAll":
                 return "allow"
-            case "readOnly":
+            case "readOnly" | "plan":
                 return "deny"
             case _:
                 return "ask"

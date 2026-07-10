@@ -1,5 +1,13 @@
 from dataclasses import dataclass
 
+PLAN_MODE = (
+    "Plan mode: you are investigating and proposing, not acting. Use only "
+    "read-only tools (read files, list directories, search) — do NOT modify "
+    "files, run mutating commands, or take any action; those are denied. When "
+    "you have a complete plan, call exit_plan_mode with it and wait for the "
+    "user to approve before doing anything."
+)
+
 
 @dataclass
 class Environment:

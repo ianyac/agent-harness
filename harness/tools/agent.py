@@ -16,6 +16,41 @@ _DESCRIPTION = (
 )
 
 
+def run_subagent(
+    task: str,
+    llm: LLMClient,
+    tools: dict[str, Tool],
+    *,
+    policy: PermissionPolicy | None,
+    system: str | Callable[[], str] | None = None,
+    on_tool_call: Callable[[str, dict], None] | None = None,
+    max_iterations: int = 20,
+    compact_threshold: int | None = None,
+    keep_recent: int = 8,
+) -> str:
+    """Run one subagent to completion and return its final answer. A subagent
+    never finds a delegation tool (the spawns_subagents recursion guard) and
+    never prompts (asker=None → ask-decisions become denials)."""
+    inner = {name: t for name, t in tools.items() if not t.spawns_subagents}
+    reply = run_turn(
+        [],
+        task,
+        llm,
+        tools=inner,
+        max_iterations=max_iterations,
+        on_tool_call=on_tool_call,
+        policy=policy,
+        asker=None,
+        system=system() if callable(system) else system,
+        compact_threshold=compact_threshold,
+        keep_recent=keep_recent,
+    )
+    content = reply["content"] or ""
+    if content.startswith(ABORTED_PREFIX):
+        return f"Error: subagent gave no final answer within {max_iterations} iterations"
+    return content
+
+
 def agent_tool(
     llm: LLMClient,
     tools: dict[str, Tool],
@@ -43,32 +78,12 @@ def agent_tool(
     """
 
     def execute(task: str) -> str:
-        # filtered by the spawns_subagents field at call time: whatever key
-        # this tool sits under, and however many wrappers (hooks) it wears,
-        # a subagent must never find a delegation tool (no recursion,
-        # structurally)
-        inner = {name: t for name, t in tools.items() if not t.spawns_subagents}
-        reply = run_turn(
-            [],  # fresh context: isolation is the whole point
-            task,
-            llm,
-            tools=inner,
-            max_iterations=max_iterations,
-            on_tool_call=on_tool_call,
-            policy=policy,
-            asker=None,  # never interactive: ask-decisions become denials
-            system=system() if callable(system) else system,
-            compact_threshold=compact_threshold,
+        return run_subagent(
+            task, llm, tools,
+            policy=policy, system=system, on_tool_call=on_tool_call,
+            max_iterations=max_iterations, compact_threshold=compact_threshold,
             keep_recent=keep_recent,
         )
-        content = reply["content"] or ""
-        if content.startswith(ABORTED_PREFIX):
-            # an exhausted sub is a failure, not an answer
-            return (
-                f"Error: subagent gave no final answer within "
-                f"{max_iterations} iterations"
-            )
-        return content
 
     tool = Tool(
         name="agent",

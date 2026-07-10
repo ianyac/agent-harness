@@ -16,17 +16,26 @@ from harness.hooks import (
     run_stop,
     with_hooks,
 )
-from harness.llm import CodexAdapter
+from harness.llm import make_llm
 from harness.loop import run_turn
 from harness.mcp import MCPError, MCPServer, load_config, mcp_tools
-from harness.permissions import MODES, PermissionPolicy
-from harness.prompts import Environment, build_system_prompt
-from harness.sandbox import SandboxPolicy, default_sandbox
+from harness.permissions import STARTUP_MODES, PermissionPolicy
+from harness.prompts import Environment, PLAN_MODE, build_system_prompt
+from harness.sandbox import NoSandbox, SandboxPolicy, default_sandbox
 from harness.session import SessionLog, lock, unlock
-from harness.skills import discover, skills_section, view_skill_tool
-from harness.tools.agent import agent_tool
-from harness.tools.bash import bash_tool
+from harness.skills import (
+    Skill,
+    cmd_blocks,
+    discover,
+    has_cmd_blocks,
+    parse_slash,
+    skill_tool,
+    skills_section,
+)
+from harness.tools.agent import agent_tool, run_subagent
+from harness.tools.bash import bash_tool, run_sandboxed
 from harness.tools.list_dir import list_dir_tool
+from harness.tools.plan import exit_plan_mode_tool
 from harness.tools.read_file import read_file_tool
 from harness.tools.write_file import write_file_tool
 
@@ -60,8 +69,10 @@ def ask_user(name: str, args: dict) -> str:
                 print("  please answer y, n, or a")
 
 
-def approve_commands(source: str, noun: str, commands: list[str]) -> bool:
-    """Workspace config (hooks.json, mcp.json) is clone-shippable and
+def approve_commands(
+    source: str, noun: str, commands: list[str], *, sandboxed: bool = False
+) -> bool:
+    """Workspace config (hooks.json, mcp.json, skills/) is clone-shippable and
     model-writable, so its commands run only after the human reads them
     on a real terminal. Runs BEFORE any listed command executes."""
     if not commands:
@@ -71,7 +82,8 @@ def approve_commands(source: str, noun: str, commands: list[str]) -> bool:
         # input must never be able to approve unsandboxed commands
         print(f"({source} present but stdin is not interactive — {noun} disabled)")
         return False
-    print(f"{source} wants to run these commands (unsandboxed):")
+    kind = "sandboxed" if sandboxed else "unsandboxed"
+    print(f"{source} wants to run these commands ({kind}):")
     for line in commands:
         print(f"  {line}")
     while True:
@@ -100,6 +112,15 @@ def approve_hooks(hookset: HookSet) -> bool:
 def approve_mcp(servers: dict[str, str]) -> bool:
     commands = [f"{name}: {command}" for name, command in servers.items()]
     return approve_commands("mcp.json", "servers", commands)
+
+
+def approve_skill_execution(skills: list[Skill], sandboxed: bool) -> bool:
+    commands = [
+        f"{skill.name}: {command}"
+        for skill in skills
+        for command in cmd_blocks(skill.body)
+    ]
+    return approve_commands("skills/", "skill commands", commands, sandboxed=sandboxed)
 
 
 class StreamLine:
@@ -177,7 +198,7 @@ def current_subagent_prompt(
 
 def main():
     parser = argparse.ArgumentParser(description="agent-harness REPL")
-    parser.add_argument("--mode", choices=MODES, default="default")
+    parser.add_argument("--mode", choices=STARTUP_MODES, default="default")
     parser.add_argument(
         "--workspace",
         type=Path,
@@ -302,8 +323,17 @@ def main():
         parser.error(str(error))
 
     # extra prompt sections, in order: hook-injected context, then the
-    # skills menu (metadata only — bodies load on demand via view_skill)
+    # skills menu (metadata only — bodies load on demand via the skill tool)
     skills = discover(workspace / "skills")
+    # a skill's !`cmd` is config-authored shell (the human installs the file),
+    # so it is gated once here like hooks.json/mcp.json — not per call. Decline
+    # drops the executable skills (a capability, not policy); prose skills stay.
+    executable = [s for s in skills if has_cmd_blocks(s.body)]
+    if executable and not approve_skill_execution(
+        executable, sandboxed=not isinstance(sandbox, NoSandbox)
+    ):
+        print(f"(skill execution declined — dropping {len(executable)} executable skill(s))")
+        skills = [s for s in skills if not has_cmd_blocks(s.body)]
     section = skills_section(skills)
     context_sections = hook_sections + ([section] if section else [])
 
@@ -337,7 +367,7 @@ def main():
         foreign_tools.extend(discovered)
         print(f"(mcp: {name} serves {len(discovered)} tools)")
 
-    llm = CodexAdapter()
+    llm = make_llm()  # the main-loop / agent-tool client (gpt-5.5)
     compact_threshold = (
         cli_args.compact_threshold
         if cli_args.compact_threshold is not None
@@ -349,10 +379,6 @@ def main():
         list_dir_tool(workspace=workspace),
         bash_tool(sandbox=sandbox),
     ]
-    if skills:
-        # only offer view_skill when there is a menu to view — otherwise the
-        # model can waste a turn calling a tool that can only ever error
-        registry.append(view_skill_tool(skills))
     tools = {tool.name: tool for tool in registry}
     # foreign tools join before the agent tool: subagents inherit them, and
     # the in-place hook wrapping below covers them like any native tool
@@ -374,6 +400,47 @@ def main():
         on_tool_call=observe_sub_tool_call,
         compact_threshold=compact_threshold,
     )
+    if skills:
+        # a skill's !`cmd` runs as a sandboxed preprocessor (config-authored,
+        # session-approved — the lesson-18 model)
+        def run(command: str) -> str:
+            return run_sandboxed(command, sandbox)
+
+        # a context:fork skill runs as a subagent: its body is the task, `model`
+        # picks the client, `allowed-tools` filters the tool set. run_subagent
+        # applies the recursion guard and the ask->deny policy.
+        def fork_run(task: str, model: str | None, allowed_tools: list[str] | None) -> str:
+            sub_tools = (
+                tools
+                if allowed_tools is None
+                else {n: t for n, t in tools.items() if n in allowed_tools}
+            )
+            return run_subagent(
+                task,
+                make_llm(model),
+                sub_tools,
+                policy=policy,
+                system=lambda: current_subagent_prompt(workspace, context_sections),
+                on_tool_call=observe_sub_tool_call,
+                compact_threshold=compact_threshold,
+            )
+
+        tools["skill"] = skill_tool(skills, run, fork_run)
+
+    def approve_plan(plan: str) -> tuple[bool, str]:
+        print("Proposed plan:\n" + plan)
+        if not sys.stdin.isatty():
+            return False, ""  # no human to consent
+        try:
+            answer = input("approve this plan? [y]es / [n]o: ").strip().lower()
+        except EOFError:
+            return False, ""
+        if answer in ("y", "yes"):
+            return True, ""
+        feedback = input("feedback for the revision (optional): ").strip()
+        return False, feedback
+
+    tools["exit_plan_mode"] = exit_plan_mode_tool(policy, approve_plan)
     # wrapped IN PLACE after the agent tool joins: every tool including the
     # delegation is hooked, the sub's closure sees the hooked registry, and
     # the spawns_subagents field keeps the recursion guard intact through
@@ -387,6 +454,8 @@ def main():
     print(f"(session: {session_path.name})")
     if messages:
         print(f"(resumed {len(messages)} messages)")
+    if skills:
+        print(f"({len(skills)} skills — /name to run one, / to list)")
 
     def record_turn() -> None:
         try:
@@ -404,11 +473,35 @@ def main():
         except OSError as error:
             print(f"(session log unavailable: {error})")
 
+    plan_armed = False
     while True:
+        policy.mode = "plan" if plan_armed else policy.base_mode
+        plan_armed = False
         try:
             user_input = input("You: ")
         except (EOFError, KeyboardInterrupt):
             break
+        if user_input.startswith("/"):
+            parsed = parse_slash(user_input)
+            names = sorted(s.name for s in skills)
+            if parsed is None:  # a bare "/" — list what's callable
+                print(f"(commands: /plan; skills: {', '.join(names) or 'none'})")
+                continue
+            name, args = parsed
+            if name == "plan":  # built-in — resolves before skill names, works with 0 skills
+                if args:
+                    policy.mode = "plan"       # run this turn in plan mode
+                    user_input = args
+                else:
+                    plan_armed = True          # arm the next turn
+                    print("(plan mode armed — your next message runs in plan mode)")
+                    continue
+            elif "skill" not in tools or name not in names:
+                print(f"(unknown skill {name!r}; skills: {', '.join(names) or 'none'})")
+                continue
+            else:
+                print(f"(running /{name})")
+                user_input = tools["skill"].execute(name=name, args=args)
         try:
             reply = run_turn(
                 messages,
@@ -418,7 +511,10 @@ def main():
                 on_tool_call=observe_tool_call,
                 policy=policy,
                 asker=asker,
-                system=current_system_prompt(workspace, context_sections),
+                system=current_system_prompt(
+                    workspace,
+                    context_sections + ([PLAN_MODE] if policy.mode == "plan" else []),
+                ),
                 compact_threshold=compact_threshold,
                 keep_recent=KEEP_RECENT,
                 on_compact=on_compact,

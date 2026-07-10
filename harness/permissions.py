@@ -1,6 +1,10 @@
 from harness.tools.base import Tool
 
-MODES = ("default", "acceptAll", "readOnly")
+# modes a session may START in (via --mode). "plan" is deliberately NOT here:
+# it is a per-turn mode entered mid-session with /plan, never selected at
+# startup — starting in "plan" would make base_mode "plan" and trap the session.
+STARTUP_MODES = ("default", "acceptAll", "readOnly")
+MODES = (*STARTUP_MODES, "plan")  # all valid modes (PermissionPolicy + decide)
 
 
 class PermissionPolicy:
@@ -11,6 +15,7 @@ class PermissionPolicy:
         if mode not in MODES:
             raise ValueError(f"unknown permission mode {mode!r}; choose from {MODES}")
         self.mode = mode
+        self.base_mode = mode  # the mode to restore to when leaving plan mode
         self.session_allowlist: set[str] = set()
 
     def decide(self, tool: Tool) -> str:
@@ -20,7 +25,7 @@ class PermissionPolicy:
         match self.mode:
             case "acceptAll":
                 return "allow"
-            case "readOnly":
+            case "readOnly" | "plan":
                 return "deny"
             case _:
                 return "ask"

@@ -1,7 +1,13 @@
 from harness.loop import run_turn
-from harness.permissions import PermissionPolicy
+from harness.permissions import MODES, STARTUP_MODES, PermissionPolicy
 from harness.tools.base import Tool
 from tests.fake_llm import FakeLLM
+
+
+def _tool(name, read_only):
+    return Tool(name=name, description="d",
+                parameters={"type": "object", "properties": {}},
+                execute=lambda: "x", read_only=read_only)
 
 
 def reader_tool() -> Tool:
@@ -158,3 +164,17 @@ def test_ask_with_no_asker_degrades_to_denial():
         policy=PermissionPolicy("default"),
     )
     assert messages[2]["content"].startswith("Permission denied")
+
+
+def test_plan_is_a_valid_mode_and_base_mode_is_recorded():
+    assert "plan" in MODES              # valid for PermissionPolicy / decide
+    assert "plan" not in STARTUP_MODES  # but never selectable at startup (--mode)
+    p = PermissionPolicy("plan")
+    assert p.mode == "plan" and p.base_mode == "plan"
+    assert PermissionPolicy("default").base_mode == "default"
+
+
+def test_plan_mode_denies_mutating_tools_and_allows_read_only():
+    p = PermissionPolicy("plan")
+    assert p.decide(_tool("write_file", read_only=False)) == "deny"
+    assert p.decide(_tool("read_file", read_only=True)) == "allow"

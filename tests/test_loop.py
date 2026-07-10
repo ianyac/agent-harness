@@ -132,3 +132,31 @@ def test_iteration_cap_ends_the_turn_gracefully():
     assert reply["role"] == "assistant"
     assert "3 iterations" in reply["content"]
     assert messages[-1] == reply
+
+
+def test_run_turn_reevaluates_a_callable_system_prompt_each_iteration():
+    # a callable system prompt is re-read every iteration, so a mid-turn change
+    # (leaving plan mode after exit_plan_mode is approved) reflects for the
+    # rest of the turn instead of carrying the stale plan-mode section
+    state = {"section": "PLAN"}
+
+    def flip() -> str:
+        state["section"] = "NORMAL"
+        return "flipped"
+
+    flip_tool = Tool(
+        name="flip", description="d",
+        parameters={"type": "object", "properties": {}}, execute=flip,
+    )
+    llm = FakeLLM([
+        {"type": "tool_calls", "calls": [{"name": "flip", "arguments": {}}]},
+        {"type": "text", "content": "done"},
+    ])
+    run_turn([], "go", llm, tools={"flip": flip_tool}, system=lambda: state["section"])
+    assert llm.turns[0]["system"] == "PLAN"    # first iteration
+    assert llm.turns[1]["system"] == "NORMAL"  # re-evaluated after the flip
+
+    # a plain string system prompt still works unchanged (back-compat)
+    llm2 = FakeLLM([{"type": "text", "content": "ok"}])
+    run_turn([], "go", llm2, system="STATIC")
+    assert llm2.turns[0]["system"] == "STATIC"

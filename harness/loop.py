@@ -37,7 +37,7 @@ def run_turn(
     on_tool_call: Callable[[str, dict], None] | None = None,
     policy: PermissionPolicy | None = None,
     asker: Callable[[str, dict], str] | None = None,
-    system: str | None = None,
+    system: str | Callable[[], str] | None = None,
     compact_threshold: int | None = None,
     keep_recent: int = 8,
     on_compact: Callable[[int], None] | None = None,
@@ -48,11 +48,15 @@ def run_turn(
     defs = definitions(tools) or None
     messages.append({"role": "user", "content": user_input})
     for _ in range(max_iterations):
+        # re-evaluated every iteration: a callable system prompt can change
+        # mid-turn (e.g. plan mode is left after exit_plan_mode is approved,
+        # so the plan-mode section must drop for the remaining iterations)
+        sys_prompt = system() if callable(system) else system
         # re-checked every iteration: tool results can balloon the context
         # mid-turn, long after the turn-start estimate looked safe
         if (
             compact_threshold is not None
-            and estimate_tokens(messages, defs, system) > compact_threshold
+            and estimate_tokens(messages, defs, sys_prompt) > compact_threshold
         ):
             compacted = compact(
                 messages,
@@ -70,7 +74,7 @@ def run_turn(
         # the kwarg travels only when streaming is on: pre-seam LLMClient
         # implementations keep working until their caller opts in
         extra = {"on_text_delta": on_text_delta} if on_text_delta is not None else {}
-        reply = llm.complete(messages, tools=defs, system=system, **extra)
+        reply = llm.complete(messages, tools=defs, system=sys_prompt, **extra)
         messages.append(reply)
         calls = reply.get("tool_calls")
         if not calls:

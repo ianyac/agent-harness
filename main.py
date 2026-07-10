@@ -20,7 +20,7 @@ from harness.llm import make_llm
 from harness.loop import run_turn
 from harness.mcp import MCPError, MCPServer, load_config, mcp_tools
 from harness.permissions import MODES, PermissionPolicy
-from harness.prompts import Environment, build_system_prompt
+from harness.prompts import Environment, PLAN_MODE, build_system_prompt
 from harness.sandbox import NoSandbox, SandboxPolicy, default_sandbox
 from harness.session import SessionLog, lock, unlock
 from harness.skills import (
@@ -35,6 +35,7 @@ from harness.skills import (
 from harness.tools.agent import agent_tool, run_subagent
 from harness.tools.bash import bash_tool, run_sandboxed
 from harness.tools.list_dir import list_dir_tool
+from harness.tools.plan import exit_plan_mode_tool
 from harness.tools.read_file import read_file_tool
 from harness.tools.write_file import write_file_tool
 
@@ -425,6 +426,21 @@ def main():
             )
 
         tools["skill"] = skill_tool(skills, run, fork_run)
+
+    def approve_plan(plan: str) -> tuple[bool, str]:
+        print("Proposed plan:\n" + plan)
+        if not sys.stdin.isatty():
+            return False, ""  # no human to consent
+        try:
+            answer = input("approve this plan? [y]es / [n]o: ").strip().lower()
+        except EOFError:
+            return False, ""
+        if answer in ("y", "yes"):
+            return True, ""
+        feedback = input("feedback for the revision (optional): ").strip()
+        return False, feedback
+
+    tools["exit_plan_mode"] = exit_plan_mode_tool(policy, approve_plan)
     # wrapped IN PLACE after the agent tool joins: every tool including the
     # delegation is hooked, the sub's closure sees the hooked registry, and
     # the spawns_subagents field keeps the recursion guard intact through
@@ -457,27 +473,35 @@ def main():
         except OSError as error:
             print(f"(session log unavailable: {error})")
 
+    plan_armed = False
     while True:
+        policy.mode = "plan" if plan_armed else policy.base_mode
+        plan_armed = False
         try:
             user_input = input("You: ")
         except (EOFError, KeyboardInterrupt):
             break
         if user_input.startswith("/"):
-            names = sorted(s.name for s in skills)
-            if "skill" not in tools or not names:
-                print("(no skills available)")
-                continue
             parsed = parse_slash(user_input)
+            names = sorted(s.name for s in skills)
             if parsed is None:  # a bare "/" — list what's callable
-                print(f"(skills: {', '.join(names)})")
+                print(f"(commands: /plan; skills: {', '.join(names) or 'none'})")
                 continue
             name, args = parsed
-            if name not in names:
-                print(f"(unknown skill {name!r}; skills: {', '.join(names)})")
+            if name == "plan":  # built-in — resolves before skill names, works with 0 skills
+                if args:
+                    policy.mode = "plan"       # run this turn in plan mode
+                    user_input = args
+                else:
+                    plan_armed = True          # arm the next turn
+                    print("(plan mode armed — your next message runs in plan mode)")
+                    continue
+            elif "skill" not in tools or name not in names:
+                print(f"(unknown skill {name!r}; skills: {', '.join(names) or 'none'})")
                 continue
-            print(f"(running /{name})")
-            # reuse the model-facing tool: args, !`cmd`, ${SKILL_DIR}, fork/inject
-            user_input = tools["skill"].execute(name=name, args=args)
+            else:
+                print(f"(running /{name})")
+                user_input = tools["skill"].execute(name=name, args=args)
         try:
             reply = run_turn(
                 messages,
@@ -487,7 +511,10 @@ def main():
                 on_tool_call=observe_tool_call,
                 policy=policy,
                 asker=asker,
-                system=current_system_prompt(workspace, context_sections),
+                system=current_system_prompt(
+                    workspace,
+                    context_sections + ([PLAN_MODE] if policy.mode == "plan" else []),
+                ),
                 compact_threshold=compact_threshold,
                 keep_recent=KEEP_RECENT,
                 on_compact=on_compact,

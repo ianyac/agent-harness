@@ -1,3 +1,5 @@
+import pytest
+
 from harness.loop import run_turn
 from harness.permissions import MODES, STARTUP_MODES, PermissionPolicy
 from harness.tools.base import Tool
@@ -166,15 +168,31 @@ def test_ask_with_no_asker_degrades_to_denial():
     assert messages[2]["content"].startswith("Permission denied")
 
 
-def test_plan_is_a_valid_mode_and_base_mode_is_recorded():
-    assert "plan" in MODES              # valid for PermissionPolicy / decide
-    assert "plan" not in STARTUP_MODES  # but never selectable at startup (--mode)
-    p = PermissionPolicy("plan")
-    assert p.mode == "plan" and p.base_mode == "plan"
-    assert PermissionPolicy("default").base_mode == "default"
+def test_plan_is_a_runtime_mode_but_never_a_startup_or_base_mode():
+    assert "plan" in MODES              # valid for decide (set via self.mode)
+    assert "plan" not in STARTUP_MODES  # never selectable at startup (--mode)
+    # library seam: constructing directly in "plan" is refused, so base_mode
+    # is always an escapable mode — no permanently-trapped policy exists
+    with pytest.raises(ValueError):
+        PermissionPolicy("plan")
+    # the real flow: start in the base mode, then flip self.mode per turn
+    p = PermissionPolicy("default")
+    p.mode = "plan"
+    assert p.base_mode == "default"     # the escapable mode to restore to
 
 
 def test_plan_mode_denies_mutating_tools_and_allows_read_only():
-    p = PermissionPolicy("plan")
+    p = PermissionPolicy("default")
+    p.mode = "plan"
     assert p.decide(_tool("write_file", read_only=False)) == "deny"
     assert p.decide(_tool("read_file", read_only=True)) == "allow"
+
+
+def test_plan_and_readonly_ignore_the_allowlist_for_mutating_tools():
+    # a tool "always"-allowed in default mode must NOT tunnel through a later
+    # plan or readOnly turn — the plan-mode escape the review found
+    for mode in ("plan", "readOnly"):
+        p = PermissionPolicy("default")
+        p.session_allowlist.add("scribble")
+        p.mode = mode
+        assert p.decide(writer_tool()) == "deny"

@@ -12,20 +12,30 @@ class PermissionPolicy:
     (injected into run_turn) handles the human on "ask"."""
 
     def __init__(self, mode: str = "default"):
-        if mode not in MODES:
-            raise ValueError(f"unknown permission mode {mode!r}; choose from {MODES}")
+        # a session may only START in a startup mode. "plan" is entered
+        # per-turn by assigning self.mode later — never as base_mode, which
+        # would trap the session with no escape. Guarding here (not only at
+        # main.py's argparse) keeps every constructible policy escapable at
+        # the library seam, for consumers that never pass through the CLI.
+        if mode not in STARTUP_MODES:
+            raise ValueError(
+                f"cannot start in mode {mode!r}; choose from {STARTUP_MODES}"
+            )
         self.mode = mode
         self.base_mode = mode  # the mode to restore to when leaving plan mode
         self.session_allowlist: set[str] = set()
 
     def decide(self, tool: Tool) -> str:
         """Return "allow", "deny", or "ask"."""
-        if tool.read_only or tool.name in self.session_allowlist:
-            return "allow"
+        if tool.read_only:
+            return "allow"  # observing never needs a gate, in any mode
         match self.mode:
+            case "readOnly" | "plan":
+                # these modes deny ALL mutation outright — even a tool the user
+                # "always"-allowed in an earlier turn. The allowlist must not
+                # tunnel a mutating call through a read-only / plan turn.
+                return "deny"
             case "acceptAll":
                 return "allow"
-            case "readOnly" | "plan":
-                return "deny"
-            case _:
-                return "ask"
+            case _:  # default
+                return "allow" if tool.name in self.session_allowlist else "ask"

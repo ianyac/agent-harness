@@ -41,7 +41,10 @@ def run_subagent(
         on_tool_call=on_tool_call,
         policy=policy,
         asker=None,
-        system=system() if callable(system) else system,
+        # run_turn re-evaluates a callable system each iteration, so pass it
+        # through rather than freezing it here — keeps the sub's env facts (date,
+        # cwd) fresh over a long run and unifies both call sites on one idiom
+        system=system,
         compact_threshold=compact_threshold,
         keep_recent=keep_recent,
     )

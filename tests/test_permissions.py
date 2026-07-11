@@ -4,12 +4,7 @@ from harness.loop import run_turn
 from harness.permissions import MODES, STARTUP_MODES, PermissionPolicy
 from harness.tools.base import Tool
 from tests.fake_llm import FakeLLM
-
-
-def _tool(name, read_only):
-    return Tool(name=name, description="d",
-                parameters={"type": "object", "properties": {}},
-                execute=lambda: "x", read_only=read_only)
+from tests.helpers import noop_tool
 
 
 def reader_tool() -> Tool:
@@ -188,8 +183,8 @@ def test_plan_is_a_runtime_mode_but_never_a_startup_or_base_mode():
 def test_plan_mode_denies_mutating_tools_and_allows_read_only():
     p = PermissionPolicy("default")
     p.mode = "plan"
-    assert p.decide(_tool("write_file", read_only=False)) == "deny"
-    assert p.decide(_tool("read_file", read_only=True)) == "allow"
+    assert p.decide(noop_tool(read_only=False)) == "deny"
+    assert p.decide(noop_tool(read_only=True)) == "allow"
 
 
 def test_plan_and_readonly_ignore_the_allowlist_for_mutating_tools():

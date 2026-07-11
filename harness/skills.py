@@ -46,6 +46,12 @@ def _parse(text: str) -> tuple[dict, str]:
     return meta, "\n".join(lines[end + 1 :]).strip()
 
 
+# the frontmatter keys discover() understands; anything else is a likely typo.
+# A misspelled 'allowed-tools' would read as absent and silently WIDEN a fork
+# skill to the full registry, so an unknown key warns rather than passing quietly.
+_KNOWN_KEYS = {"name", "description", "context", "model", "allowed-tools"}
+
+
 def discover(
     skills_dir: Path, on_warning: Callable[[str], None] = print
 ) -> list[Skill]:
@@ -86,8 +92,27 @@ def discover(
         if model is not None and model not in CONTEXT_WINDOWS:
             on_warning(f"skipping skill {entry.name}: unknown model {model!r}")
             continue
+        # warn on frontmatter that would otherwise fail silently
+        for key in meta.keys() - _KNOWN_KEYS:
+            on_warning(f"skill {entry.name}: ignoring unknown frontmatter key {key!r}")
+        context = meta.get("context")
+        if context is not None and context != "fork":
+            on_warning(
+                f"skill {entry.name}: context {context!r} is not 'fork' — "
+                "loading as a plain (non-fork) skill"
+            )
+        allowed_tools = None
+        if "allowed-tools" in meta:
+            allowed_tools = meta["allowed-tools"].split()
+            if not allowed_tools:  # a blank value → zero tools, almost never intended
+                on_warning(
+                    f"skill {entry.name}: empty allowed-tools — the subagent "
+                    "would have no tools"
+                )
         name = meta["name"]
-        body = body.replace("${SKILL_DIR}", str(base))  # a fixed path, resolved once
+        # shlex.quote so a ${SKILL_DIR} spliced into a command survives a path
+        # with spaces (a no-op for ordinary paths)
+        body = body.replace("${SKILL_DIR}", shlex.quote(str(base)))
         if name in seen:
             # a duplicate name would shadow the first in the skill tool's lookup;
             # keep the first, never silently serve the wrong body
@@ -100,23 +125,23 @@ def discover(
                 description=meta["description"],
                 body=body,
                 dir=base,
-                fork=meta.get("context") == "fork",
+                fork=context == "fork",
                 model=model,
-                allowed_tools=(
-                    meta["allowed-tools"].split() if "allowed-tools" in meta else None
-                ),
+                allowed_tools=allowed_tools,
             )
         )
     return sorted(skills, key=lambda s: s.name)  # menu order = displayed names
 
 
-def skills_section(skills: list[Skill]) -> str | None:
+def skills_section(skills: list[Skill], tool_name: str = "skill") -> str | None:
     """The always-present metadata block: name + description only. Full
     bodies are pulled in on demand by the skill tool, so an unused skill costs
-    one line, not its whole content."""
+    one line, not its whole content. `tool_name` must name the tool the caller
+    actually registered — the main loop registers "skill", the ui lane
+    "view_skill" — so the menu never tells the model to call a missing tool."""
     if not skills:
         return None
-    lines = ["Available skills (call the skill tool to load one in full):"]
+    lines = [f"Available skills (call the {tool_name} tool to load one in full):"]
     lines += [f"- {s.name}: {s.description}" for s in skills]
     return "\n".join(lines)
 
@@ -130,8 +155,8 @@ def parse_slash(text: str) -> tuple[str, str] | None:
     rest = text[1:].strip()
     if not rest:
         return None
-    name, _, args = rest.partition(" ")
-    return name, args.strip()
+    parts = rest.split(maxsplit=1)  # split on any whitespace run (a tab too, not just a space)
+    return parts[0], (parts[1] if len(parts) > 1 else "")
 
 
 # !`cmd` — at a token boundary (start of body or after whitespace): a bang, an
@@ -177,7 +202,12 @@ def shell_substitute_args(command: str, args: str) -> str:
     (`;`, `|`, backticks, `$( )`) are passed as literal data — never
     interpreted. $ARGUMENTS expands to its whitespace tokens, each quoted, so
     multi-token flag args still work (`--oneline -n 5`); a missing positional
-    is "" (nothing), matching substitute_args."""
+    is "" (nothing), matching substitute_args.
+
+    Skill-authoring convention: write BARE placeholders (`git log $1`,
+    `grep $1 file`) — this function supplies the quoting. A template that also
+    quotes the placeholder (`grep "$1" file`) would double-quote and break the
+    moment an arg needs escaping, so do not quote placeholders yourself."""
     parts = args.split()
 
     def repl(match: "re.Match[str]") -> str:

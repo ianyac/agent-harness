@@ -1,6 +1,5 @@
+import shlex
 from pathlib import Path
-
-import pytest
 
 from harness.skills import (
     Skill,
@@ -77,6 +76,13 @@ def test_section_lists_metadata_only_never_bodies(tmp_path):
 
 def test_no_skills_means_no_section(tmp_path):
     assert skills_section([]) is None
+
+
+def test_section_names_the_registered_tool(tmp_path):
+    write_skill(tmp_path, "s", "d", "b")
+    skills = discover(tmp_path)
+    assert "call the skill tool" in skills_section(skills)              # main-loop default
+    assert "call the view_skill tool" in skills_section(skills, "view_skill")  # ui lane
 
 
 def test_cmd_blocks_extracts_commands_in_order():
@@ -351,6 +357,52 @@ def test_substitute_args_fills_a_positional_inside_a_command():
     assert substitute_args("!`git log $1`", "HEAD") == "!`git log HEAD`"
 
 
+def test_discover_warns_on_a_misspelled_allowed_tools_key(tmp_path):
+    # 'allowed_tools' (underscore) reads as absent → allowed_tools stays None,
+    # which WIDENS a fork skill to the full registry; warn instead of silence
+    (tmp_path / "r").mkdir()
+    (tmp_path / "r" / "SKILL.md").write_text(
+        "---\nname: r\ndescription: d\ncontext: fork\nallowed_tools: read_file\n---\nBody."
+    )
+    warnings = []
+    (skill,) = discover(tmp_path, on_warning=warnings.append)
+    assert skill.allowed_tools is None
+    assert any("allowed_tools" in w for w in warnings)
+
+
+def test_discover_warns_on_empty_allowed_tools(tmp_path):
+    (tmp_path / "r").mkdir()
+    (tmp_path / "r" / "SKILL.md").write_text(
+        "---\nname: r\ndescription: d\ncontext: fork\nallowed-tools:\n---\nBody."
+    )
+    warnings = []
+    (skill,) = discover(tmp_path, on_warning=warnings.append)
+    assert skill.allowed_tools == []
+    assert any("empty allowed-tools" in w for w in warnings)
+
+
+def test_discover_warns_when_context_is_not_exactly_fork(tmp_path):
+    (tmp_path / "r").mkdir()
+    (tmp_path / "r" / "SKILL.md").write_text(
+        "---\nname: r\ndescription: d\ncontext: Fork\n---\nBody."
+    )
+    warnings = []
+    (skill,) = discover(tmp_path, on_warning=warnings.append)
+    assert skill.fork is False  # a case typo degrades to a plain skill...
+    assert any("not 'fork'" in w for w in warnings)  # ...but no longer silently
+
+
+def test_skill_dir_with_a_space_stays_shell_safe(tmp_path):
+    d = tmp_path / "My Skills"
+    d.mkdir()
+    write_skill(d, "s", "d", "run: !`cat ${SKILL_DIR}/x`")
+    ran = []
+    tool = skill_tool(discover(d), run=lambda cmd: ran.append(cmd) or "ok")
+    tool.execute(name="s")
+    # the quoted path is a single shell token even though it contains a space
+    assert ran == [f"cat {shlex.quote(str(d))}/x"]
+
+
 def test_discover_reads_fork_model_and_allowed_tools(tmp_path):
     write_dir_skill(
         tmp_path, "research", "research", "does research",
@@ -495,6 +547,12 @@ def test_parse_slash_name_only():
 
 def test_parse_slash_args_is_remainder_after_first_space():
     assert parse_slash("/x  a b  ") == ("x", "a b")
+
+
+def test_parse_slash_splits_the_name_on_any_whitespace():
+    # a tab after the name must not glue into the name (which would make
+    # '/plan\ttask' fall through to the model as an ordinary, acting turn)
+    assert parse_slash("/plan\tinvestigate the bug") == ("plan", "investigate the bug")
 
 
 def test_parse_slash_name_is_the_first_token_only():

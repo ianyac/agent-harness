@@ -26,7 +26,7 @@ from harness.prompts import (
     PLAN_MODE_SUBAGENT,
     build_system_prompt,
 )
-from harness.sandbox import NoSandbox, SandboxPolicy, default_sandbox
+from harness.sandbox import LinuxSandbox, NoSandbox, SandboxPolicy, default_sandbox
 from harness.session import SessionLog, lock, unlock
 from harness.skills import (
     Skill,
@@ -333,16 +333,19 @@ def main():
     # a skill's !`cmd` is config-authored shell (the human installs the file),
     # so it is gated once here like hooks.json/mcp.json — not per call. Decline
     # drops the executable skills (a capability, not policy); prose skills stay.
+    # LinuxSandbox is a stub that raises on wrap(), so it is NOT a working
+    # sandbox — treat it like NoSandbox when deciding whether commands may run
+    sandbox_enforces = not isinstance(sandbox, (NoSandbox, LinuxSandbox))
     executable = [s for s in skills if has_cmd_blocks(s.body)]
     if executable:
-        if isinstance(sandbox, NoSandbox):
-            # no sandbox backend on this platform: skill commands are refused
+        if not sandbox_enforces:
+            # no working sandbox on this platform: skill commands are refused
             # at run time (they render as inert skip-notices), so there is
             # nothing dangerous to approve. Keep the skills — their prose and
             # args still work — and say the commands won't run.
             print(
-                f"(no sandbox here — {len(executable)} skill(s) with commands "
-                "will not run those commands)"
+                f"(no working sandbox here — {len(executable)} skill(s) with "
+                "commands will not run those commands)"
             )
         elif not approve_skill_execution(executable, sandboxed=True):
             print(f"(skill execution declined — dropping {len(executable)} executable skill(s))")
@@ -442,11 +445,12 @@ def main():
         # a skill's !`cmd` runs as a sandboxed preprocessor (config-authored,
         # session-approved — the lesson-18 model)
         def run(command: str) -> str:
-            # require a real sandbox: model-influenced args reach sh -c, so an
-            # unsandboxed run is refused outright. (expand_body's shell-quoting
-            # is the other half of this defense — belt and suspenders.)
-            if isinstance(sandbox, NoSandbox):
-                return "[skill command not run: no sandbox backend on this platform]"
+            # require a working sandbox: model-influenced args reach sh -c, so a
+            # run without enforcement is refused outright. (expand_body's
+            # shell-quoting is the other half of this defense.) LinuxSandbox
+            # counts as non-enforcing — its wrap() raises NotImplementedError.
+            if not sandbox_enforces:
+                return "[skill command not run: no working sandbox on this platform]"
             return run_sandboxed(command, sandbox)
 
         # a context:fork skill runs as a subagent: its body is the task, `model`
@@ -487,6 +491,14 @@ def main():
         return False, feedback
 
     tools["exit_plan_mode"] = exit_plan_mode_tool(policy, approve_plan)
+    # the slash front door invokes a skill as an explicit USER action, so it
+    # calls the UNWRAPPED skill tool: the tool hooks gate the model's
+    # autonomous calls, not a command the human typed, and — crucially — the
+    # unwrapped tool RAISES on failure (a fork skill's LLM error) so the slash
+    # loop's try/except can catch it, whereas with_hooks converts failures to
+    # result strings that would otherwise be fed to the model as a prompt. The
+    # fork subagent's own tool calls still see the hooked registry.
+    raw_skill_tool = tools.get("skill")
     # wrapped IN PLACE after the agent tool joins: every tool including the
     # delegation is hooked, the sub's closure sees the hooked registry, and
     # the spawns_subagents field keeps the recursion guard intact through
@@ -544,18 +556,20 @@ def main():
                     plan_armed = True          # arm the next turn
                     print("(plan mode armed — your next message runs in plan mode)")
                     continue
-            elif "skill" in tools and name in names:
-                # a real turn: set the mode before executing (a fork skill
-                # spawns a subagent that reads policy.mode)
+            elif raw_skill_tool is not None and name in names:
+                # set the mode before executing (a fork skill spawns a subagent
+                # that reads policy.mode) — but do NOT consume plan_armed yet:
+                # if the skill fails/cancels below we `continue` without a turn,
+                # and a real turn is what consumes the arming (line below)
                 policy.mode = "plan" if run_in_plan else policy.base_mode
-                plan_armed = False
                 print(f"(running /{name})")
                 # journal it like a model-invoked skill call, and guard the
                 # execute: a fork skill's LLM/tool failure, or Ctrl-C mid-fork,
-                # must not crash the whole REPL
+                # must not crash the whole REPL (the unwrapped tool raises, so
+                # this catches it — with_hooks would have hidden it in a string)
                 record_action("agent", "skill", {"name": name, "args": args})
                 try:
-                    user_input = tools["skill"].execute(name=name, args=args)
+                    user_input = raw_skill_tool.execute(name=name, args=args)
                 except KeyboardInterrupt:
                     print("\n(skill cancelled)")
                     continue
@@ -568,6 +582,7 @@ def main():
         # commit to a turn: fix the mode (idempotent if the skill branch set it)
         # and consume any arming
         policy.mode = "plan" if run_in_plan else policy.base_mode
+        was_plan_turn = policy.mode == "plan"
         plan_armed = False
         try:
             reply = run_turn(
@@ -601,6 +616,12 @@ def main():
             record_turn()
             for warning in run_stop(hookset, reply, cwd=workspace):
                 print(f"({warning})")
+            if was_plan_turn and policy.mode == "plan":
+                # the plan was never approved (approval would have restored
+                # base_mode). Plan mode is per-turn, so the next message runs in
+                # the base mode — say so, mirroring the "(plan armed)" notice, so
+                # the user isn't surprised that a rejected plan can now be acted on
+                print(f"(plan mode ended — your next message runs in {policy.base_mode} mode)")
         except KeyboardInterrupt:
             stream.discard()
             # drop the half-built exchange: a dangling tool_call in history

@@ -2,10 +2,10 @@ from dataclasses import dataclass
 
 PLAN_MODE = (
     "Plan mode: you are investigating and proposing, not acting. Use only "
-    "read-only tools (read files, list directories, search) — do NOT modify "
-    "files, run mutating commands, or take any action; those are denied. When "
-    "you have a complete plan, call exit_plan_mode with it and wait for the "
-    "user to approve before doing anything."
+    "read-only tools (read files, list directories) — do NOT modify files or "
+    "run commands (bash and every mutating tool are denied here, including for "
+    "search). When you have a complete plan, call exit_plan_mode with it and "
+    "wait for the user to approve before doing anything."
 )
 
 # Subagents share the plan-mode policy but cannot exit it (exit_plan_mode is
@@ -13,8 +13,9 @@ PLAN_MODE = (
 # report — no mention of a gate tool they don't have.
 PLAN_MODE_SUBAGENT = (
     "This is a read-only planning turn: use only read-only tools (read files, "
-    "list directories, search). Any attempt to modify files or run mutating "
-    "commands is denied. Investigate and report what you find — do not act."
+    "list directories). Any attempt to modify files or run commands (bash "
+    "included, so no shell search) is denied. Investigate and report what you "
+    "find — do not act."
 )
 
 

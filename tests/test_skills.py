@@ -330,23 +330,38 @@ def test_directory_name_and_frontmatter_name_may_differ(tmp_path):
     assert skill.dir == tmp_path / "tools"
 
 
-def test_skill_dir_is_substituted_in_the_body(tmp_path):
+def test_skill_dir_is_substituted_at_expansion(tmp_path):
     write_dir_skill(tmp_path, "pdf", "pdf", "d", "schema: ${SKILL_DIR}/references/api.md")
-    (skill,) = discover(tmp_path)
-    assert "${SKILL_DIR}" not in skill.body
-    assert f"{tmp_path / 'pdf'}/references/api.md" in skill.body
+    out = skill_tool(discover(tmp_path)).execute(name="pdf")
+    assert "${SKILL_DIR}" not in out
+    assert out == f"schema: {tmp_path / 'pdf'}/references/api.md"
 
 
-def test_skill_dir_resolves_inside_a_command_for_the_approval_listing(tmp_path):
+def test_command_approval_listing_shows_the_skill_dir_token(tmp_path):
     write_dir_skill(tmp_path, "pdf", "pdf", "d", "run: !`python ${SKILL_DIR}/check.py`")
     (skill,) = discover(tmp_path)
-    assert cmd_blocks(skill.body) == [f"python {tmp_path / 'pdf'}/check.py"]
+    # ${SKILL_DIR} resolves at expansion now, so the listing shows the template
+    # token (the skill's own dir — safe, not model-controlled)
+    assert cmd_blocks(skill.body) == ["python ${SKILL_DIR}/check.py"]
 
 
-def test_flat_skill_dir_substitutes_to_the_skills_root(tmp_path):
+def test_flat_skill_dir_resolves_to_the_skills_root(tmp_path):
     write_skill(tmp_path, "s", "d", "here: ${SKILL_DIR}/x")
-    (skill,) = discover(tmp_path)
-    assert f"{tmp_path}/x" in skill.body
+    assert skill_tool(discover(tmp_path)).execute(name="s") == f"here: {tmp_path}/x"
+
+
+def test_skill_dir_in_prose_is_not_shell_quoted_even_with_a_space(tmp_path):
+    # the round-2 regression: a spaced install path must NOT put literal quotes
+    # into a prose path, or the model relays a broken path to read_file
+    d = tmp_path / "My Skills"
+    d.mkdir()
+    write_dir_skill(d, "pdf", "pdf", "d", "See ${SKILL_DIR}/ref.md")
+    assert skill_tool(discover(d)).execute(name="pdf") == f"See {d / 'pdf'}/ref.md"
+
+
+def test_view_skill_resolves_the_skill_dir_raw(tmp_path):
+    write_dir_skill(tmp_path, "pdf", "pdf", "d", "ref: ${SKILL_DIR}/x")
+    assert view_skill_tool(discover(tmp_path)).execute(name="pdf") == f"ref: {tmp_path / 'pdf'}/x"
 
 
 def test_substitute_args_arguments_and_positionals():
@@ -404,12 +419,8 @@ def test_skill_dir_with_a_space_stays_shell_safe(tmp_path):
 
 
 def test_discover_reads_fork_model_and_allowed_tools(tmp_path):
-    write_dir_skill(
-        tmp_path, "research", "research", "does research",
-        "body",
-        # frontmatter written directly to control the extra keys:
-    )
-    # overwrite SKILL.md with the policy frontmatter
+    # frontmatter written directly to control the fork/model/allowed-tools keys
+    (tmp_path / "research").mkdir()
     (tmp_path / "research" / "SKILL.md").write_text(
         "---\nname: research\ndescription: d\ncontext: fork\n"
         "model: gpt-5.4-mini\nallowed-tools: read_file list_dir\n---\nBody."
@@ -418,6 +429,15 @@ def test_discover_reads_fork_model_and_allowed_tools(tmp_path):
     assert skill.fork is True
     assert skill.model == "gpt-5.4-mini"
     assert skill.allowed_tools == ["read_file", "list_dir"]
+
+
+def test_discover_warns_when_a_skill_is_named_plan(tmp_path):
+    # 'plan' collides with the /plan built-in, so it's unreachable via slash
+    write_skill(tmp_path, "plan", "d", "b")
+    warnings = []
+    (skill,) = discover(tmp_path, on_warning=warnings.append)
+    assert skill.name == "plan"  # still loaded (the model can call it by name)
+    assert any("shadowed by the /plan" in w for w in warnings)
 
 
 def test_discover_survives_an_unreadable_skills_directory(tmp_path, monkeypatch):
@@ -435,7 +455,8 @@ def test_discover_survives_an_unreadable_skills_directory(tmp_path, monkeypatch)
     assert warnings and "permission denied" in warnings[0]
 
 
-def test_discover_skips_a_skill_with_an_unknown_model(tmp_path):
+def test_discover_keeps_a_plain_skill_but_ignores_its_model(tmp_path):
+    # model is meaningless on a non-fork skill: don't drop the skill over it
     (tmp_path / "bad").mkdir()
     (tmp_path / "bad" / "SKILL.md").write_text(
         "---\nname: bad\ndescription: d\nmodel: gpt-9-imaginary\n---\nBody."
@@ -443,8 +464,22 @@ def test_discover_skips_a_skill_with_an_unknown_model(tmp_path):
     write_skill(tmp_path, "good", "d", "b")
     warnings = []
     skills = discover(tmp_path, on_warning=warnings.append)
+    assert sorted(s.name for s in skills) == ["bad", "good"]  # kept, not dropped
+    assert next(s for s in skills if s.name == "bad").model is None
+    assert any("ignored" in w for w in warnings)
+
+
+def test_discover_skips_a_fork_skill_with_an_unknown_model(tmp_path):
+    # a fork skill NEEDS a real model to build its client, so a bad one is fatal
+    (tmp_path / "bad").mkdir()
+    (tmp_path / "bad" / "SKILL.md").write_text(
+        "---\nname: bad\ndescription: d\ncontext: fork\nmodel: gpt-9-imaginary\n---\nBody."
+    )
+    write_skill(tmp_path, "good", "d", "b")
+    warnings = []
+    skills = discover(tmp_path, on_warning=warnings.append)
     assert [s.name for s in skills] == ["good"]
-    assert warnings and "gpt-9-imaginary" in warnings[0]
+    assert any("gpt-9-imaginary" in w for w in warnings)
 
 
 def test_a_plain_skill_has_no_fork_or_policy(tmp_path):

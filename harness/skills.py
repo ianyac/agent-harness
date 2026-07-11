@@ -88,10 +88,6 @@ def discover(
         except (OSError, ValueError, UnicodeDecodeError) as error:
             on_warning(f"skipping skill {entry.name}: {error}")
             continue
-        model = meta.get("model")
-        if model is not None and model not in CONTEXT_WINDOWS:
-            on_warning(f"skipping skill {entry.name}: unknown model {model!r}")
-            continue
         # warn on frontmatter that would otherwise fail silently
         for key in meta.keys() - _KNOWN_KEYS:
             on_warning(f"skill {entry.name}: ignoring unknown frontmatter key {key!r}")
@@ -101,6 +97,16 @@ def discover(
                 f"skill {entry.name}: context {context!r} is not 'fork' — "
                 "loading as a plain (non-fork) skill"
             )
+        is_fork = context == "fork"
+        model = meta.get("model")
+        if model is not None and not is_fork:
+            # model only picks a fork subagent's client; on a plain skill it does
+            # nothing — ignore it rather than drop the whole skill over the field
+            on_warning(f"skill {entry.name}: model {model!r} ignored (only fork skills use a model)")
+            model = None
+        elif model is not None and model not in CONTEXT_WINDOWS:
+            on_warning(f"skipping skill {entry.name}: unknown model {model!r}")
+            continue
         allowed_tools = None
         if "allowed-tools" in meta:
             allowed_tools = meta["allowed-tools"].split()
@@ -110,9 +116,10 @@ def discover(
                     "would have no tools"
                 )
         name = meta["name"]
-        # shlex.quote so a ${SKILL_DIR} spliced into a command survives a path
-        # with spaces (a no-op for ordinary paths)
-        body = body.replace("${SKILL_DIR}", shlex.quote(str(base)))
+        if name == "plan":
+            # the /plan built-in resolves before skill names, so a skill named
+            # "plan" is unreachable through the slash front door
+            on_warning(f"skill {entry.name}: name 'plan' is shadowed by the /plan built-in")
         if name in seen:
             # a duplicate name would shadow the first in the skill tool's lookup;
             # keep the first, never silently serve the wrong body
@@ -123,9 +130,9 @@ def discover(
             Skill(
                 name=name,
                 description=meta["description"],
-                body=body,
+                body=body,  # ${SKILL_DIR} stays a token; expand_body resolves it per-context
                 dir=base,
-                fork=context == "fork",
+                fork=is_fork,
                 model=model,
                 allowed_tools=allowed_tools,
             )
@@ -180,20 +187,30 @@ def has_cmd_blocks(body: str) -> bool:
 _ARG = re.compile(r"\$(ARGUMENTS|[1-9])")
 
 
-def substitute_args(body: str, args: str) -> str:
-    """Replace $ARGUMENTS (the whole string) and $1..$9 (whitespace-split
-    positionals; missing → "") in one pass, so an arg that itself contains a
-    $-token is never re-expanded."""
+def _substitute_args(text: str, args: str, quote: Callable[[str], str] | None) -> str:
+    """Shared engine for the two arg-substitution modes, so a future change to
+    placeholder syntax can never drift them apart (and silently drop quoting on
+    the shell path, re-opening injection). `quote` is None for the display mode
+    and shlex.quote for the shell mode; $ARGUMENTS and $1..$9 are filled in one
+    pass, so an arg that itself contains a $-token is never re-expanded."""
     parts = args.split()
 
     def repl(match: "re.Match[str]") -> str:
         token = match.group(1)
         if token == "ARGUMENTS":
-            return args
+            return " ".join(quote(p) for p in parts) if quote else args
         i = int(token)
-        return parts[i - 1] if i <= len(parts) else ""
+        if i > len(parts):
+            return ""  # missing positional → nothing, in both modes
+        return quote(parts[i - 1]) if quote else parts[i - 1]
 
-    return _ARG.sub(repl, body)
+    return _ARG.sub(repl, text)
+
+
+def substitute_args(body: str, args: str) -> str:
+    """Replace $ARGUMENTS (the whole string) and $1..$9 (whitespace-split
+    positionals; missing → "") for display — no shell quoting."""
+    return _substitute_args(body, args, quote=None)
 
 
 def shell_substitute_args(command: str, args: str) -> str:
@@ -208,44 +225,67 @@ def shell_substitute_args(command: str, args: str) -> str:
     `grep $1 file`) — this function supplies the quoting. A template that also
     quotes the placeholder (`grep "$1" file`) would double-quote and break the
     moment an arg needs escaping, so do not quote placeholders yourself."""
-    parts = args.split()
-
-    def repl(match: "re.Match[str]") -> str:
-        token = match.group(1)
-        if token == "ARGUMENTS":
-            return " ".join(shlex.quote(p) for p in parts)
-        i = int(token)
-        return shlex.quote(parts[i - 1]) if i <= len(parts) else ""
-
-    return _ARG.sub(repl, command)
+    return _substitute_args(command, args, quote=shlex.quote)
 
 
-def expand_body(body: str, run: Callable[[str], str] | None, args: str = "") -> str:
+def resolve_skill_dir(text: str, skill_dir: "Path | None", *, quote: bool) -> str:
+    """Replace ${SKILL_DIR} with the skill's directory. Quoted (shlex) when the
+    text is a command bound for `sh -c` — safe with spaces — but RAW in prose,
+    where the model relays the path to read_file/list_dir and literal quotes
+    would corrupt it. Applied AFTER arg substitution, so a $-token inside the
+    path is never treated as a placeholder."""
+    if skill_dir is None:
+        return text
+    value = shlex.quote(str(skill_dir)) if quote else str(skill_dir)
+    return text.replace("${SKILL_DIR}", value)
+
+
+def expand_body(
+    body: str,
+    run: Callable[[str], str] | None,
+    args: str = "",
+    skill_dir: "Path | None" = None,
+) -> str:
     """Expand a skill body at invocation. `!`cmd`` spans are located on THIS body
     — the template the human approved at session start — then each command has
     $args filled and is run via `run`. Prose between commands gets $args but is
     NOT re-scanned for commands, so an arg containing !`...` lands in prose,
     inert: args can FILL an approved command but never INTRODUCE a new one. A
-    command that RUNS gets shell-quoted args (metacharacters stay literal);
-    `\\!`cmd`` is a literal and run=None leaves commands unrun — both show args
-    raw, since nothing reaches a shell."""
+    command that RUNS gets shell-quoted args and a shell-quoted ${SKILL_DIR};
+    `\\!`cmd`` is a literal and run=None leaves commands unrun — both, and all
+    prose, show args and ${SKILL_DIR} raw, since nothing reaches a shell."""
     out: list[str] = []
     last = 0
     for match in _CMD.finditer(body):
-        out.append(substitute_args(body[last : match.start()], args))  # prose: args, never a command
+        prose = substitute_args(body[last : match.start()], args)  # never a command
+        out.append(resolve_skill_dir(prose, skill_dir, quote=False))
         escaped, command = match.group(1), match.group(2)
         if escaped or run is None:
             # literal (escaped) or non-executing: nothing reaches a shell, so
-            # show the args raw for display fidelity
-            out.append(f"!`{substitute_args(command, args)}`")
+            # show args and the path raw for display fidelity
+            filled = resolve_skill_dir(substitute_args(command, args), skill_dir, quote=False)
+            out.append(f"!`{filled}`")
         else:
+            filled = resolve_skill_dir(shell_substitute_args(command, args), skill_dir, quote=True)
             try:
-                out.append(run(shell_substitute_args(command, args)))  # runs → quote args
+                out.append(run(filled))  # runs → args and ${SKILL_DIR} shell-quoted
             except Exception as error:  # a bad block degrades, never raises
                 out.append(f"[skill command failed: {error}]")
         last = match.end()
-    out.append(substitute_args(body[last:], args))
+    tail = substitute_args(body[last:], args)
+    out.append(resolve_skill_dir(tail, skill_dir, quote=False))
     return "".join(out)
+
+
+def _lookup(by_name: dict, name: str) -> tuple[Skill | None, str]:
+    """Resolve a skill by name, or (None, error) with an identical not-found
+    message — shared by the skill and view_skill tools so the two seams never
+    drift. Callers branch on `skill is None` (which narrows the type)."""
+    skill = by_name.get(name)
+    if skill is None:
+        available = ", ".join(sorted(by_name)) or "none"
+        return None, f"Error: no skill named {name!r}. Available skills: {available}"
+    return skill, ""
 
 
 def skill_tool(
@@ -259,11 +299,10 @@ def skill_tool(
     by_name = {s.name: s for s in skills}
 
     def execute(name: str, args: str = "") -> str:
-        if name not in by_name:
-            available = ", ".join(sorted(by_name)) or "none"
-            return f"Error: no skill named {name!r}. Available skills: {available}"
-        skill = by_name[name]
-        processed = expand_body(skill.body, run, args)  # commands come from the template only
+        skill, error = _lookup(by_name, name)
+        if skill is None:
+            return error
+        processed = expand_body(skill.body, run, args, skill_dir=skill.dir)  # commands from the template only
         if skill.fork:
             if fork_run is None:
                 return "Error: this skill runs as a subagent, which is unavailable here."
@@ -305,10 +344,12 @@ def view_skill_tool(skills: list[Skill]) -> Tool:
     by_name = {s.name: s for s in skills}
 
     def execute(name: str) -> str:
-        if name not in by_name:
-            available = ", ".join(sorted(by_name)) or "none"
-            return f"Error: no skill named {name!r}. Available skills: {available}"
-        return by_name[name].body  # verbatim; commands are not run
+        skill, error = _lookup(by_name, name)
+        if skill is None:
+            return error
+        # verbatim; commands are not run — resolve ${SKILL_DIR} raw (prose), so
+        # a bundled-file path the model reads out is a real, unquoted path
+        return resolve_skill_dir(skill.body, skill.dir, quote=False)
 
     return Tool(
         name="view_skill",

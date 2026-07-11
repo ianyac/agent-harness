@@ -36,3 +36,15 @@ exist in the ui registry → `Error: unknown tool 'skill'`.
 Related: `view_skill_tool` is again a **real** factory (not an alias to
 `skill_tool`) — it returns a read-only, non-executing tool named `view_skill`
 with `spawns_subagents=False`, i.e. the lesson-15 contract the ui lane keyed on.
+
+## 3. `Skill.body` now carries an unresolved `${SKILL_DIR}` token
+
+`discover()` no longer eagerly replaces `${SKILL_DIR}` in the body. Resolution
+moved to invocation time (`expand_body` / `view_skill_tool.execute`), where it
+is **shell-quoted inside a command** but **raw in prose** — a quoted path in
+prose was corrupting `read_file` arguments on spaced install paths.
+
+- Consume bodies through `view_skill_tool` (which resolves `${SKILL_DIR}` raw)
+  or the `skill` tool — do **not** read `Skill.body` directly and expect a
+  resolved path; you would now see the literal `${SKILL_DIR}` token. `Skill.dir`
+  holds the directory if you need to resolve it yourself.

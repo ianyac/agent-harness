@@ -169,7 +169,11 @@ def test_ask_with_no_asker_degrades_to_denial():
 
 
 def test_plan_is_a_runtime_mode_but_never_a_startup_or_base_mode():
-    assert "plan" in MODES              # valid for decide (set via self.mode)
+    # MODES is the constructible set; plan is a runtime-only self.mode. Keeping
+    # plan out of MODES means a consumer using MODES as a picker (the ui lane)
+    # never offers a mode that would raise on construction.
+    assert MODES == STARTUP_MODES
+    assert "plan" not in MODES
     assert "plan" not in STARTUP_MODES  # never selectable at startup (--mode)
     # library seam: constructing directly in "plan" is refused, so base_mode
     # is always an escapable mode — no permanently-trapped policy exists

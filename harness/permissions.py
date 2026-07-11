@@ -4,7 +4,12 @@ from harness.tools.base import Tool
 # it is a per-turn mode entered mid-session with /plan, never selected at
 # startup — starting in "plan" would make base_mode "plan" and trap the session.
 STARTUP_MODES = ("default", "acceptAll", "readOnly")
-MODES = (*STARTUP_MODES, "plan")  # all valid modes (PermissionPolicy + decide)
+# MODES is the set of CONSTRUCTIBLE modes — every member is a valid starting /
+# base mode. "plan" is NOT a member: it is a runtime-only mode entered per-turn
+# by assigning self.mode (decide handles it via a literal case, not membership).
+# Consumers treat MODES as the selectable-mode list, so advertising a
+# non-constructible "plan" here would 500 a session that tried to start in it.
+MODES = STARTUP_MODES
 
 
 class PermissionPolicy:

@@ -569,13 +569,21 @@ def main():
                 # this catches it — with_hooks would have hidden it in a string)
                 record_action("agent", "skill", {"name": name, "args": args})
                 try:
-                    user_input = raw_skill_tool.execute(name=name, args=args)
+                    result = raw_skill_tool.execute(name=name, args=args)
                 except KeyboardInterrupt:
                     print("\n(skill cancelled)")
                     continue
                 except Exception as error:  # noqa: BLE001 — surface, don't die
                     print(f"(skill {name!r} failed: {error})")
                     continue
+                if next(s for s in skills if s.name == name).fork:
+                    # a fork skill already ran its subagent to a final answer;
+                    # show it directly instead of feeding it into a second,
+                    # top-level turn that would only paraphrase it at double cost
+                    plan_armed = False  # a completed invocation consumes the arming
+                    print(result)
+                    continue
+                user_input = result  # a plain skill's body drives the turn below
             # else: an unknown /name is not a command — fall through and send
             # the original message to the model rather than swallowing it
             # (e.g. "/etc/hosts has a stale entry, can you check it?")

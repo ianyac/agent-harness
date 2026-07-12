@@ -410,6 +410,16 @@ def main():
             print(f"(mcp: duplicate tool name {tool.name!r} — keeping the first)")
             continue
         tools[tool.name] = tool
+
+    def register_builtin(name, tool):
+        # built-ins (agent/skill/exit_plan_mode) join AFTER the MCP tools, so the
+        # keep-first-warn guard above doesn't cover them. The built-in wins (it
+        # is core harness capability), but warn so a same-named MCP tool isn't
+        # shadowed silently — the very thing that guard exists to announce.
+        if name in tools:
+            print(f"(builtin {name!r} shadows an MCP tool of the same name — using the builtin)")
+        tools[name] = tool
+
     policy = PermissionPolicy(cli_args.mode)
     # built once: the callable system prompt is re-evaluated per delegation,
     # so the sub's env facts (date, cwd) never go stale anyway
@@ -420,14 +430,14 @@ def main():
         extra = subagent_sections + ([PLAN_MODE_SUBAGENT] if policy.mode == "plan" else [])
         return current_subagent_prompt(workspace, extra)
 
-    tools["agent"] = agent_tool(
+    register_builtin("agent", agent_tool(
         llm,
         tools,
         policy=policy,
         system=subagent_prompt,
         on_tool_call=observe_sub_tool_call,
         compact_threshold=compact_threshold,
-    )
+    ))
     if skills:
         # validate each fork skill's allowed-tools against the tools a subagent
         # could actually receive (spawns_subagents tools are filtered out for
@@ -472,7 +482,7 @@ def main():
                 compact_threshold=compact_threshold,
             )
 
-        tools["skill"] = skill_tool(skills, run, fork_run)
+        register_builtin("skill", skill_tool(skills, run, fork_run))
 
     def approve_plan(plan: str) -> tuple[bool, str]:
         print("Proposed plan:\n" + plan)
@@ -490,7 +500,7 @@ def main():
             feedback = ""  # Ctrl-D at the feedback prompt is still a rejection
         return False, feedback
 
-    tools["exit_plan_mode"] = exit_plan_mode_tool(policy, approve_plan)
+    register_builtin("exit_plan_mode", exit_plan_mode_tool(policy, approve_plan))
     # the slash front door invokes a skill as an explicit USER action, so it
     # calls the UNWRAPPED skill tool: the tool hooks gate the model's
     # autonomous calls, not a command the human typed, and — crucially — the

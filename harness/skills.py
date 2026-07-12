@@ -184,19 +184,30 @@ def has_cmd_blocks(body: str) -> bool:
     return any(not m.group(1) for m in _CMD.finditer(body))
 
 
-_ARG = re.compile(r"\$(ARGUMENTS|[1-9])")
+# One-pass fill of ${SKILL_DIR}, $ARGUMENTS, and $1..$9. The single pass IS the
+# security boundary: a value substituted in (an arg, or the skill-dir path) is
+# never re-scanned, so args fill approved holes but can never INTRODUCE a
+# ${SKILL_DIR} or a $-token, and a skill-dir path that happens to contain a
+# $-token is inert. Splitting ${SKILL_DIR} and args into two passes (either
+# order) re-opens one of those two holes.
+_SUBST = re.compile(r"\$\{SKILL_DIR\}|\$(ARGUMENTS|[1-9])")
 
 
-def _substitute_args(text: str, args: str, quote: Callable[[str], str] | None) -> str:
-    """Shared engine for the two arg-substitution modes, so a future change to
-    placeholder syntax can never drift them apart (and silently drop quoting on
-    the shell path, re-opening injection). `quote` is None for the display mode
-    and shlex.quote for the shell mode; $ARGUMENTS and $1..$9 are filled in one
-    pass, so an arg that itself contains a $-token is never re-expanded."""
+def _substitute(
+    text: str, args: str, skill_dir: "Path | None", quote: Callable[[str], str] | None
+) -> str:
+    """Fill the placeholders in one pass. `quote` is shlex.quote for a command
+    bound for `sh -c` (each filled value quoted, so metacharacters stay literal
+    and a spaced ${SKILL_DIR} is one token) or None for display/prose. A missing
+    $1..$9 is ""; a ${SKILL_DIR} with no skill_dir is left as the literal token."""
     parts = args.split()
 
     def repl(match: "re.Match[str]") -> str:
         token = match.group(1)
+        if token is None:  # matched ${SKILL_DIR}
+            if skill_dir is None:
+                return match.group(0)  # nothing to resolve — leave the token
+            return quote(str(skill_dir)) if quote else str(skill_dir)
         if token == "ARGUMENTS":
             return " ".join(quote(p) for p in parts) if quote else args
         i = int(token)
@@ -204,13 +215,13 @@ def _substitute_args(text: str, args: str, quote: Callable[[str], str] | None) -
             return ""  # missing positional → nothing, in both modes
         return quote(parts[i - 1]) if quote else parts[i - 1]
 
-    return _ARG.sub(repl, text)
+    return _SUBST.sub(repl, text)
 
 
 def substitute_args(body: str, args: str) -> str:
-    """Replace $ARGUMENTS (the whole string) and $1..$9 (whitespace-split
-    positionals; missing → "") for display — no shell quoting."""
-    return _substitute_args(body, args, quote=None)
+    """Fill $ARGUMENTS (whole string) and $1..$9 (whitespace positionals;
+    missing → "") for display — no shell quoting; ${SKILL_DIR} left literal."""
+    return _substitute(body, args, None, None)
 
 
 def shell_substitute_args(command: str, args: str) -> str:
@@ -225,19 +236,7 @@ def shell_substitute_args(command: str, args: str) -> str:
     `grep $1 file`) — this function supplies the quoting. A template that also
     quotes the placeholder (`grep "$1" file`) would double-quote and break the
     moment an arg needs escaping, so do not quote placeholders yourself."""
-    return _substitute_args(command, args, quote=shlex.quote)
-
-
-def resolve_skill_dir(text: str, skill_dir: "Path | None", *, quote: bool) -> str:
-    """Replace ${SKILL_DIR} with the skill's directory. Quoted (shlex) when the
-    text is a command bound for `sh -c` — safe with spaces — but RAW in prose,
-    where the model relays the path to read_file/list_dir and literal quotes
-    would corrupt it. Applied AFTER arg substitution, so a $-token inside the
-    path is never treated as a placeholder."""
-    if skill_dir is None:
-        return text
-    value = shlex.quote(str(skill_dir)) if quote else str(skill_dir)
-    return text.replace("${SKILL_DIR}", value)
+    return _substitute(command, args, None, shlex.quote)
 
 
 def expand_body(
@@ -247,33 +246,31 @@ def expand_body(
     skill_dir: "Path | None" = None,
 ) -> str:
     """Expand a skill body at invocation. `!`cmd`` spans are located on THIS body
-    — the template the human approved at session start — then each command has
-    $args filled and is run via `run`. Prose between commands gets $args but is
-    NOT re-scanned for commands, so an arg containing !`...` lands in prose,
-    inert: args can FILL an approved command but never INTRODUCE a new one. A
-    command that RUNS gets shell-quoted args and a shell-quoted ${SKILL_DIR};
-    `\\!`cmd`` is a literal and run=None leaves commands unrun — both, and all
-    prose, show args and ${SKILL_DIR} raw, since nothing reaches a shell."""
+    — the template the human approved at session start — then each command's
+    placeholders (${SKILL_DIR}, $args) are filled in ONE pass and it is run via
+    `run`. Prose between commands gets the same fill but is NOT re-scanned for
+    commands, so an arg containing !`...` lands in prose, inert: args FILL an
+    approved template but never INTRODUCE a command or a ${SKILL_DIR}. A running
+    command gets shell-quoted args and a shell-quoted ${SKILL_DIR}; `\\!`cmd`` is
+    a literal and run=None leaves commands unrun — both, and all prose, are raw,
+    since nothing reaches a shell."""
     out: list[str] = []
     last = 0
     for match in _CMD.finditer(body):
-        prose = substitute_args(body[last : match.start()], args)  # never a command
-        out.append(resolve_skill_dir(prose, skill_dir, quote=False))
+        # prose (and the template's ${SKILL_DIR}) raw — never a command
+        out.append(_substitute(body[last : match.start()], args, skill_dir, None))
         escaped, command = match.group(1), match.group(2)
         if escaped or run is None:
-            # literal (escaped) or non-executing: nothing reaches a shell, so
-            # show args and the path raw for display fidelity
-            filled = resolve_skill_dir(substitute_args(command, args), skill_dir, quote=False)
-            out.append(f"!`{filled}`")
+            # literal (escaped) or non-executing: nothing reaches a shell → raw
+            out.append(f"!`{_substitute(command, args, skill_dir, None)}`")
         else:
-            filled = resolve_skill_dir(shell_substitute_args(command, args), skill_dir, quote=True)
+            filled = _substitute(command, args, skill_dir, shlex.quote)  # runs → quoted
             try:
-                out.append(run(filled))  # runs → args and ${SKILL_DIR} shell-quoted
+                out.append(run(filled))
             except Exception as error:  # a bad block degrades, never raises
                 out.append(f"[skill command failed: {error}]")
         last = match.end()
-    tail = substitute_args(body[last:], args)
-    out.append(resolve_skill_dir(tail, skill_dir, quote=False))
+    out.append(_substitute(body[last:], args, skill_dir, None))
     return "".join(out)
 
 
@@ -347,9 +344,9 @@ def view_skill_tool(skills: list[Skill]) -> Tool:
         skill, error = _lookup(by_name, name)
         if skill is None:
             return error
-        # verbatim; commands are not run — resolve ${SKILL_DIR} raw (prose), so
-        # a bundled-file path the model reads out is a real, unquoted path
-        return resolve_skill_dir(skill.body, skill.dir, quote=False)
+        # verbatim (commands not run, placeholders left as-is) except ${SKILL_DIR},
+        # resolved raw so a bundled-file path the model reads out is a real path
+        return skill.body.replace("${SKILL_DIR}", str(skill.dir))
 
     return Tool(
         name="view_skill",

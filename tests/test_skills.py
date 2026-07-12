@@ -364,6 +364,31 @@ def test_view_skill_resolves_the_skill_dir_raw(tmp_path):
     assert view_skill_tool(discover(tmp_path)).execute(name="pdf") == f"ref: {tmp_path / 'pdf'}/x"
 
 
+def test_an_arg_cannot_introduce_a_skill_dir_token_in_prose(tmp_path):
+    # args fill approved holes but must NEVER introduce a ${SKILL_DIR} that then
+    # resolves to the skill's path (single-pass invariant)
+    write_dir_skill(tmp_path, "notes", "notes", "d", "Notes: $ARGUMENTS")
+    out = skill_tool(discover(tmp_path)).execute(name="notes", args="${SKILL_DIR}")
+    assert out == "Notes: ${SKILL_DIR}"  # the literal token, not the skill's path
+
+
+def test_an_arg_skill_dir_token_reaches_a_command_literally(tmp_path):
+    write_dir_skill(tmp_path, "g", "g", "d", "!`grep $1 file`")
+    ran = []
+    skill_tool(discover(tmp_path), run=lambda cmd: ran.append(cmd) or "ok").execute(
+        name="g", args="${SKILL_DIR}"
+    )
+    assert ran == ["grep '${SKILL_DIR}' file"]  # quoted literal token, not the dir path
+
+
+def test_a_dollar_token_in_the_skill_dir_path_is_not_expanded_by_args():
+    # a skill dir whose path contains a literal $N must stay inert — only the
+    # template's own $1 is filled (single pass, so the resolved path isn't rescanned)
+    weird = Path("/opt/$1tools/pdf")
+    out = expand_body("!`ls ${SKILL_DIR} $1`", run=lambda c: c, args="HEAD", skill_dir=weird)
+    assert out == f"ls {shlex.quote(str(weird))} HEAD"
+
+
 def test_substitute_args_arguments_and_positionals():
     assert substitute_args("all=$ARGUMENTS first=$1 third=$3", "a b") == "all=a b first=a third="
 

@@ -243,6 +243,40 @@ def test_run_subagent_excludes_spawns_subagents_tools():
     assert "agent" not in names
 
 
+def test_substitution_restores_a_filtered_tool_in_a_safe_build():
+    # the parent's skill tool is fork-capable (filtered out); the sub gets the
+    # non-forking build in its place — filtering alone could only remove it
+    llm = FakeLLM([{"type": "text", "content": "done"}])
+    tools = {"skill": noop_tool(name="skill", spawns_subagents=True)}
+    variant = noop_tool(name="skill")
+    run_subagent("do it", llm, tools, policy=None, substitutions={"skill": variant})
+    names = [d["function"]["name"] for d in llm.turns[0]["tools"]]
+    assert names == ["skill"]
+
+
+def test_substitution_is_ignored_for_a_name_the_caller_did_not_offer():
+    # a fork skill's allowed-tools passes an already-restricted registry;
+    # substitution must not smuggle a tool back past that restriction
+    llm = FakeLLM([{"type": "text", "content": "done"}])
+    tools = {"read_file": noop_tool(name="read_file")}   # "skill" deliberately absent
+    run_subagent(
+        "do it", llm, tools, policy=None,
+        substitutions={"skill": noop_tool(name="skill")},
+    )
+    names = [d["function"]["name"] for d in llm.turns[0]["tools"]]
+    assert names == ["read_file"]
+
+
+def test_substitution_does_not_mutate_the_parent_registry():
+    llm = FakeLLM([{"type": "text", "content": "done"}])
+    parent = {"skill": noop_tool(name="skill", spawns_subagents=True)}
+    run_subagent(
+        "do it", llm, parent, policy=None,
+        substitutions={"skill": noop_tool(name="skill")},
+    )
+    assert parent["skill"].spawns_subagents is True   # parent build untouched
+
+
 def test_run_subagent_exhaustion_becomes_an_error_string():
     llm = FakeLLM(
         [

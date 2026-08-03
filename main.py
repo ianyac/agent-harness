@@ -352,11 +352,9 @@ def main():
             skills = [s for s in skills if not has_cmd_blocks(s.body)]
     section = skills_section(skills)
     context_sections = hook_sections + ([section] if section else [])
-    # subagents never get the skill tool (spawns_subagents keeps it out), so
-    # they must NOT get the skills menu that tells them to "call the skill
-    # tool" — they would only call a tool they don't have. Hook context still
-    # applies; the plan-mode note is added per-turn below.
-    subagent_sections = hook_sections
+    # subagents DO get skills now — a non-forking build handed down via
+    # sub_variants below — so the menu telling them to "call the skill tool"
+    # is honest, and their context sections are simply the main loop's.
 
     try:
         server_commands = load_config(workspace / "mcp.json")
@@ -424,12 +422,16 @@ def main():
     # built once: the callable system prompt is re-evaluated per delegation,
     # so the sub's env facts (date, cwd) never go stale anyway
     def subagent_prompt() -> str:
-        # no skills menu; add the read-only plan note when this delegation
-        # happens inside a plan-mode turn (the sub shares the plan policy but
-        # cannot exit plan mode, so PLAN_MODE_SUBAGENT — not PLAN_MODE)
-        extra = subagent_sections + ([PLAN_MODE_SUBAGENT] if policy.mode == "plan" else [])
+        # add the read-only plan note when this delegation happens inside a
+        # plan-mode turn (the sub shares the plan policy but cannot exit plan
+        # mode, so PLAN_MODE_SUBAGENT — not PLAN_MODE)
+        extra = context_sections + ([PLAN_MODE_SUBAGENT] if policy.mode == "plan" else [])
         return current_subagent_prompt(workspace, extra)
 
+    # subagent-specific builds of parent tools, applied after the recursion
+    # filter. Empty until the skills block fills it; agent_tool closes over the
+    # dict, so a later insert is visible at delegation time.
+    sub_variants: dict = {}
     register_builtin("agent", agent_tool(
         llm,
         tools,
@@ -437,6 +439,7 @@ def main():
         system=subagent_prompt,
         on_tool_call=observe_sub_tool_call,
         compact_threshold=compact_threshold,
+        substitutions=sub_variants,
     ))
     if skills:
         # validate each fork skill's allowed-tools against the tools a subagent
@@ -477,11 +480,16 @@ def main():
                 make_llm(model),
                 sub_tools,
                 policy=policy,
-                system=subagent_prompt,  # no skills menu; plan note when planning
+                system=subagent_prompt,  # plan note when planning
                 on_tool_call=observe_sub_tool_call,
                 compact_threshold=compact_threshold,
+                substitutions=sub_variants,
             )
 
+        # the subagent's build: same skills, same sandboxed run, but NO
+        # fork_run — it refuses fork skills, so it cannot recurse and is safe
+        # to hand down. This is what gives subagents skills at all.
+        sub_variants["skill"] = skill_tool(skills, run)
         register_builtin("skill", skill_tool(skills, run, fork_run))
 
     def approve_plan(plan: str) -> tuple[bool, str]:
@@ -514,6 +522,9 @@ def main():
     # the spawns_subagents field keeps the recursion guard intact through
     # the wrapping
     with_hooks(tools, hookset, on_warning=lambda w: print(f"({w})"), cwd=workspace)
+    # a derived tool is model-driven too, so it gets the same hook wrapping —
+    # unlike the raw slash-command tool captured above, which is a human action
+    with_hooks(sub_variants, hookset, on_warning=lambda w: print(f"({w})"), cwd=workspace)
     session = SessionLog(session_path)
     try:
         messages = session.load()

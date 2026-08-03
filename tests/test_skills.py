@@ -535,10 +535,15 @@ def test_skill_tool_forks_and_returns_the_subagent_answer(tmp_path):
     assert calls == {"task": "research pdfs", "model": "gpt-5.4-mini", "allowed_tools": ["read_file"]}
 
 
-def test_skill_tool_is_read_only_and_bars_nested_fork(tmp_path):
+def test_the_fork_guard_tracks_fork_capability(tmp_path):
+    # the guard exists to bar NESTED fork, so it belongs to the fork-capable
+    # build only; without fork_run the tool refuses fork skills and cannot
+    # recurse, so it is safe to hand to a subagent
     write_skill(tmp_path, "x", "d", "b")
-    t = skill_tool(discover(tmp_path))
-    assert t.read_only is True and t.spawns_subagents is True
+    forking = skill_tool(discover(tmp_path), fork_run=lambda *a: "answer")
+    plain = skill_tool(discover(tmp_path))
+    assert forking.read_only is True and forking.spawns_subagents is True
+    assert plain.read_only is True and plain.spawns_subagents is False
 
 
 def test_a_fork_skill_without_fork_run_reports_an_error(tmp_path):

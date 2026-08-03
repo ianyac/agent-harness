@@ -326,8 +326,12 @@ def skill_tool(
             "required": ["name"],
         },
         execute=execute,
-        read_only=True,          # the call injects text or delegates; sub actions are policy-gated
-        spawns_subagents=True,   # a fork skill delegates — keep it out of subagents (no nested fork)
+        read_only=True,  # the call injects text or delegates; sub actions are policy-gated
+        # the guard tracks the CAPABILITY, not the tool's identity: only a
+        # fork-capable build can delegate. Built without fork_run, a fork skill
+        # is refused above, so this build cannot recurse and is safe inside a
+        # subagent — which is how subagents get skills at all.
+        spawns_subagents=fork_run is not None,
     )
 
 

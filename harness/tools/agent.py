@@ -27,11 +27,22 @@ def run_subagent(
     max_iterations: int = 20,
     compact_threshold: int | None = None,
     keep_recent: int = 8,
+    substitutions: dict[str, Tool] | None = None,
 ) -> str:
-    """Run one subagent to completion and return its final answer. A subagent
-    never finds a delegation tool (the spawns_subagents recursion guard) and
-    never prompts (asker=None → ask-decisions become denials)."""
+    """Run one subagent to completion and return its final answer. Its registry
+    is DERIVED from the parent's: filter out delegating tools (the
+    spawns_subagents recursion guard), then apply `substitutions` — a
+    subagent-specific build of a tool, e.g. a skill tool made without fork_run,
+    which cannot recurse and so is safe to hand down. Filtering alone can only
+    REMOVE, so a tool unsafe in one configuration used to cost subagents the
+    tool entirely. A substitution applies only to a name the caller actually
+    offered, so a restricted registry (a fork skill's allowed-tools) stays
+    authoritative. A subagent never prompts (asker=None → ask-decisions become
+    denials)."""
     inner = {name: t for name, t in tools.items() if not t.spawns_subagents}
+    for name, variant in (substitutions or {}).items():
+        if name in tools:  # never smuggle a tool past the caller's restriction
+            inner[name] = variant
     reply = run_turn(
         [],
         task,
@@ -66,6 +77,7 @@ def agent_tool(
     max_iterations: int = 20,
     compact_threshold: int | None = None,
     keep_recent: int = 8,
+    substitutions: dict[str, Tool] | None = None,
 ) -> Tool:
     """A subagent as a plain registry tool: fresh context in, one answer out.
 
@@ -85,7 +97,7 @@ def agent_tool(
             task, llm, tools,
             policy=policy, system=system, on_tool_call=on_tool_call,
             max_iterations=max_iterations, compact_threshold=compact_threshold,
-            keep_recent=keep_recent,
+            keep_recent=keep_recent, substitutions=substitutions,
         )
 
     tool = Tool(

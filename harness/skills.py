@@ -299,10 +299,17 @@ def skill_tool(
         skill, error = _lookup(by_name, name)
         if skill is None:
             return error
+        if skill.fork and fork_run is None:
+            # refuse BEFORE expanding: expansion RUNS the body's !`cmd`, so
+            # expanding first would fire a refused skill's side effects (and
+            # fire them again on retry). "Do not retry" keeps the model from
+            # looping on a capability this build will never have.
+            return (
+                "Error: this skill runs as a subagent, which is unavailable "
+                "here. Do not retry."
+            )
         processed = expand_body(skill.body, run, args, skill_dir=skill.dir)  # commands from the template only
-        if skill.fork:
-            if fork_run is None:
-                return "Error: this skill runs as a subagent, which is unavailable here."
+        if skill.fork and fork_run is not None:
             return fork_run(processed, skill.model, skill.allowed_tools)
         return processed
 
@@ -338,10 +345,13 @@ def skill_tool(
 def view_skill_tool(skills: list[Skill]) -> Tool:
     """The lesson-15 read-only skill viewer, kept for the ui lane, which keys on
     this tool's name ("view_skill") and its behavior. It returns a skill's body
-    verbatim — no !`cmd` execution, no fork, no args — and is NOT a subagent
-    delegator, so subagents may use it. The executing "skill" tool (skill_tool)
-    is the main-loop path. (A bare `view_skill_tool = skill_tool` alias silently
-    changed the name to "skill" and set spawns_subagents=True, breaking both.)"""
+    verbatim — no !`cmd` execution, no fork, no args.
+
+    Distinct from skill_tool even though a non-forking skill_tool build is also
+    subagent-safe (lesson 23): this one never runs commands and never
+    substitutes args, so it stays the right choice where a body should be READ
+    rather than executed. (A bare `view_skill_tool = skill_tool` alias would
+    also rename the tool to "skill", breaking consumers keyed on the name.)"""
     by_name = {s.name: s for s in skills}
 
     def execute(name: str) -> str:

@@ -94,6 +94,34 @@ fork skill with allowed-tools: read_file
 `tests/helpers.py`: `noop_tool` gains optional `name` / `spawns_subagents`
 (defaults unchanged) so the new tests need no second factory.
 
+## Revisions after code review
+
+The first implementation was reviewed and revised. The review found that
+handing subagents an *executing* skill tool quietly broke two things:
+
+1. **`allowed-tools` stopped being a capability bound.** A fork skill listing
+   `skill` but not `bash` still got shell, because any skill's `` !`cmd` ``
+   runs through the same `run` closure. **Fix:** `substitutions` now also
+   accepts a *callable* given the sub's filtered registry, and `main.py` keeps
+   two hook-wrapped builds — `skill_tool(skills, run)` for a sub that already
+   holds `bash`, `skill_tool(skills)` (no `run`) otherwise. Excluding `bash`
+   once again excludes shell.
+2. **A refused fork skill ran its commands first.** `execute` expanded the body
+   (executing `` !`cmd` ``) *before* checking `skill.fork`, so a sub calling a
+   fork skill fired its side effects, got a bare error, and typically retried —
+   firing them twice. **Fix:** refuse before expanding, and say "Do not retry".
+
+Three honesty fixes followed from the same seam: the sub's menu is now built
+from the registry that sub actually receives (no menu when it lacks `skill`),
+lists only non-fork skills (its build refuses forks), and the `allowed-tools`
+validation runs *after* `skill` is registered so a legitimate
+`allowed-tools: skill` is no longer warned about.
+
+Two invariants are now enforced in `run_subagent` rather than left to
+convention: a substitution must not be a delegating tool, and its key must
+match `tool.name` (the loop dispatches on the key but advertises the name).
+Both raise `ValueError`.
+
 ## Out of scope (deferred)
 
 - The fork `compact_threshold` derived from the parent's context window.

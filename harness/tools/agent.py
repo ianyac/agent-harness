@@ -5,6 +5,13 @@ from harness.loop import ABORTED_PREFIX, run_turn
 from harness.permissions import PermissionPolicy
 from harness.tools.base import Tool
 
+# A subagent-specific tool set: either a fixed {name: Tool} mapping, or a
+# callable given the sub's filtered registry that returns one — so a caller can
+# pick a build from what the sub will actually hold.
+Substitutions = (
+    dict[str, Tool] | Callable[[dict[str, Tool]], dict[str, Tool]] | None
+)
+
 _DESCRIPTION = (
     "Delegate a self-contained task to a subagent: a fresh agent with no "
     "memory of this conversation and the same tools (except this one). It "
@@ -27,7 +34,7 @@ def run_subagent(
     max_iterations: int = 20,
     compact_threshold: int | None = None,
     keep_recent: int = 8,
-    substitutions: dict[str, Tool] | None = None,
+    substitutions: "Substitutions" = None,
 ) -> str:
     """Run one subagent to completion and return its final answer. Its registry
     is DERIVED from the parent's: filter out delegating tools (the
@@ -35,14 +42,37 @@ def run_subagent(
     subagent-specific build of a tool, e.g. a skill tool made without fork_run,
     which cannot recurse and so is safe to hand down. Filtering alone can only
     REMOVE, so a tool unsafe in one configuration used to cost subagents the
-    tool entirely. A substitution applies only to a name the caller actually
+    tool entirely.
+
+    `substitutions` is a {name: Tool} mapping, or a callable given the filtered
+    registry and returning one — the callable form lets a caller choose a build
+    from what the sub will ACTUALLY hold (e.g. only hand over an executing
+    skill tool when the sub also has `bash`, so a restriction stays a
+    restriction). A substitution applies only to a name the caller actually
     offered, so a restricted registry (a fork skill's allowed-tools) stays
     authoritative. A subagent never prompts (asker=None → ask-decisions become
     denials)."""
     inner = {name: t for name, t in tools.items() if not t.spawns_subagents}
-    for name, variant in (substitutions or {}).items():
-        if name in tools:  # never smuggle a tool past the caller's restriction
-            inner[name] = variant
+    chosen = substitutions(inner) if callable(substitutions) else substitutions
+    for name, variant in (chosen or {}).items():
+        if name not in tools:
+            continue  # never smuggle a tool past the caller's restriction
+        # the two invariants the filter above enforces for inherited tools must
+        # hold for substituted ones too — a wiring slip here would otherwise
+        # hand a subagent a delegating tool (unbounded recursion) or advertise
+        # a name the loop cannot dispatch
+        if variant.spawns_subagents:
+            raise ValueError(
+                f"substitution {name!r} is a delegating tool; a subagent must "
+                "never receive one"
+            )
+        if variant.name != name:
+            raise ValueError(
+                f"substitution key {name!r} does not match tool name "
+                f"{variant.name!r}; the sub would be offered a tool the loop "
+                "cannot dispatch"
+            )
+        inner[name] = variant
     reply = run_turn(
         [],
         task,
@@ -77,7 +107,7 @@ def agent_tool(
     max_iterations: int = 20,
     compact_threshold: int | None = None,
     keep_recent: int = 8,
-    substitutions: dict[str, Tool] | None = None,
+    substitutions: "Substitutions" = None,
 ) -> Tool:
     """A subagent as a plain registry tool: fresh context in, one answer out.
 

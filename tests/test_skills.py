@@ -535,6 +535,22 @@ def test_skill_tool_forks_and_returns_the_subagent_answer(tmp_path):
     assert calls == {"task": "research pdfs", "model": "gpt-5.4-mini", "allowed_tools": ["read_file"]}
 
 
+def test_a_refused_fork_skill_never_runs_its_commands(tmp_path):
+    # expansion RUNS the body's !`cmd`, so a build that will refuse a fork
+    # skill must refuse BEFORE expanding — otherwise a subagent fires the
+    # skill's side effects (twice, if the model retries) and gets only an error
+    (tmp_path / "release").mkdir()
+    (tmp_path / "release" / "SKILL.md").write_text(
+        "---\nname: release\ndescription: d\ncontext: fork\n---\ntag: !`git tag rc-$1`"
+    )
+    ran = []
+    tool = skill_tool(discover(tmp_path), run=lambda cmd: ran.append(cmd) or "ok")
+    out = tool.execute(name="release", args="7")
+    assert ran == []                          # the tag command never fired
+    assert "unavailable here" in out
+    assert "Do not retry" in out              # and the model is told not to loop
+
+
 def test_the_fork_guard_tracks_fork_capability(tmp_path):
     # the guard exists to bar NESTED fork, so it belongs to the fork-capable
     # build only; without fork_run the tool refuses fork skills and cannot

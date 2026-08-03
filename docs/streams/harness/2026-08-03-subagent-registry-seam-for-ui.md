@@ -32,28 +32,46 @@ that build cannot recurse — which is exactly why it is considered safe.
 
 ## 2. `run_subagent()` / `agent_tool()` accept `substitutions`
 
-Both gained an optional keyword, `substitutions: dict[str, Tool] | None =
-None`. A subagent's registry is now derived filter-then-substitute
-(`harness/tools/agent.py`):
+Both gained an optional keyword, typed `Substitutions` (exported from
+`harness/tools/agent.py`):
+
+```python
+Substitutions = dict[str, Tool] | Callable[[dict[str, Tool]], dict[str, Tool]] | None
+```
+
+A subagent's registry is now derived filter-then-substitute. The **callable**
+form receives the filtered registry and returns the mapping, so a caller can
+pick a build from what the sub will *actually* hold:
 
 ```python
 inner = {name: t for name, t in tools.items() if not t.spawns_subagents}
-for name, variant in (substitutions or {}).items():
-    if name in tools:  # never smuggle a tool past the caller's restriction
-        inner[name] = variant
+chosen = substitutions(inner) if callable(substitutions) else substitutions
+for name, variant in (chosen or {}).items():
+    if name not in tools:
+        continue                      # never smuggle a tool past a restriction
+    if variant.spawns_subagents: raise ValueError(...)   # no delegating variant
+    if variant.name != name:     raise ValueError(...)   # key must match name
+    inner[name] = variant
 ```
+
+Note the two `ValueError`s: a substitution may not be a delegating tool, and
+its dict key must equal `tool.name` (the loop dispatches on the key but
+advertises the name — a divergence offers a tool the sub can never call).
 
 - **Purely additive.** Omitting it preserves the old prune-only behavior
   exactly — the ui's `agent_tool(...)` call in `ui/server/runner.py` needs no
   change on rebase.
 - **What it buys you:** hand subagents a *different build* of a tool the
-  parent holds. `main.py` now does `sub_variants["skill"] =
-  skill_tool(skills, run)` (no `fork_run`) and passes
-  `substitutions=sub_variants` to both `agent_tool` and the fork path — that
-  is how subagents get fully expanding skills with fork skills refused. If the
-  ui ever registers the executing `skill` tool, mirror this rather than
+  parent holds. `main.py` keeps two hook-wrapped builds and chooses per
+  delegation — `skill_tool(skills, run)` for a sub that already holds `bash`,
+  `skill_tool(skills)` (commands load but do not run) otherwise. That keeps
+  `allowed-tools` a real capability bound: excluding `bash` genuinely excludes
+  shell, instead of a skill's `` !`cmd` `` becoming a side-channel around it.
+  If the ui ever registers the executing `skill` tool, mirror this rather than
   stripping the skills menu from the subagent prompt (`main.py`'s
-  `subagent_sections` workaround is gone for the same reason).
+  `subagent_sections` workaround is gone for the same reason). Note the menu
+  itself is now derived per-sub: no menu when the sub lacks the tool, and only
+  non-fork skills are listed, since a non-forking build refuses them.
 - **Guard:** a substitution applies only to a name present in the caller's
   `tools` dict, so a restricted registry (e.g. a fork skill's
   `allowed-tools`) stays authoritative — nothing can be injected past it.

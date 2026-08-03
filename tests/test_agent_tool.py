@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from harness.loop import run_turn
 from harness.permissions import PermissionPolicy
 from harness.tools.agent import agent_tool, run_subagent
@@ -265,6 +267,63 @@ def test_substitution_is_ignored_for_a_name_the_caller_did_not_offer():
     )
     names = [d["function"]["name"] for d in llm.turns[0]["tools"]]
     assert names == ["read_file"]
+
+
+def test_agent_tool_forwards_substitutions_to_the_subagent():
+    # the model-driven delegation path: deleting the forward in agent_tool used
+    # to leave the whole suite green while stripping skills from every subagent
+    llm = FakeLLM([{"type": "text", "content": "done"}])
+    tools = {"skill": noop_tool(name="skill", spawns_subagents=True)}
+    tool = agent_tool(
+        llm, tools, policy=None,
+        substitutions={"skill": noop_tool(name="skill")},
+    )
+    tool.execute(task="go")
+    names = [d["function"]["name"] for d in llm.turns[0]["tools"]]
+    assert names == ["skill"]
+
+
+def test_substitutions_may_be_a_callable_given_the_filtered_registry():
+    # the callable form lets a caller pick a build from what the sub will
+    # actually hold — main.py only hands over an EXECUTING skill tool to a sub
+    # that already has bash, so allowed-tools stays a real bound
+    seen = []
+
+    def choose(offered):
+        seen.append(sorted(offered))
+        return {"skill": noop_tool(name="skill")} if "bash" in offered else {}
+
+    llm = FakeLLM([{"type": "text", "content": "done"}])
+    tools = {"skill": noop_tool(name="skill", spawns_subagents=True),
+             "read_file": noop_tool(name="read_file")}
+    run_subagent("go", llm, tools, policy=None, substitutions=choose)
+    assert seen == [["read_file"]]              # filtered registry, pre-substitution
+    names = [d["function"]["name"] for d in llm.turns[0]["tools"]]
+    assert names == ["read_file"]               # no bash → no skill tool
+
+
+def test_a_delegating_substitution_is_refused():
+    # the filter exists to keep delegating tools out of subagents; a
+    # substitution must not be a way around it (unbounded recursion)
+    llm = FakeLLM([{"type": "text", "content": "done"}])
+    tools = {"skill": noop_tool(name="skill", spawns_subagents=True)}
+    with pytest.raises(ValueError, match="delegating"):
+        run_subagent(
+            "go", llm, tools, policy=None,
+            substitutions={"skill": noop_tool(name="skill", spawns_subagents=True)},
+        )
+
+
+def test_a_substitution_whose_name_disagrees_with_its_key_is_refused():
+    # definitions() advertises tool.name but the loop dispatches on the dict
+    # key, so a divergence offers the sub a tool it can never call
+    llm = FakeLLM([{"type": "text", "content": "done"}])
+    tools = {"skill": noop_tool(name="skill", spawns_subagents=True)}
+    with pytest.raises(ValueError, match="does not match tool name"):
+        run_subagent(
+            "go", llm, tools, policy=None,
+            substitutions={"skill": noop_tool(name="view_skill")},
+        )
 
 
 def test_substitution_does_not_mutate_the_parent_registry():

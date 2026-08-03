@@ -1,5 +1,12 @@
-from harness.tools.bash import bash_tool
+from harness.tools.bash import bash_tool, run_sandboxed
+from harness.sandbox import NoSandbox
 from harness.truncate import truncate
+
+
+def test_run_sandboxed_reports_exit_and_output():
+    out = run_sandboxed("echo hi", NoSandbox())
+    assert "hi" in out
+    assert "exit code: 0" in out
 
 
 def test_echo_round_trip():

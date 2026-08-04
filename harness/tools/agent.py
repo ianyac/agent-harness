@@ -55,8 +55,10 @@ def run_subagent(
     authoritative. A subagent never prompts (asker=None → ask-decisions become
     denials)."""
     inner = {name: t for name, t in tools.items() if not t.spawns_subagents}
-    # a callable sees a COPY: it is meant to choose a build from what the sub
-    # will hold, not to write into the sub's registry behind the checks below
+    # a callable sees a COPY of the mapping: it is meant to choose a build from
+    # what the sub will hold, not to add entries behind the checks below. (The
+    # Tool objects inside are shared, as they are with the parent registry —
+    # this guards the membership, not the tools themselves.)
     chosen = substitutions(dict(inner)) if callable(substitutions) else substitutions
     # validate the whole map BEFORE applying any of it, so a bad substitution is
     # caught the same way on every delegation — checking inside the per-name

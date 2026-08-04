@@ -8,6 +8,7 @@ the model would read as data).
 """
 
 from main import SHELL_TOOLS, may_run_skill_commands
+from harness.permissions import NO_MUTATION_MODES
 from harness.skills import NOT_RUN, discover, skill_tool
 
 
@@ -27,9 +28,18 @@ def test_a_sub_without_shell_may_not():
     assert not may_run_skill_commands({"read_file": object(), "skill": object()}, "default")
 
 
-def test_a_plan_turn_denies_skill_commands_even_with_shell():
-    # the sub is told commands are denied; don't hand it the build that runs them
-    assert not may_run_skill_commands({"bash": object()}, "plan")
+def test_a_mutation_denying_mode_denies_skill_commands_even_with_shell():
+    # plan and readOnly are the SAME to decide() — both deny every mutating
+    # call — so both must deny skill commands too, or a read-only session's
+    # subagents run shell through a skill body
+    for mode in NO_MUTATION_MODES:
+        assert not may_run_skill_commands({"bash": object()}, mode), mode
+    assert "readOnly" in NO_MUTATION_MODES and "plan" in NO_MUTATION_MODES
+
+
+def test_modes_that_allow_mutation_allow_skill_commands():
+    for mode in ("default", "acceptAll"):
+        assert may_run_skill_commands({"bash": object()}, mode), mode
 
 
 def test_an_unrecognised_shell_fails_closed():
@@ -74,13 +84,18 @@ def test_a_build_only_advertises_what_it_can_do(tmp_path):
     assert "shell" not in plain and "subagent" not in plain
 
 
-def test_a_non_forking_build_does_not_advertise_fork_skills(tmp_path):
+def test_a_build_only_advertises_skills_it_can_serve(tmp_path):
     # the not-found error is the only skill listing some subs ever see, so it
-    # must not name skills this build will only refuse
-    write_skill(tmp_path, "notes", "b")
+    # must match what that build can actually do — a fork skill it would refuse
+    # and a command-bearing skill it cannot run are both absent
+    write_skill(tmp_path, "notes", "prose only")
+    write_skill(tmp_path, "gitstat", "!`git status`")
     write_skill(tmp_path, "deploy", "b", extra="context: fork\n")
     skills = discover(tmp_path)
-    plain = skill_tool(skills).execute(name="nope")
-    assert "notes" in plain and "deploy" not in plain
-    forking = skill_tool(skills, fork_run=lambda *a: "x").execute(name="nope")
-    assert "notes" in forking and "deploy" in forking
+
+    no_shell = skill_tool(skills).execute(name="nope")
+    assert "notes" in no_shell
+    assert "gitstat" not in no_shell and "deploy" not in no_shell
+
+    full = skill_tool(skills, run=lambda c: "x", fork_run=lambda *a: "y").execute(name="nope")
+    assert "notes" in full and "gitstat" in full and "deploy" in full

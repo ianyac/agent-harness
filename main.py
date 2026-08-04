@@ -19,7 +19,7 @@ from harness.hooks import (
 from harness.llm import make_llm
 from harness.loop import run_turn
 from harness.mcp import MCPError, MCPServer, load_config, mcp_tools
-from harness.permissions import STARTUP_MODES, PermissionPolicy
+from harness.permissions import NO_MUTATION_MODES, STARTUP_MODES, PermissionPolicy
 from harness.prompts import (
     Environment,
     PLAN_MODE,
@@ -61,11 +61,12 @@ def may_run_skill_commands(offered: dict, mode: str) -> bool:
     so a subagent only gets an executing skill build if it was already allowed
     shell. Otherwise excluding `bash` from a fork skill's allowed-tools would
     be no restriction at all — the sub could run anything through a skill body.
-    A plan turn denies commands, so it gets the non-executing build too. Fails
-    closed: a shell reached under an unrecognised name yields False."""
+    A mode that denies mutation denies these too (NO_MUTATION_MODES, shared with
+    decide() so the two cannot drift). Fails closed: a shell reached under an
+    unrecognised name yields False."""
     if not any(name in offered for name in SHELL_TOOLS):
         return False
-    return mode != "plan"
+    return mode not in NO_MUTATION_MODES
 
 
 def ask_user(name: str, args: dict) -> str:
@@ -439,23 +440,15 @@ def main():
     policy = PermissionPolicy(cli_args.mode)
 
     def subagent_prompt_for(offered: dict):
-        """The sub's system prompt, built from what THIS sub will actually
-        hold — a factory: called once per delegation, so it reflects late
-        registrations and the current mode. The menu is derived, not assumed: a
-        sub sees it only if it gets the skill tool, lists only non-fork skills
-        (its build refuses forks), and drops command-bearing skills when the
-        sub's build cannot run them. An honest menu is the whole reason the old
-        strip-it workaround existed."""
+        """The sub's system prompt, built from what THIS sub will actually hold.
+        A factory: the returned closure is re-evaluated on every model call in
+        the delegation (run_turn re-reads a callable system prompt each
+        iteration), so it reflects late registrations and the mode at that
+        moment. The menu is derived, not assumed — see sub_usable_skills. An
+        honest menu is the whole reason the old strip-it workaround existed."""
 
         def build() -> str:
-            can_run = sub_substitutions(offered) is sub_variants_exec
-            usable = [
-                s for s in skills
-                # a fork skill is refused by the sub's build; a command-bearing
-                # skill without shell yields only skip notices, so listing it
-                # invites the sub to "gather context" it cannot gather
-                if not s.fork and (can_run or not has_cmd_blocks(s.body))
-            ] if "skill" in offered else []
+            usable = sub_usable_skills(offered) if "skill" in offered else []
             section = skills_section(usable)
             sections = hook_sections + ([section] if section else [])
             # the read-only plan note when this delegation happens inside a
@@ -475,13 +468,31 @@ def main():
     sub_variants_exec: dict = {}   # sub has shell → skills may run their commands
     sub_variants_plain: dict = {}  # sub has none → commands render as skip notices
 
+    def sub_may_run(offered: dict) -> bool:
+        # may_run_skill_commands is the rule (module level, tested); a platform
+        # with no working sandbox refuses every command anyway, so it decides
+        # the same way — one predicate behind both the build and the menu
+        return sandbox_enforces and may_run_skill_commands(offered, policy.mode)
+
+    def sub_usable_skills(offered: dict) -> list:
+        # a fork skill is refused by the sub's build; a command-bearing skill
+        # the sub cannot run yields only NOT_RUN, so listing it would invite
+        # the sub to "gather context" it cannot gather
+        can_run = sub_may_run(offered)
+        return [
+            s for s in skills
+            if not s.fork and (can_run or not has_cmd_blocks(s.body))
+        ]
+
     def sub_substitutions(offered: dict) -> dict:
-        # the rule itself is may_run_skill_commands (module level, tested); a
-        # sub that may not run them still gets a build, one that renders each
-        # command as a visible skip notice rather than silently unrun text
-        if may_run_skill_commands(offered, policy.mode):
-            return sub_variants_exec
-        return sub_variants_plain
+        # a sub that may not run commands still gets a build — one that renders
+        # each command as a visible NOT_RUN rather than silently unrun text —
+        # but only if that build has something to serve. Handing over a tool
+        # whose description points at a menu that was never emitted is worse
+        # than not handing it over at all.
+        if not sub_usable_skills(offered):
+            return {}
+        return sub_variants_exec if sub_may_run(offered) else sub_variants_plain
 
     register_builtin("agent", agent_tool(
         llm,
@@ -536,10 +547,12 @@ def main():
         sub_variants_plain["skill"] = skill_tool(skills)
         register_builtin("skill", skill_tool(skills, run, fork_run))
 
-        # validated AFTER registration so `skill` itself counts as available —
-        # a fork skill listing it in allowed-tools is a legitimate config
+        # what a subagent can actually end up holding: the inheritable tools,
+        # plus `skill` — which never survives the comprehension (the parent's
+        # build is fork-capable, so spawns_subagents excludes it) and instead
+        # arrives by substitution. Listing it in allowed-tools is legitimate.
         sub_capable = {n for n, t in tools.items() if not t.spawns_subagents}
-        sub_capable.add("skill")  # supplied by substitution, not inheritance
+        sub_capable.add("skill")
         for s in skills:
             unknown = [t for t in (s.allowed_tools or []) if t not in sub_capable]
             if unknown:

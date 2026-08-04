@@ -266,7 +266,11 @@ def expand_body(
         out.append(_substitute(body[last : match.start()], args, skill_dir, None))
         escaped, command = match.group(1), match.group(2)
         if escaped:
-            # a literal the skill documents: show it exactly, nothing runs
+            # a literal the skill documents: the escape is consumed and $args /
+            # ${SKILL_DIR} still fill, so what lands is a command-shaped string
+            # that was NOT run. Nothing re-scans it (see the span note above),
+            # so it cannot execute — but a body relying on this is showing the
+            # reader a command, not reporting output.
             out.append(f"!`{_substitute(command, args, skill_dir, None)}`")
         elif run is None:
             # this build may not execute. Say so — emitting the raw template
@@ -315,9 +319,16 @@ def skill_tool(
     only to a subagent that is already allowed shell — otherwise a skill's
     !`cmd` becomes a way around that subagent's tool restrictions."""
     by_name = {s.name: s for s in skills}
-    # what THIS build can actually serve: a build without fork_run refuses fork
-    # skills, so it must not advertise them in the menu or the not-found error
-    usable = sorted(s.name for s in skills if fork_run is not None or not s.fork)
+    # what THIS build can actually serve, and so what it may advertise: a build
+    # without fork_run refuses fork skills, and one without run returns only
+    # NOT_RUN for a command-bearing skill's whole point. The not-found error is
+    # the only listing some agents see, so it must not re-offer either.
+    usable = sorted(
+        s.name
+        for s in skills
+        if (fork_run is not None or not s.fork)
+        and (run is not None or not has_cmd_blocks(s.body))
+    )
 
     def execute(name: str, args: str = "") -> str:
         skill, error = _lookup(by_name, name, usable)
@@ -341,16 +352,18 @@ def skill_tool(
     # instance does not have (a sub's build has no fork, and may have no shell)
     capabilities = []
     if run is not None:
-        capabilities.append("Some skills run shell commands to gather live context")
+        capabilities.append("Some skills run shell commands to gather live context.")
     if fork_run is not None:
-        capabilities.append("some run as a subagent and return its result")
+        capabilities.append("Some skills run as a subagent and return its result.")
     return Tool(
         name="skill",
-        description=(
-            "Load and run one of the available skills (listed in the system "
-            "prompt) by name, optionally passing `args`. Do this before a task "
-            "the skill governs."
-            + (f" {'; '.join(capabilities)}." if capabilities else "")
+        description=" ".join(
+            [
+                "Load and run one of the available skills (listed in the system "
+                "prompt) by name, optionally passing `args`. Do this before a task "
+                "the skill governs."
+            ]
+            + capabilities
         ),
         parameters={
             "type": "object",

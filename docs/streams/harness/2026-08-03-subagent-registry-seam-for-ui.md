@@ -7,6 +7,25 @@ substitute** instead of filter alone (rationale in
 Both changes are backward-compatible — existing ui calls keep working
 unchanged — but one removes an exclusion guarantee the ui could have keyed on.
 
+## 0. `skill_tool(skills)` (no `run`) now marks skipped commands
+
+Behaviour change to a seam the ui lane may already call: a build without `run`
+used to return a body with each `` !`cmd` `` **as written**; it now renders
+`skills.NOT_RUN` — `[skill command not run: this agent cannot run shell
+commands]` — in its place. An escaped `` \!`cmd` `` is still shown verbatim.
+
+Why: bare template text is indistinguishable, to the model reading the body,
+from a command that ran and printed nothing, so a no-shell agent would answer
+from a template as if it were live data.
+
+- **Affects you if** the ui lane builds `skill_tool(skills)` with no `run` and
+  asserts on the body text. `view_skill_tool` is **unchanged** — it still
+  returns the body verbatim (it never expands), so a ui lane using only that
+  tool needs no change.
+- `skill_tool`'s model-facing `description` is now composed per build: it
+  mentions shell only when `run` is wired, and subagent/fork only when
+  `fork_run` is. Anything asserting on that exact string will need updating.
+
 ## 1. `skill_tool(...)`: `spawns_subagents` is now conditional
 
 The signature is unchanged — `skill_tool(skills, run=None, fork_run=None)` —

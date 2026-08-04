@@ -122,6 +122,40 @@ convention: a substitution must not be a delegating tool, and its key must
 match `tool.name` (the loop dispatches on the key but advertises the name).
 Both raise `ValueError`.
 
+### Second review round
+
+The bash-gating fix above was itself reviewed and found to have traded one
+defect for a subtler one, plus fourteen smaller issues. The root problem: the
+no-shell build used `run=None`, and `expand_body` re-emitted each `` !`cmd` ``
+as **bare template text** — indistinguishable to a model from a command that
+ran and printed nothing. A bash-less subagent would read `` !`git status` ``,
+conclude the tree was clean, and return that as its answer.
+
+Fixed at the root rather than at the call site: `run=None` now renders
+`skills.NOT_RUN` (`[skill command not run: …]`) for each command, while an
+escaped `` \!`cmd` `` still shows exactly as written. One mechanism serves both
+"this build may not execute" and the existing no-sandbox notice.
+
+The rest, in three groups:
+
+- **Honesty.** The skill tool's description is now *composed per build*, so a
+  build never advertises fork or shell it lacks; the not-found error lists only
+  skills that build can serve; the subagent menu drops command-bearing skills
+  when the sub cannot run them; the `agent` tool no longer promises "the same
+  tools".
+- **The gate.** Extracted to `main.may_run_skill_commands(offered, mode)` — a
+  named, tested predicate rather than an inline conditional (the inline form
+  survived mutation with all tests green). It also now returns False during a
+  plan turn, so the sub's prompt no longer says "commands are denied" while
+  handing it the one build that could run them. Shell is recognised via
+  `SHELL_TOOLS`; a foreign (MCP) shell is not recognised and fails closed —
+  visibly, since the resulting build marks every skipped command.
+- **The seam.** A callable `substitutions` receives a **copy** of the filtered
+  registry (mutating the original would have written past both guards), and the
+  invariants are validated across the whole map *before* any of it is applied,
+  so a bad substitution fails identically on every delegation instead of only
+  when that name happens to be offered.
+
 ## Out of scope (deferred)
 
 - The fork `compact_threshold` derived from the parent's context window.

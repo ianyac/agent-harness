@@ -2,6 +2,7 @@ import shlex
 from pathlib import Path
 
 from harness.skills import (
+    NOT_RUN,
     Skill,
     cmd_blocks,
     discover,
@@ -125,11 +126,13 @@ def test_skill_tool_with_run_is_still_read_only(tmp_path):
     assert skill_tool(discover(tmp_path), run=_noop).read_only is True
 
 
-def test_skill_tool_with_run_none_is_read_only_and_returns_body_verbatim(tmp_path):
+def test_skill_tool_with_run_none_marks_commands_as_not_run(tmp_path):
+    # a non-executing build must SAY a command was skipped: emitting the raw
+    # template reads to the model exactly like a command that printed nothing
     write_skill(tmp_path, "x", "d", "body with !`echo hi` inside")
     tool = skill_tool(discover(tmp_path))
     assert tool.read_only is True
-    assert tool.execute(name="x") == "body with !`echo hi` inside"
+    assert tool.execute(name="x") == f"body with {NOT_RUN} inside"
 
 
 def test_view_skill_tool_preserves_the_lesson15_contract(tmp_path):

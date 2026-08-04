@@ -48,6 +48,24 @@ KEEP_RECENT = 8  # messages kept verbatim through a compaction
 # fraction of the model's context window that triggers compaction; the rest
 # is headroom for output tokens, mid-turn growth, and estimate bias
 COMPACT_FRACTION = 0.8
+# registry names that mean "this agent may already run shell". Used to decide
+# whether a subagent may also run a skill's !`cmd`; a shell reached under any
+# other name is not recognised, so the decision fails closed.
+SHELL_TOOLS = ("bash",)
+
+
+def may_run_skill_commands(offered: dict, mode: str) -> bool:
+    """Whether a subagent holding `offered` may run a skill's !`cmd`.
+
+    The rule that keeps allowed-tools meaningful: a skill's commands are shell,
+    so a subagent only gets an executing skill build if it was already allowed
+    shell. Otherwise excluding `bash` from a fork skill's allowed-tools would
+    be no restriction at all — the sub could run anything through a skill body.
+    A plan turn denies commands, so it gets the non-executing build too. Fails
+    closed: a shell reached under an unrecognised name yields False."""
+    if not any(name in offered for name in SHELL_TOOLS):
+        return False
+    return mode != "plan"
 
 
 def ask_user(name: str, args: dict) -> str:
@@ -352,9 +370,9 @@ def main():
             skills = [s for s in skills if not has_cmd_blocks(s.body)]
     section = skills_section(skills)
     context_sections = hook_sections + ([section] if section else [])
-    # subagents DO get skills now — a non-forking build handed down via
-    # sub_variants below — so the menu telling them to "call the skill tool"
-    # is honest, and their context sections are simply the main loop's.
+    # NOTE: context_sections is the MAIN LOOP's. A subagent's sections are built
+    # separately by subagent_prompt_for, from what that sub actually holds — a
+    # new section added here does NOT reach subagents unless added there too.
 
     try:
         server_commands = load_config(workspace / "mcp.json")
@@ -419,18 +437,25 @@ def main():
         tools[name] = tool
 
     policy = PermissionPolicy(cli_args.mode)
-    # built once: the callable system prompt is re-evaluated per delegation,
-    # so the sub's env facts (date, cwd) never go stale anyway
+
     def subagent_prompt_for(offered: dict):
         """The sub's system prompt, built from what THIS sub will actually
-        hold. Evaluated per delegation (so late registrations are visible), and
-        the menu is derived, not assumed: a sub only sees the skills menu if it
-        gets the skill tool, and only non-fork skills, since its build refuses
-        forks. An honest menu is the whole reason the old strip-it workaround
-        existed."""
+        hold — a factory: called once per delegation, so it reflects late
+        registrations and the current mode. The menu is derived, not assumed: a
+        sub sees it only if it gets the skill tool, lists only non-fork skills
+        (its build refuses forks), and drops command-bearing skills when the
+        sub's build cannot run them. An honest menu is the whole reason the old
+        strip-it workaround existed."""
 
         def build() -> str:
-            usable = [s for s in skills if not s.fork] if "skill" in offered else []
+            can_run = sub_substitutions(offered) is sub_variants_exec
+            usable = [
+                s for s in skills
+                # a fork skill is refused by the sub's build; a command-bearing
+                # skill without shell yields only skip notices, so listing it
+                # invites the sub to "gather context" it cannot gather
+                if not s.fork and (can_run or not has_cmd_blocks(s.body))
+            ] if "skill" in offered else []
             section = skills_section(usable)
             sections = hook_sections + ([section] if section else [])
             # the read-only plan note when this delegation happens inside a
@@ -443,15 +468,20 @@ def main():
 
     # Subagent-specific builds of parent tools, applied after the recursion
     # filter. Two sets, chosen per delegation by what the sub actually holds: a
-    # sub without `bash` must not gain shell through a skill's !`cmd`, or
+    # sub without shell must not gain it through a skill's !`cmd`, or
     # allowed-tools could no longer bound its capabilities. Both are filled by
     # the skills block below and hook-wrapped with the rest; the closures read
     # them at delegation time.
-    sub_variants_exec: dict = {}   # sub has bash → skills may run their commands
-    sub_variants_plain: dict = {}  # sub has no bash → skills load, commands do not run
+    sub_variants_exec: dict = {}   # sub has shell → skills may run their commands
+    sub_variants_plain: dict = {}  # sub has none → commands render as skip notices
 
     def sub_substitutions(offered: dict) -> dict:
-        return sub_variants_exec if "bash" in offered else sub_variants_plain
+        # the rule itself is may_run_skill_commands (module level, tested); a
+        # sub that may not run them still gets a build, one that renders each
+        # command as a visible skip notice rather than silently unrun text
+        if may_run_skill_commands(offered, policy.mode):
+            return sub_variants_exec
+        return sub_variants_plain
 
     register_builtin("agent", agent_tool(
         llm,
@@ -498,9 +528,10 @@ def main():
 
         # the subagent's builds: same skills, NO fork_run — a fork skill is
         # refused, so neither build can recurse. The executing one goes only to
-        # subs that already hold `bash`; a sub without it gets the plain build,
-        # so a skill's !`cmd` can't become a shell side-channel around
-        # allowed-tools.
+        # subs that already hold shell; a sub without it gets the run-less
+        # build, so a skill's !`cmd` can't become a shell side-channel around
+        # allowed-tools. That build renders each command as skills.NOT_RUN, so
+        # a skipped command is never mistaken for one that printed nothing.
         sub_variants_exec["skill"] = skill_tool(skills, run)
         sub_variants_plain["skill"] = skill_tool(skills)
         register_builtin("skill", skill_tool(skills, run, fork_run))

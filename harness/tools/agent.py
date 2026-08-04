@@ -14,7 +14,9 @@ Substitutions = (
 
 _DESCRIPTION = (
     "Delegate a self-contained task to a subagent: a fresh agent with no "
-    "memory of this conversation and the same tools (except this one). It "
+    "memory of this conversation. It gets your tools except the ones that "
+    "delegate, and some may be narrower versions — it cannot itself "
+    "delegate, so do not send it work that depends on doing so. It "
     "runs unattended — it may use read-only tools and anything the user "
     "already granted, and every other action is denied rather than asked; "
     "it can never prompt the user. It returns only its final answer — use "
@@ -53,14 +55,13 @@ def run_subagent(
     authoritative. A subagent never prompts (asker=None → ask-decisions become
     denials)."""
     inner = {name: t for name, t in tools.items() if not t.spawns_subagents}
-    chosen = substitutions(inner) if callable(substitutions) else substitutions
+    # a callable sees a COPY: it is meant to choose a build from what the sub
+    # will hold, not to write into the sub's registry behind the checks below
+    chosen = substitutions(dict(inner)) if callable(substitutions) else substitutions
+    # validate the whole map BEFORE applying any of it, so a bad substitution is
+    # caught the same way on every delegation — checking inside the per-name
+    # offer test would make it fire only when that name happens to be offered
     for name, variant in (chosen or {}).items():
-        if name not in tools:
-            continue  # never smuggle a tool past the caller's restriction
-        # the two invariants the filter above enforces for inherited tools must
-        # hold for substituted ones too — a wiring slip here would otherwise
-        # hand a subagent a delegating tool (unbounded recursion) or advertise
-        # a name the loop cannot dispatch
         if variant.spawns_subagents:
             raise ValueError(
                 f"substitution {name!r} is a delegating tool; a subagent must "
@@ -72,7 +73,13 @@ def run_subagent(
                 f"{variant.name!r}; the sub would be offered a tool the loop "
                 "cannot dispatch"
             )
-        inner[name] = variant
+    for name, variant in (chosen or {}).items():
+        # never smuggle a tool past the caller's restriction: substitution may
+        # only REPLACE a name the caller offered, never add capability.
+        # (Inherited tools keep the caller's own keys — that registry is the
+        # caller's to construct; only substitutions are validated here.)
+        if name in tools:
+            inner[name] = variant
     reply = run_turn(
         [],
         task,

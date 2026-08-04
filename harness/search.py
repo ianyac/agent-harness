@@ -24,17 +24,25 @@ class BraveSearch:
         self.timeout = timeout
 
     def search(self, query: str, count: int = 5) -> list[dict]:
-        client = self._client
-        if client is None:
-            import httpx
+        if self._client is not None:
+            return self._parse(self._get(self._client, query, count), count)
+        import httpx
 
-            client = httpx.Client(timeout=self.timeout)
+        # closed on the way out, like harness/llm.py — a client per call that
+        # is never closed leaks sockets over a long session
+        with httpx.Client(timeout=self.timeout) as client:
+            return self._parse(self._get(client, query, count), count)
+
+    def _get(self, client, query: str, count: int):
         response = client.get(
             BRAVE_ENDPOINT,
             params={"q": query, "count": count},
             headers={"X-Subscription-Token": self.api_key, "Accept": "application/json"},
         )
         response.raise_for_status()
+        return response
+
+    def _parse(self, response, count: int) -> list[dict]:
         payload = response.json()
         return [
             {

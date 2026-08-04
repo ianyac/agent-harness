@@ -90,6 +90,42 @@ Every failure becomes tool-result text (the loop's law), never an exception:
 - `web_search_tool`: formats results; empty results are stated, not empty
 - provider absent → `default_provider()` is `None`
 
+## Revisions after code review
+
+The first implementation was reviewed and found to have holes in both guards —
+the two things this lesson exists to build.
+
+**The address guard was a denylist, and denylists leak.** It enumerated private
+ranges (`is_private`, `is_loopback`, `is_link_local`, …) and missed
+`100.64.0.0/10` — shared/CGNAT space, where an entire Tailscale tailnet lives.
+`ipaddress` reports `is_private == False` for it, so a tailnet host read as
+public. Replaced by an **allowlist**: an address is reachable only if
+`is_global and not is_multicast`. Enumerating what is forbidden fails silently
+when the list is incomplete; requiring what is permitted fails closed. This is
+the lesson's real point and it was got wrong the first time.
+
+**The untrusted marker covered one path out of three.** A non-2xx body was
+returned unmarked and prefixed `Error:`, so answering `404` was enough to get
+attacker text into the context looking like harness-authored diagnostics; a page
+echoing the literal footer could close the region early and append text that
+appeared to sit outside it; and `web_search` — third-party titles and snippets —
+was never marked at all. All three now route through `mark_untrusted`, which
+defangs forged copies of the markers first.
+
+Also fixed: a lazy `<script>.*?</script>` regex that went quadratic on an
+unclosed tag (an attacker-controlled stall of the single-threaded loop —
+replaced by a linear scanner, which also handles `</script >`); no bound on
+response size (`Content-Length` refused above `MAX_BODY_CHARS`, body clipped
+before conversion); a `Location`-less 3xx misreported as a redirect-cap
+violation; the cap message naming the last hop instead of the URL asked for;
+`check_url` missing the `ValueError`/`UnicodeError` families from `parsed.port`
+and IDNA encoding; unvalidated model-supplied `count`; unbounded `web_search`
+output; and an httpx client created per call and never closed, in both modules.
+
+Two items were left as documented gaps rather than half-built, following the
+`LinuxSandbox` precedent: DNS rebinding between check and connect, and
+`getaddrinfo` being a blocking call with no timeout.
+
 ## Out of scope (deferred)
 
 - Any exfiltration control (per-call consent, domain allowlist, egress log).

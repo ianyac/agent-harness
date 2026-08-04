@@ -8,10 +8,14 @@ than it can through `curl`. Whatever confines this tool has to be built here.
 
 Two guards live in this module:
 
-- `check_url` refuses anything that resolves into private address space, so a
-  page fetch cannot become a probe of the machine's own network.
-- fetched text is wrapped in an untrusted marker: it is the first tool result
-  authored by a third party rather than by the user or a command they approved.
+- `check_url` refuses anything that does not resolve to a **globally routable**
+  address. It is an allowlist ("must be public"), not a denylist of private
+  ranges: the first version enumerated ranges and missed 100.64.0.0/10, so a
+  Tailscale host read as public. Enumerating what is forbidden fails silently
+  when the list is incomplete; requiring what is permitted fails closed.
+- fetched text is wrapped in an untrusted marker, with any forged copy of that
+  marker defanged first. It is the first tool result authored by a third party
+  rather than by the user or a command they approved.
 
 One risk is deliberately NOT guarded: a URL is an outbound channel, so a fetch
 can carry data out (`https://evil.com/?d=…`). These tools are `read_only=True`,
@@ -33,6 +37,12 @@ from harness.truncate import truncate
 MAX_REDIRECTS = 5
 DEFAULT_TIMEOUT = 15
 DEFAULT_CHAR_LIMIT = 10000
+SEARCH_CHAR_LIMIT = 4000
+MAX_RESULTS = 25
+# hard ceiling on how much fetched text we process. The download itself is
+# bounded only when the server sends Content-Length (see fetch); this cap is
+# what keeps a huge or lying body from reaching the converter and the context.
+MAX_BODY_CHARS = 2_000_000
 USER_AGENT = "agent-harness/0.1 (+teaching project)"
 
 # The model cannot tell a fetched page from any other tool result, and a page
@@ -44,20 +54,53 @@ UNTRUSTED_HEADER = (
 )
 UNTRUSTED_FOOTER = "[end web content]"
 
-_SCRIPT_OR_STYLE = re.compile(r"<(script|style)\b[^>]*>.*?</\1>", re.I | re.S)
 _TAG = re.compile(r"<[^>]+>")
 _BLANK_RUN = re.compile(r"\n{3,}")
+
+
+def _strip_elements(source: str, tags=("script", "style")) -> str:
+    """Remove whole elements (open tag, contents, close tag).
+
+    Scanned linearly with str.find rather than a `<script>.*?</script>` regex:
+    that pattern is quadratic when the closing tag is missing, which an
+    attacker-controlled page can trigger to stall the single-threaded agent
+    loop. Also tolerates `</script >`, which HTML permits and an exact-match
+    regex misses — leaving the whole script body visible to the model.
+    """
+    out = []
+    lowered = source.lower()
+    i = 0
+    while i < len(source):
+        starts = [(lowered.find(f"<{t}", i), t) for t in tags]
+        starts = [(pos, t) for pos, t in starts if pos != -1]
+        if not starts:
+            out.append(source[i:])
+            break
+        start, tag = min(starts)
+        # `<scriptable` is not `<script`: the next char must end the tag name
+        after = start + 1 + len(tag)
+        if after < len(source) and (source[after].isalnum() or source[after] == "-"):
+            out.append(source[i : after])
+            i = after
+            continue
+        out.append(source[i:start])
+        close = lowered.find(f"</{tag}", start)
+        if close == -1:
+            break  # unclosed: drop the rest rather than scan it repeatedly
+        gt = lowered.find(">", close)
+        i = len(source) if gt == -1 else gt + 1
+    return "".join(out)
 
 
 def html_to_text(source: str) -> str:
     """Flatten HTML to readable text.
 
-    Deliberately crude — a regex pass, not a parser — because the goal is a
-    model-readable approximation, not fidelity. It drops `<script>`/`<style>`
-    WITH their contents (otherwise the model reads minified JS as prose),
-    strips remaining tags, unescapes entities, and collapses blank runs.
+    Deliberately crude — not a parser — because the goal is a model-readable
+    approximation, not fidelity. It drops `<script>`/`<style>` WITH their
+    contents (otherwise the model reads minified JS as prose), strips remaining
+    tags, unescapes entities, and collapses blank runs.
     """
-    text = _SCRIPT_OR_STYLE.sub(" ", source)
+    text = _strip_elements(source)
     text = _TAG.sub(" ", text)
     text = html_module.unescape(text)
     # collapse spaces/tabs but keep newlines, so paragraph structure survives
@@ -66,49 +109,75 @@ def html_to_text(source: str) -> str:
     return _BLANK_RUN.sub("\n\n", text).strip()
 
 
-def _is_private(address: str) -> bool:
-    ip = ipaddress.ip_address(address)
-    # link_local covers cloud metadata (169.254.169.254); reserved and
-    # unspecified close the remaining non-public ranges
-    return (
-        ip.is_private
-        or ip.is_loopback
-        or ip.is_link_local
-        or ip.is_multicast
-        or ip.is_reserved
-        or ip.is_unspecified
+def defang(text: str) -> str:
+    """Neutralise forged copies of our own markers inside third-party text.
+
+    Without this a page can emit the footer, then append text that appears to
+    sit OUTSIDE the untrusted region — the marker would fence only the content
+    that chose to stay inside it.
+    """
+    return text.replace(UNTRUSTED_FOOTER, "[end web content (defanged)]").replace(
+        "[web content from", "[web content from (defanged)"
     )
 
 
+def mark_untrusted(url: str, body: str) -> str:
+    """Wrap third-party text in the untrusted marker. Every path that returns
+    fetched or searched text goes through here — including error paths, since
+    a 404 body is just as attacker-controlled as a 200 one."""
+    return f"{UNTRUSTED_HEADER.format(url=url)}\n{defang(body)}\n{UNTRUSTED_FOOTER}"
+
+
+def _reachable(address: str) -> bool:
+    """True only for globally routable unicast addresses.
+
+    `is_global` is the allowlist: it is False for loopback, private, link-local
+    (so cloud metadata at 169.254.169.254), unspecified, reserved, AND
+    100.64.0.0/10 shared/CGNAT space that a hand-written range list misses.
+    Multicast is excluded separately because some multicast ranges report
+    is_global True.
+    """
+    ip = ipaddress.ip_address(address)
+    return ip.is_global and not ip.is_multicast
+
+
 def check_url(url: str) -> None:
-    """Raise ValueError unless `url` is http(s) and resolves to a public address.
+    """Raise ValueError unless `url` is http(s) and every address it resolves
+    to is globally routable.
 
     The check is on the RESOLVED address, not the hostname: a public name can
-    resolve to 127.0.0.1, so a string test for "localhost" is bypassable.
+    resolve to 127.0.0.1, so a string test for "localhost" is bypassable. Every
+    address is checked, not just the first — a name can publish both a public
+    and a private record.
 
-    Known gap (not fixed): DNS can change between this check and the connect
-    that follows — a rebinding attack. Pinning the resolved IP needs a custom
-    httpx transport; documented rather than half-built, like the Linux sandbox.
+    Known gaps, documented rather than half-built (the LinuxSandbox precedent):
+    DNS can change between this check and the connect that follows (rebinding);
+    pinning the resolved IP needs a custom httpx transport. And getaddrinfo is
+    a blocking call with no timeout, so a slow resolver stalls the agent loop.
     """
-    parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https"):
+    try:
+        parsed = urlparse(url)
+        scheme, host, port = parsed.scheme, parsed.hostname, parsed.port
+    except ValueError as error:  # malformed port, bad IPv6 literal, …
+        raise ValueError(f"refused {url!r}: malformed URL ({error})") from None
+    if scheme not in ("http", "https"):
         raise ValueError(
             f"refused {url!r}: only http and https are fetchable, not "
-            f"{parsed.scheme or 'a missing scheme'!r}"
+            f"{scheme or 'a missing scheme'!r}"
         )
-    host = parsed.hostname
     if not host:
         raise ValueError(f"refused {url!r}: no host in the URL")
     try:
-        resolved = socket.getaddrinfo(host, parsed.port or 0, proto=socket.IPPROTO_TCP)
-    except OSError as error:
+        resolved = socket.getaddrinfo(host, port or 0, proto=socket.IPPROTO_TCP)
+    except (OSError, UnicodeError, ValueError) as error:
+        # UnicodeError: idna encoding of an absurd hostname; OSError: DNS
         raise ValueError(f"refused {url!r}: cannot resolve {host!r} ({error})") from None
     for info in resolved:
-        address = info[4][0]
-        if _is_private(address):
+        address = str(info[4][0])
+        if not _reachable(address):
             raise ValueError(
-                f"refused {url!r}: {host!r} resolves to {address}, a private "
-                "address. Fetching may not reach this machine's own network."
+                f"refused {url!r}: {host!r} resolves to {address}, which is not a "
+                "public address. Fetching may not reach this machine's network."
             )
 
 
@@ -118,18 +187,32 @@ def fetch(url: str, client, *, max_redirects: int = MAX_REDIRECTS):
     Auto-following would defeat check_url: a public URL may redirect to
     http://127.0.0.1. Returns (final_url, status_code, text, content_type).
     """
+    original = url  # keep for error messages; `url` is rebound per hop
     for _ in range(max_redirects + 1):
         check_url(url)  # every hop, not just the first
         response = client.get(url, follow_redirects=False)
-        if response.status_code in (301, 302, 303, 307, 308):
-            location = response.headers.get("location")
+        status = response.status_code
+        headers = getattr(response, "headers", {}) or {}
+        if status in (301, 302, 303, 307, 308):
+            location = headers.get("location")
             if not location:
-                break
-            url = urljoin(url, location)  # relative redirects are legal
+                # a redirect that says nowhere: report what actually happened
+                raise ValueError(
+                    f"refused {url!r}: HTTP {status} redirect with no Location header"
+                )
+            url = urljoin(url, location)  # relative and protocol-relative both resolve
             continue
-        content_type = response.headers.get("content-type", "")
-        return url, response.status_code, response.text, content_type
-    raise ValueError(f"refused: more than {max_redirects} redirects starting at {url!r}")
+        declared = headers.get("content-length")
+        if declared and declared.isdigit() and int(declared) > MAX_BODY_CHARS:
+            raise ValueError(
+                f"refused {url!r}: response declares {declared} bytes, over the "
+                f"{MAX_BODY_CHARS} limit"
+            )
+        text = response.text or ""
+        return url, status, text[:MAX_BODY_CHARS], headers.get("content-type", "")
+    raise ValueError(
+        f"refused: more than {max_redirects} redirects starting at {original!r}"
+    )
 
 
 def web_fetch_tool(client=None, char_limit: int = DEFAULT_CHAR_LIMIT) -> Tool:
@@ -137,24 +220,32 @@ def web_fetch_tool(client=None, char_limit: int = DEFAULT_CHAR_LIMIT) -> Tool:
     is still an outbound channel (see the module docstring)."""
 
     def execute(url: str) -> str:
-        active = client
+        active, owned = client, False
         if active is None:
             import httpx
 
             active = httpx.Client(
                 timeout=DEFAULT_TIMEOUT, headers={"User-Agent": USER_AGENT}
             )
+            owned = True  # we made it, so we close it
         try:
             final_url, status, text, content_type = fetch(url, active)
         except ValueError as error:  # our own refusals, already explained
             return f"Error: {error}"
         except Exception as error:  # noqa: BLE001 — network failures are results
             return f"Error fetching {url!r}: {type(error).__name__}: {error}"
+        finally:
+            if owned:
+                active.close()
         body = html_to_text(text) if "html" in content_type.lower() else text
         if not 200 <= status < 300:
-            return f"Error: {final_url} returned HTTP {status}\n{truncate(body, 1000)}"
-        marker = UNTRUSTED_HEADER.format(url=final_url)
-        return f"{marker}\n{truncate(body, char_limit)}\n{UNTRUSTED_FOOTER}"
+            # a 4xx/5xx body is just as attacker-controlled as a 200 one, so it
+            # is marked too — the status line goes outside the marker
+            return (
+                f"Error: {final_url} returned HTTP {status}\n"
+                + mark_untrusted(final_url, truncate(body, 1000))
+            )
+        return mark_untrusted(final_url, truncate(body, char_limit))
 
     return Tool(
         name="web_fetch",
@@ -192,17 +283,24 @@ def web_search_tool(provider: SearchProvider) -> Tool:
 
     def execute(query: str, count: int = 5) -> str:
         try:
-            results = provider.search(query, count)
+            wanted = int(count)
+        except (TypeError, ValueError):
+            wanted = 5
+        wanted = max(1, min(wanted, MAX_RESULTS))  # model-supplied: clamp, don't trust
+        try:
+            results = provider.search(query, wanted)
         except Exception as error:  # noqa: BLE001 — a dead backend is a result
             return f"Error searching for {query!r}: {type(error).__name__}: {error}"
         if not results:
-            return f"No results for {query!r}."  # say it; an empty string reads as a bug
+            return f"No results for {query!r}."  # say it; "" reads as a broken tool
         lines = []
-        for r in results:
+        for r in results[:wanted]:
             lines.append(f"- {r.get('title', '(untitled)')} — {r.get('url', '')}")
             if r.get("snippet"):
                 lines.append(f"  {r['snippet']}")
-        return "\n".join(lines)
+        # titles and snippets are third-party text like any fetched page, and
+        # bounded like every other tool result in the harness
+        return mark_untrusted(f"search: {query}", truncate("\n".join(lines), SEARCH_CHAR_LIMIT))
 
     return Tool(
         name="web_search",
@@ -217,7 +315,7 @@ def web_search_tool(provider: SearchProvider) -> Tool:
                 "query": {"type": "string", "description": "The search query."},
                 "count": {
                     "type": "integer",
-                    "description": "How many results to return (default 5).",
+                    "description": f"How many results (1-{MAX_RESULTS}, default 5).",
                 },
             },
             "required": ["query"],

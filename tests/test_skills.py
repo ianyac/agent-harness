@@ -2,6 +2,7 @@ import shlex
 from pathlib import Path
 
 from harness.skills import (
+    NOT_RUN,
     Skill,
     cmd_blocks,
     discover,
@@ -125,11 +126,13 @@ def test_skill_tool_with_run_is_still_read_only(tmp_path):
     assert skill_tool(discover(tmp_path), run=_noop).read_only is True
 
 
-def test_skill_tool_with_run_none_is_read_only_and_returns_body_verbatim(tmp_path):
+def test_skill_tool_with_run_none_marks_commands_as_not_run(tmp_path):
+    # a non-executing build must SAY a command was skipped: emitting the raw
+    # template reads to the model exactly like a command that printed nothing
     write_skill(tmp_path, "x", "d", "body with !`echo hi` inside")
     tool = skill_tool(discover(tmp_path))
     assert tool.read_only is True
-    assert tool.execute(name="x") == "body with !`echo hi` inside"
+    assert tool.execute(name="x") == f"body with {NOT_RUN} inside"
 
 
 def test_view_skill_tool_preserves_the_lesson15_contract(tmp_path):
@@ -535,10 +538,31 @@ def test_skill_tool_forks_and_returns_the_subagent_answer(tmp_path):
     assert calls == {"task": "research pdfs", "model": "gpt-5.4-mini", "allowed_tools": ["read_file"]}
 
 
-def test_skill_tool_is_read_only_and_bars_nested_fork(tmp_path):
+def test_a_refused_fork_skill_never_runs_its_commands(tmp_path):
+    # expansion RUNS the body's !`cmd`, so a build that will refuse a fork
+    # skill must refuse BEFORE expanding — otherwise a subagent fires the
+    # skill's side effects (twice, if the model retries) and gets only an error
+    (tmp_path / "release").mkdir()
+    (tmp_path / "release" / "SKILL.md").write_text(
+        "---\nname: release\ndescription: d\ncontext: fork\n---\ntag: !`git tag rc-$1`"
+    )
+    ran = []
+    tool = skill_tool(discover(tmp_path), run=lambda cmd: ran.append(cmd) or "ok")
+    out = tool.execute(name="release", args="7")
+    assert ran == []                          # the tag command never fired
+    assert "unavailable here" in out
+    assert "Do not retry" in out              # and the model is told not to loop
+
+
+def test_the_fork_guard_tracks_fork_capability(tmp_path):
+    # the guard exists to bar NESTED fork, so it belongs to the fork-capable
+    # build only; without fork_run the tool refuses fork skills and cannot
+    # recurse, so it is safe to hand to a subagent
     write_skill(tmp_path, "x", "d", "b")
-    t = skill_tool(discover(tmp_path))
-    assert t.read_only is True and t.spawns_subagents is True
+    forking = skill_tool(discover(tmp_path), fork_run=lambda *a: "answer")
+    plain = skill_tool(discover(tmp_path))
+    assert forking.read_only is True and forking.spawns_subagents is True
+    assert plain.read_only is True and plain.spawns_subagents is False
 
 
 def test_a_fork_skill_without_fork_run_reports_an_error(tmp_path):

@@ -192,6 +192,11 @@ def has_cmd_blocks(body: str) -> bool:
 # order) re-opens one of those two holes.
 _SUBST = re.compile(r"\$\{SKILL_DIR\}|\$(ARGUMENTS|[1-9])")
 
+# what a non-executing build renders in place of a command's output. Never the
+# raw template: an unrun command that looks like one that printed nothing is
+# read as data by the model consuming the body.
+NOT_RUN = "[skill command not run: this agent cannot run shell commands]"
+
 
 def _substitute(
     text: str, args: str, skill_dir: "Path | None", quote: Callable[[str], str] | None
@@ -252,17 +257,26 @@ def expand_body(
     commands, so an arg containing !`...` lands in prose, inert: args FILL an
     approved template but never INTRODUCE a command or a ${SKILL_DIR}. A running
     command gets shell-quoted args and a shell-quoted ${SKILL_DIR}; `\\!`cmd`` is
-    a literal and run=None leaves commands unrun — both, and all prose, are raw,
-    since nothing reaches a shell."""
+    a documented literal (shown as written); run=None means this build may not
+    execute, so each command renders as NOT_RUN rather than as its own text."""
     out: list[str] = []
     last = 0
     for match in _CMD.finditer(body):
         # prose (and the template's ${SKILL_DIR}) raw — never a command
         out.append(_substitute(body[last : match.start()], args, skill_dir, None))
         escaped, command = match.group(1), match.group(2)
-        if escaped or run is None:
-            # literal (escaped) or non-executing: nothing reaches a shell → raw
+        if escaped:
+            # a literal the skill documents: the escape is consumed and $args /
+            # ${SKILL_DIR} still fill, so what lands is a command-shaped string
+            # that was NOT run. Nothing re-scans it (see the span note above),
+            # so it cannot execute — but a body relying on this is showing the
+            # reader a command, not reporting output.
             out.append(f"!`{_substitute(command, args, skill_dir, None)}`")
+        elif run is None:
+            # this build may not execute. Say so — emitting the raw template
+            # would be indistinguishable from a command that ran and printed
+            # nothing, and a model reads that as data.
+            out.append(NOT_RUN)
         else:
             filled = _substitute(command, args, skill_dir, shlex.quote)  # runs → quoted
             try:
@@ -274,13 +288,15 @@ def expand_body(
     return "".join(out)
 
 
-def _lookup(by_name: dict, name: str) -> tuple[Skill | None, str]:
+def _lookup(by_name: dict, name: str, usable: list[str] | None = None) -> tuple[Skill | None, str]:
     """Resolve a skill by name, or (None, error) with an identical not-found
     message — shared by the skill and view_skill tools so the two seams never
-    drift. Callers branch on `skill is None` (which narrows the type)."""
+    drift. `usable` narrows what the error advertises to what THIS build can
+    actually serve (a non-forking build must not list fork skills it will only
+    refuse). Callers branch on `skill is None` (which narrows the type)."""
     skill = by_name.get(name)
     if skill is None:
-        available = ", ".join(sorted(by_name)) or "none"
+        available = ", ".join(sorted(by_name if usable is None else usable)) or "none"
         return None, f"Error: no skill named {name!r}. Available skills: {available}"
     return skill, ""
 
@@ -292,27 +308,62 @@ def skill_tool(
 ) -> Tool:
     """The skill tool. `execute(name, args)` substitutes $ARGUMENTS/$1..$9, then
     runs the body's !`cmd` (if `run` is wired). A `context: fork` skill runs as a
-    subagent via `fork_run` (returning its answer); other skills inject the text."""
+    subagent via `fork_run` (returning its answer); other skills inject the text.
+
+    The build determines what this tool can do, and the model-facing description
+    below is composed to match — a build cannot advertise a capability it lacks.
+
+    Handing a build to a subagent (via run_subagent's `substitutions`) requires
+    `fork_run=None`, which the spawns_subagents flag enforces. `run`, however, is
+    the caller's judgement: a run-wired build executes skill commands, so give it
+    only to a subagent that is already allowed shell — otherwise a skill's
+    !`cmd` becomes a way around that subagent's tool restrictions."""
     by_name = {s.name: s for s in skills}
+    # what THIS build can actually serve, and so what it may advertise: a build
+    # without fork_run refuses fork skills, and one without run returns only
+    # NOT_RUN for a command-bearing skill's whole point. The not-found error is
+    # the only listing some agents see, so it must not re-offer either.
+    usable = sorted(
+        s.name
+        for s in skills
+        if (fork_run is not None or not s.fork)
+        and (run is not None or not has_cmd_blocks(s.body))
+    )
 
     def execute(name: str, args: str = "") -> str:
-        skill, error = _lookup(by_name, name)
+        skill, error = _lookup(by_name, name, usable)
         if skill is None:
             return error
+        if skill.fork and fork_run is None:
+            # refuse BEFORE expanding: expansion RUNS the body's !`cmd`, so
+            # expanding first would fire a refused skill's side effects (and
+            # fire them again on retry). "Do not retry" keeps the model from
+            # looping on a capability this build will never have.
+            return (
+                "Error: this skill runs as a subagent, which is unavailable "
+                "here. Do not retry."
+            )
         processed = expand_body(skill.body, run, args, skill_dir=skill.dir)  # commands from the template only
-        if skill.fork:
-            if fork_run is None:
-                return "Error: this skill runs as a subagent, which is unavailable here."
+        if skill.fork and fork_run is not None:
             return fork_run(processed, skill.model, skill.allowed_tools)
         return processed
 
+    # composed per build, so the model is never promised a capability this
+    # instance does not have (a sub's build has no fork, and may have no shell)
+    capabilities = []
+    if run is not None:
+        capabilities.append("Some skills run shell commands to gather live context.")
+    if fork_run is not None:
+        capabilities.append("Some skills run as a subagent and return its result.")
     return Tool(
         name="skill",
-        description=(
-            "Load and run one of the available skills (listed in the system "
-            "prompt) by name, optionally passing `args`. Do this before a task "
-            "the skill governs. Some skills run shell commands to gather live "
-            "context; some run as a subagent and return its result."
+        description=" ".join(
+            [
+                "Load and run one of the available skills (listed in the system "
+                "prompt) by name, optionally passing `args`. Do this before a task "
+                "the skill governs."
+            ]
+            + capabilities
         ),
         parameters={
             "type": "object",
@@ -326,18 +377,25 @@ def skill_tool(
             "required": ["name"],
         },
         execute=execute,
-        read_only=True,          # the call injects text or delegates; sub actions are policy-gated
-        spawns_subagents=True,   # a fork skill delegates — keep it out of subagents (no nested fork)
+        read_only=True,  # the call injects text or delegates; sub actions are policy-gated
+        # the guard tracks the CAPABILITY, not the tool's identity: only a
+        # fork-capable build can delegate. Built without fork_run, a fork skill
+        # is refused above, so this build cannot recurse and is safe inside a
+        # subagent — which is how subagents get skills at all.
+        spawns_subagents=fork_run is not None,
     )
 
 
 def view_skill_tool(skills: list[Skill]) -> Tool:
     """The lesson-15 read-only skill viewer, kept for the ui lane, which keys on
     this tool's name ("view_skill") and its behavior. It returns a skill's body
-    verbatim — no !`cmd` execution, no fork, no args — and is NOT a subagent
-    delegator, so subagents may use it. The executing "skill" tool (skill_tool)
-    is the main-loop path. (A bare `view_skill_tool = skill_tool` alias silently
-    changed the name to "skill" and set spawns_subagents=True, breaking both.)"""
+    verbatim — no !`cmd` execution, no fork, no args.
+
+    Distinct from skill_tool even though a non-forking skill_tool build is also
+    subagent-safe (lesson 23): this one never runs commands and never
+    substitutes args, so it stays the right choice where a body should be READ
+    rather than executed. (A bare `view_skill_tool = skill_tool` alias would
+    also rename the tool to "skill", breaking consumers keyed on the name.)"""
     by_name = {s.name: s for s in skills}
 
     def execute(name: str) -> str:

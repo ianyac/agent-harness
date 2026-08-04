@@ -10,6 +10,10 @@ STARTUP_MODES = ("default", "acceptAll", "readOnly")
 # Consumers treat MODES as the selectable-mode list, so advertising a
 # non-constructible "plan" here would 500 a session that tried to start in it.
 MODES = STARTUP_MODES
+# modes in which NO mutating action may run, whatever the allowlist says. Shared
+# so anything deriving a capability from the mode (e.g. whether a subagent may
+# run a skill's commands) cannot drift from what decide() actually enforces.
+NO_MUTATION_MODES = ("readOnly", "plan")
 
 
 class PermissionPolicy:
@@ -35,7 +39,7 @@ class PermissionPolicy:
         if tool.read_only:
             return "allow"  # observing never needs a gate, in any mode
         match self.mode:
-            case "readOnly" | "plan":
+            case mode if mode in NO_MUTATION_MODES:
                 # these modes deny ALL mutation outright — even a tool the user
                 # "always"-allowed in an earlier turn. The allowlist must not
                 # tunnel a mutating call through a read-only / plan turn.

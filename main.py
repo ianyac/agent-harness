@@ -19,7 +19,7 @@ from harness.hooks import (
 from harness.llm import make_llm
 from harness.loop import run_turn
 from harness.mcp import MCPError, MCPServer, load_config, mcp_tools
-from harness.permissions import STARTUP_MODES, PermissionPolicy
+from harness.permissions import NO_MUTATION_MODES, STARTUP_MODES, PermissionPolicy
 from harness.prompts import (
     Environment,
     PLAN_MODE,
@@ -48,6 +48,25 @@ KEEP_RECENT = 8  # messages kept verbatim through a compaction
 # fraction of the model's context window that triggers compaction; the rest
 # is headroom for output tokens, mid-turn growth, and estimate bias
 COMPACT_FRACTION = 0.8
+# registry names that mean "this agent may already run shell". Used to decide
+# whether a subagent may also run a skill's !`cmd`; a shell reached under any
+# other name is not recognised, so the decision fails closed.
+SHELL_TOOLS = ("bash",)
+
+
+def may_run_skill_commands(offered: dict, mode: str) -> bool:
+    """Whether a subagent holding `offered` may run a skill's !`cmd`.
+
+    The rule that keeps allowed-tools meaningful: a skill's commands are shell,
+    so a subagent only gets an executing skill build if it was already allowed
+    shell. Otherwise excluding `bash` from a fork skill's allowed-tools would
+    be no restriction at all — the sub could run anything through a skill body.
+    A mode that denies mutation denies these too (NO_MUTATION_MODES, shared with
+    decide() so the two cannot drift). Fails closed: a shell reached under an
+    unrecognised name yields False."""
+    if not any(name in offered for name in SHELL_TOOLS):
+        return False
+    return mode not in NO_MUTATION_MODES
 
 
 def ask_user(name: str, args: dict) -> str:
@@ -352,11 +371,9 @@ def main():
             skills = [s for s in skills if not has_cmd_blocks(s.body)]
     section = skills_section(skills)
     context_sections = hook_sections + ([section] if section else [])
-    # subagents never get the skill tool (spawns_subagents keeps it out), so
-    # they must NOT get the skills menu that tells them to "call the skill
-    # tool" — they would only call a tool they don't have. Hook context still
-    # applies; the plan-mode note is added per-turn below.
-    subagent_sections = hook_sections
+    # NOTE: context_sections is the MAIN LOOP's. A subagent's sections are built
+    # separately by subagent_prompt_for, from what that sub actually holds — a
+    # new section added here does NOT reach subagents unless added there too.
 
     try:
         server_commands = load_config(workspace / "mcp.json")
@@ -421,37 +438,72 @@ def main():
         tools[name] = tool
 
     policy = PermissionPolicy(cli_args.mode)
-    # built once: the callable system prompt is re-evaluated per delegation,
-    # so the sub's env facts (date, cwd) never go stale anyway
-    def subagent_prompt() -> str:
-        # no skills menu; add the read-only plan note when this delegation
-        # happens inside a plan-mode turn (the sub shares the plan policy but
-        # cannot exit plan mode, so PLAN_MODE_SUBAGENT — not PLAN_MODE)
-        extra = subagent_sections + ([PLAN_MODE_SUBAGENT] if policy.mode == "plan" else [])
-        return current_subagent_prompt(workspace, extra)
+
+    def subagent_prompt_for(offered: dict):
+        """The sub's system prompt, built from what THIS sub will actually hold.
+        A factory: the returned closure is re-evaluated on every model call in
+        the delegation (run_turn re-reads a callable system prompt each
+        iteration), so it reflects late registrations and the mode at that
+        moment. The menu is derived, not assumed — see sub_usable_skills. An
+        honest menu is the whole reason the old strip-it workaround existed."""
+
+        def build() -> str:
+            usable = sub_usable_skills(offered) if "skill" in offered else []
+            section = skills_section(usable)
+            sections = hook_sections + ([section] if section else [])
+            # the read-only plan note when this delegation happens inside a
+            # plan-mode turn (the sub shares the plan policy but cannot exit
+            # plan mode, so PLAN_MODE_SUBAGENT — not PLAN_MODE)
+            extra = sections + ([PLAN_MODE_SUBAGENT] if policy.mode == "plan" else [])
+            return current_subagent_prompt(workspace, extra)
+
+        return build
+
+    # Subagent-specific builds of parent tools, applied after the recursion
+    # filter. Two sets, chosen per delegation by what the sub actually holds: a
+    # sub without shell must not gain it through a skill's !`cmd`, or
+    # allowed-tools could no longer bound its capabilities. Both are filled by
+    # the skills block below and hook-wrapped with the rest; the closures read
+    # them at delegation time.
+    sub_variants_exec: dict = {}   # sub has shell → skills may run their commands
+    sub_variants_plain: dict = {}  # sub has none → commands render as skip notices
+
+    def sub_may_run(offered: dict) -> bool:
+        # may_run_skill_commands is the rule (module level, tested); a platform
+        # with no working sandbox refuses every command anyway, so it decides
+        # the same way — one predicate behind both the build and the menu
+        return sandbox_enforces and may_run_skill_commands(offered, policy.mode)
+
+    def sub_usable_skills(offered: dict) -> list:
+        # a fork skill is refused by the sub's build; a command-bearing skill
+        # the sub cannot run yields only NOT_RUN, so listing it would invite
+        # the sub to "gather context" it cannot gather
+        can_run = sub_may_run(offered)
+        return [
+            s for s in skills
+            if not s.fork and (can_run or not has_cmd_blocks(s.body))
+        ]
+
+    def sub_substitutions(offered: dict) -> dict:
+        # a sub that may not run commands still gets a build — one that renders
+        # each command as a visible NOT_RUN rather than silently unrun text —
+        # but only if that build has something to serve. Handing over a tool
+        # whose description points at a menu that was never emitted is worse
+        # than not handing it over at all.
+        if not sub_usable_skills(offered):
+            return {}
+        return sub_variants_exec if sub_may_run(offered) else sub_variants_plain
 
     register_builtin("agent", agent_tool(
         llm,
         tools,
         policy=policy,
-        system=subagent_prompt,
+        system=subagent_prompt_for(tools),
         on_tool_call=observe_sub_tool_call,
         compact_threshold=compact_threshold,
+        substitutions=sub_substitutions,
     ))
     if skills:
-        # validate each fork skill's allowed-tools against the tools a subagent
-        # could actually receive (spawns_subagents tools are filtered out for
-        # subs anyway). A typo would otherwise yield a sub silently missing
-        # tools, with no warning — unlike the model: field, which is checked.
-        sub_capable = {n for n, t in tools.items() if not t.spawns_subagents}
-        for s in skills:
-            unknown = [t for t in (s.allowed_tools or []) if t not in sub_capable]
-            if unknown:
-                print(
-                    f"(skill {s.name!r}: allowed-tools not available to a "
-                    f"subagent: {', '.join(unknown)})"
-                )
-
         # a skill's !`cmd` runs as a sandboxed preprocessor (config-authored,
         # session-approved — the lesson-18 model)
         def run(command: str) -> str:
@@ -477,12 +529,37 @@ def main():
                 make_llm(model),
                 sub_tools,
                 policy=policy,
-                system=subagent_prompt,  # no skills menu; plan note when planning
+                # the menu is built from THIS sub's registry, so a restricted
+                # fork is never told to call a tool it wasn't given
+                system=subagent_prompt_for(sub_tools),
                 on_tool_call=observe_sub_tool_call,
                 compact_threshold=compact_threshold,
+                substitutions=sub_substitutions,
             )
 
+        # the subagent's builds: same skills, NO fork_run — a fork skill is
+        # refused, so neither build can recurse. The executing one goes only to
+        # subs that already hold shell; a sub without it gets the run-less
+        # build, so a skill's !`cmd` can't become a shell side-channel around
+        # allowed-tools. That build renders each command as skills.NOT_RUN, so
+        # a skipped command is never mistaken for one that printed nothing.
+        sub_variants_exec["skill"] = skill_tool(skills, run)
+        sub_variants_plain["skill"] = skill_tool(skills)
         register_builtin("skill", skill_tool(skills, run, fork_run))
+
+        # what a subagent can actually end up holding: the inheritable tools,
+        # plus `skill` — which never survives the comprehension (the parent's
+        # build is fork-capable, so spawns_subagents excludes it) and instead
+        # arrives by substitution. Listing it in allowed-tools is legitimate.
+        sub_capable = {n for n, t in tools.items() if not t.spawns_subagents}
+        sub_capable.add("skill")
+        for s in skills:
+            unknown = [t for t in (s.allowed_tools or []) if t not in sub_capable]
+            if unknown:
+                print(
+                    f"(skill {s.name!r}: allowed-tools not available to a "
+                    f"subagent: {', '.join(unknown)})"
+                )
 
     def approve_plan(plan: str) -> tuple[bool, str]:
         print("Proposed plan:\n" + plan)
@@ -514,6 +591,10 @@ def main():
     # the spawns_subagents field keeps the recursion guard intact through
     # the wrapping
     with_hooks(tools, hookset, on_warning=lambda w: print(f"({w})"), cwd=workspace)
+    # a derived tool is model-driven too, so it gets the same hook wrapping —
+    # unlike the raw slash-command tool captured above, which is a human action
+    for variants in (sub_variants_exec, sub_variants_plain):
+        with_hooks(variants, hookset, on_warning=lambda w: print(f"({w})"), cwd=workspace)
     session = SessionLog(session_path)
     try:
         messages = session.load()

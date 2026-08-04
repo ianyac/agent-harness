@@ -93,6 +93,21 @@ def test_html_to_text_does_not_eat_a_tag_that_merely_starts_with_script():
     assert html_to_text("<scriptable>hi</scriptable>") == "hi"
 
 
+def test_html_to_text_survives_a_character_that_grows_when_lowercased():
+    # 'İ'.lower() is TWO characters. A scanner matching on a source.lower()
+    # copy desynchronises its offsets from the original, and the script body
+    # survives into the model-visible text. Found as a regression from the
+    # first fix wave; all matching now happens on the original string.
+    assert len("İ".lower()) == 2                      # the premise
+    out = html_to_text("İ" * 5 + "<script>SECRET</script>tail")
+    assert "SECRET" not in out and out.endswith("tail")
+
+
+def test_html_to_text_strips_uppercase_and_attribute_heavy_tags():
+    assert "SECRET" not in html_to_text("<SCRIPT>SECRET</SCRIPT>tail")
+    assert "SECRET" not in html_to_text('<script data-x="a>b">SECRET</script>tail')
+
+
 def test_html_to_text_is_linear_on_unclosed_tags():
     # a lazy `<script>.*?</script>` is quadratic when the close tag never
     # comes, which an attacker-controlled page uses to stall the agent loop

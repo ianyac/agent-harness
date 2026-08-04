@@ -58,38 +58,42 @@ _TAG = re.compile(r"<[^>]+>")
 _BLANK_RUN = re.compile(r"\n{3,}")
 
 
-def _strip_elements(source: str, tags=("script", "style")) -> str:
+# `\b` is what distinguishes `<script>` from `<scriptable>`: after the tag name
+# the next character must not be a word character. The close pattern allows
+# whitespace before `>`, which HTML permits.
+_OPEN_ELEMENT = re.compile(r"<(script|style)\b", re.I)
+_CLOSE_ELEMENT = {
+    tag: re.compile(rf"</{tag}\s*>", re.I) for tag in ("script", "style")
+}
+
+
+def _strip_elements(source: str) -> str:
     """Remove whole elements (open tag, contents, close tag).
 
-    Scanned linearly with str.find rather than a `<script>.*?</script>` regex:
-    that pattern is quadratic when the closing tag is missing, which an
-    attacker-controlled page can trigger to stall the single-threaded agent
-    loop. Also tolerates `</script >`, which HTML permits and an exact-match
-    regex misses — leaving the whole script body visible to the model.
+    Two traps this avoids:
+
+    - a `<script>.*?</script>` regex is QUADRATIC when the close tag is
+      missing, which an attacker-controlled page uses to stall the
+      single-threaded agent loop. Here each search starts where the last ended,
+      so the scan is linear.
+    - matching positions on a `source.lower()` copy desynchronises the indices:
+      `'İ'.lower()` is TWO characters, so one such character earlier in the
+      page shifts every later offset and the script body survives into the
+      model-visible text. All matching happens on the ORIGINAL string, with
+      case-insensitivity delegated to re.I.
     """
     out = []
-    lowered = source.lower()
     i = 0
-    while i < len(source):
-        starts = [(lowered.find(f"<{t}", i), t) for t in tags]
-        starts = [(pos, t) for pos, t in starts if pos != -1]
-        if not starts:
+    while True:
+        opened = _OPEN_ELEMENT.search(source, i)
+        if opened is None:
             out.append(source[i:])
-            break
-        start, tag = min(starts)
-        # `<scriptable` is not `<script`: the next char must end the tag name
-        after = start + 1 + len(tag)
-        if after < len(source) and (source[after].isalnum() or source[after] == "-"):
-            out.append(source[i : after])
-            i = after
-            continue
-        out.append(source[i:start])
-        close = lowered.find(f"</{tag}", start)
-        if close == -1:
-            break  # unclosed: drop the rest rather than scan it repeatedly
-        gt = lowered.find(">", close)
-        i = len(source) if gt == -1 else gt + 1
-    return "".join(out)
+            return "".join(out)
+        out.append(source[i : opened.start()])
+        closed = _CLOSE_ELEMENT[opened.group(1).lower()].search(source, opened.end())
+        if closed is None:
+            return "".join(out)  # unclosed: drop the remainder, do not rescan it
+        i = closed.end()
 
 
 def html_to_text(source: str) -> str:

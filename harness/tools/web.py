@@ -6,16 +6,21 @@ sandbox, whose profile says `deny network*`. A fetch runs IN-PROCESS, so the
 sandbox never sees it — meaning the model can reach more of the network here
 than it can through `curl`. Whatever confines this tool has to be built here.
 
-Two guards live in this module, and both took several attempts:
+Two guards live in this module, and the honest lesson of both is HOW MUCH of
+this you should not write yourself. Three hand-rolled HTML strippers and one
+hand-rolled URL rewriter shipped, between them, a quadratic stall (twice), a
+crash into the agent loop, silently dropped query strings, and stripped
+credentials. Each fix was reasonable; the accumulation was not. The versions
+here delegate to `html.parser` and `urlunparse`, which are linear, correct,
+and already tested by people who thought about the edge cases first.
 
-- `pin` resolves the host ONCE, refuses unless every address is safe, and then
-  requests that verified IP directly (the hostname travels as the Host header
-  for virtual hosting and TLS SNI). The first version checked the URL string
-  and let httpx resolve independently — which meant the guard could validate a
-  different host than the connection reached (stdlib IDNA 2003 vs the `idna`
-  package's 2008), and DNS could change in between. A guard that does not
-  control the connection is not a guard.
-  `_reachable` then requires an address be `is_global` AND outside every
+- `normalise` encodes the host to its ASCII form and `check_url` refuses
+  unless every address it resolves to is safe. Encoding up front is what makes
+  the guard and the connection agree: the stdlib resolver (IDNA 2003) and
+  httpx's `idna` package (2008) can differ on a Unicode host, so the guard
+  could validate a name the connection never used. One ASCII string removes
+  the disagreement at its source.
+  `_reachable` requires an address be `is_global` AND outside every
   non-routable category: a hand-written range list missed CGNAT, and
   `is_global` alone re-opened NAT64 space. Neither test is sufficient alone.
 - fetched text is wrapped in an untrusted marker, with anything marker-shaped
@@ -29,13 +34,13 @@ cannot ask. That was an explicit design decision (see the lesson-24 spec); the
 address guard is the only bound.
 """
 
-import html as html_module
 import ipaddress
 import time
 import re
 import socket
+from html.parser import HTMLParser
 from typing import Protocol
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urlunparse
 
 from harness.tools.base import Tool
 from harness.truncate import truncate
@@ -53,6 +58,10 @@ MAX_RESULTS = 25
 # what keeps a huge or lying body from reaching the converter and the context.
 MAX_BODY_CHARS = 2_000_000
 USER_AGENT = "agent-harness/0.1 (+teaching project)"
+# ONE wording for every resolution failure. Distinguishing "does not resolve"
+# from "resolves privately" told the model whether an internal name exists,
+# turning refusals into a DNS oracle over the deliberately-open channel.
+_REFUSED = "refused {url}: not a fetchable public address"
 
 # The model cannot tell a fetched page from any other tool result, and a page
 # can contain text shaped like instructions. The marker is a mitigation, not a
@@ -63,83 +72,67 @@ UNTRUSTED_HEADER = (
 )
 UNTRUSTED_FOOTER = "[end web content]"
 
-_TAG = re.compile(r"<[^>]+>")
 _BLANK_RUN = re.compile(r"\n{3,}")
 
 
-# One (open, close) pair per element, so the close pattern is chosen by WHICH
-# pattern matched — never by looking the matched text up in a dict. That lookup
-# raised KeyError: `re.I` also matches Unicode case-folds (U+017F 'ſ' matches
-# 's'), and `.lower()` does not map them back, so the tool crashed into the
-# loop on `<ſcript>`.
-# `(?=[\s/>])` ends the tag name explicitly: `\b` alone also matches
-# `<style-guide>`, swallowing a custom element whole.
-_ELEMENTS = (
-    (re.compile(r"<script(?=[\s/>])", re.I), re.compile(r"</script\s*>", re.I)),
-    (re.compile(r"<style(?=[\s/>])", re.I), re.compile(r"</style\s*>", re.I)),
-)
-DROPPED_UNCLOSED = "\n[unclosed script/style tag: rest of the page not shown]"
+_HIDDEN_ELEMENTS = frozenset({"script", "style"})
 
 
-def _strip_elements(source: str) -> str:
-    """Remove whole elements (open tag, contents, close tag).
+class _TextExtractor(HTMLParser):
+    """Collect the text a reader would see, dropping script/style bodies.
 
-    Two traps this avoids:
-
-    - a `<script>.*?</script>` regex is QUADRATIC when the close tag is
-      missing, which an attacker-controlled page uses to stall the
-      single-threaded agent loop. Here each search starts where the last ended,
-      so the scan is linear.
-    - matching positions on a `source.lower()` copy desynchronises the indices:
-      `'İ'.lower()` is TWO characters, so one such character earlier in the
-      page shifts every later offset and the script body survives into the
-      model-visible text. All matching happens on the ORIGINAL string, with
-      case-insensitivity delegated to re.I.
+    This replaces three successive hand-rolled strippers. Each one shipped with
+    a defect the next had to fix, and the scan went quadratic TWICE (an
+    attacker-controlled page stalling the single-threaded agent loop). A real
+    tokenizer is linear by construction, and gets for free the cases the regex
+    versions each got wrong: `>` inside an attribute value, comments, unclosed
+    tags, `</script >`, `<style-guide>`, mixed case, and Unicode case-folds.
     """
-    out = []
-    i = 0
-    while True:
-        found = None
-        for open_pattern, close_pattern in _ELEMENTS:
-            match = open_pattern.search(source, i)
-            if match is not None and (found is None or match.start() < found[0].start()):
-                found = (match, close_pattern)
-        if found is None:
-            out.append(source[i:])
-            return "".join(out)
-        opened, close_pattern = found
-        out.append(source[i : opened.start()])
-        closed = close_pattern.search(source, opened.end())
-        if closed is None:
-            # unclosed: a browser would treat the rest as script, so drop it —
-            # but SAY so. Silently returning a truncated page would let a page
-            # hide its own tail behind one malformed tag.
-            out.append(DROPPED_UNCLOSED)
-            return "".join(out)
-        i = closed.end()
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)  # entities resolved for us
+        self.parts: list[str] = []
+        self._hidden = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in _HIDDEN_ELEMENTS:
+            self._hidden += 1
+
+    def handle_endtag(self, tag):
+        if tag in _HIDDEN_ELEMENTS and self._hidden:
+            self._hidden -= 1
+
+    def handle_data(self, data):
+        if not self._hidden:
+            self.parts.append(data)
 
 
 def html_to_text(source: str) -> str:
-    """Flatten HTML to readable text.
+    """Flatten HTML to the text a reader would see.
 
-    Deliberately crude — not a parser — because the goal is a model-readable
-    approximation, not fidelity. It drops `<script>`/`<style>` WITH their
-    contents (otherwise the model reads minified JS as prose), strips remaining
-    tags, unescapes entities, and collapses blank runs.
+    Structure is approximated, not preserved — the goal is something a model
+    can read, not fidelity. Script and style bodies are dropped so minified JS
+    is never read as prose.
     """
-    text = _strip_elements(source)
-    text = _TAG.sub(" ", text)
-    text = html_module.unescape(text)
+    extractor = _TextExtractor()
+    try:
+        extractor.feed(source)
+        extractor.close()
+    except Exception:  # noqa: BLE001 — malformed markup must not raise upward
+        pass
+    text = "".join(extractor.parts)
     # collapse spaces/tabs but keep newlines, so paragraph structure survives
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r" *\n *", "\n", text)
     return _BLANK_RUN.sub("\n\n", text).strip()
 
 
-# case-insensitive: a page closes the fence with `[END WEB CONTENT]` just as
-# effectively as with the exact literal
+# Whitespace-tolerant and case-insensitive: a model reads `[ END  WEB CONTENT ]`
+# as the closing fence just as readily as the exact literal, so matching the
+# exact spelling only would let a near-miss close the region. `[^\]\n]*` stops
+# at a newline so a match can never span into text that follows.
 _MARKER_LIKE = re.compile(
-    r"\[end web content[^\]]*\]|\[web content from[^\]]*\]", re.I
+    r"\[\s*end\s+web\s+content[^\]\n]*\]|\[\s*web\s+content\s+from[^\]\n]*\]", re.I
 )
 
 
@@ -153,12 +146,22 @@ def defang(text: str) -> str:
     return _MARKER_LIKE.sub("[defanged marker]", text)
 
 
+def label(url: str) -> str:
+    """A URL safe to show inside a bracketed label.
+
+    Brackets are stripped, not defanged: on a redirect chain the URL is a
+    Location the PAGE chose, and a single `]` in it closes the header early —
+    which no amount of marker-matching can catch, because `]` is not
+    marker-shaped.
+    """
+    return defang(url).replace("[", "(").replace("]", ")")
+
+
 def mark_untrusted(url: str, body: str) -> str:
     """Wrap third-party text in the untrusted marker. Every path returning
     fetched or searched text goes through here — including error paths, since a
-    404 body is as attacker-controlled as a 200 one, and including `url`, which
-    on a redirect chain is a Location the page chose."""
-    return f"{UNTRUSTED_HEADER.format(url=defang(url))}\n{defang(body)}\n{UNTRUSTED_FOOTER}"
+    404 body is as attacker-controlled as a 200 one."""
+    return f"{UNTRUSTED_HEADER.format(url=label(url))}\n{defang(body)}\n{UNTRUSTED_FOOTER}"
 
 
 # IPv6 forms that CARRY an IPv4 address. The connection ultimately reaches the
@@ -220,30 +223,47 @@ def _reachable(address: str) -> bool:
 
 
 
-def pin(url: str) -> tuple[str, str]:
-    """Verify `url` and return (url_to_request, host_header).
+def normalise(url: str) -> str:
+    """Verify `url` and return it with an ASCII (punycode) hostname.
 
-    This is the fix for a guard that checked one thing and connected to
-    another. Previously `check_url` resolved with `socket.getaddrinfo` (IDNA
-    2003) and then handed the *hostname* to httpx, which resolved it again via
-    the `idna` package (IDNA 2008) — for hosts where the two encodings disagree
-    the guard validated a different name than the connection reached, and even
-    for identical names DNS could change in between (rebinding).
+    The defect this fixes: `check_url` resolved with `socket.getaddrinfo`
+    (stdlib IDNA 2003) while httpx resolved the same URL itself via the `idna`
+    package (IDNA 2008). Where those encodings disagree the guard validated a
+    different name than the connection reached.
 
-    Resolving once and requesting the verified IP directly removes both: the
-    address checked IS the address connected to. The original hostname travels
-    as the Host header so virtual hosting and TLS SNI still work.
+    Encoding the host to its ASCII form up front removes the disagreement at
+    the source: both sides now see one identical, unambiguous string, so there
+    is nothing left to differ about. Everything else in the URL — path, query,
+    fragment, userinfo, port — is rebuilt by `urlunparse` rather than by string
+    surgery, which is how an earlier attempt silently dropped query strings and
+    credentials.
+
+    Requesting the HOSTNAME (not a resolved IP) keeps Host, TLS SNI and
+    certificate validation, Basic auth from userinfo, and multi-address
+    failover with httpx, which implements all of them correctly.
+
+    Known gap, unchanged and deliberate: DNS may change between this check and
+    the connect (rebinding). Pinning the IP would need a custom httpx transport
+    — an earlier attempt hand-rolled it and broke five other things instead.
     """
-    check_url(url)
     parsed = urlparse(url)
     host = parsed.hostname or ""
-    address = _resolve(url, host, parsed.port)[0]
-    literal = f"[{address}]" if ":" in address else address  # IPv6 needs brackets
-    port = f":{parsed.port}" if parsed.port else ""
-    rest = url.split("//", 1)[1]
-    path = rest[rest.index("/"):] if "/" in rest else ""
-    netloc_host = parsed.hostname or ""
-    return f"{parsed.scheme}://{literal}{port}{path}", netloc_host
+    if not host.isascii():
+        try:
+            host = host.encode("idna").decode("ascii")
+        except (UnicodeError, ValueError) as error:
+            raise ValueError(f"refused {url!r}: invalid international host ({error})") from None
+    netloc = f"[{host}]" if ":" in host else host
+    if parsed.port:
+        netloc = f"{netloc}:{parsed.port}"
+    if parsed.username:
+        credentials = parsed.username
+        if parsed.password:
+            credentials = f"{credentials}:{parsed.password}"
+        netloc = f"{credentials}@{netloc}"
+    ascii_url = urlunparse(parsed._replace(netloc=netloc))
+    check_url(ascii_url)
+    return ascii_url
 
 
 def _resolve(url: str, host: str, port) -> list[str]:
@@ -251,15 +271,13 @@ def _resolve(url: str, host: str, port) -> list[str]:
     try:
         resolved = socket.getaddrinfo(host, port or 0, proto=socket.IPPROTO_TCP)
     except (OSError, UnicodeError, ValueError) as error:
-        raise ValueError(f"refused {url!r}: cannot resolve {host!r} ({error})") from None
+        raise ValueError(_REFUSED.format(url=label(url))) from None
     addresses = [str(info[4][0]) for info in resolved]
     for address in addresses:
         if not _reachable(address):
-            raise ValueError(
-                f"refused {url!r}: {host!r} does not resolve to a public address"
-            )
+            raise ValueError(_REFUSED.format(url=label(url)))
     if not addresses:
-        raise ValueError(f"refused {url!r}: {host!r} resolved to nothing")
+        raise ValueError(_REFUSED.format(url=label(url)))
     return addresses
 
 
@@ -314,13 +332,10 @@ def fetch(
             raise ValueError(
                 f"refused {original!r}: exceeded {total_timeout}s across redirects"
             )
-        # resolve + verify + rewrite to the verified IP, all in one step: the
-        # address we checked is the address the request goes to
-        target, host_header = pin(url)
-        with client.stream(
-            "GET", target, headers={"Host": host_header}, follow_redirects=False,
-            extensions={"sni_hostname": host_header},
-        ) as response:
+        # normalise to an ASCII host and verify it; httpx then resolves that
+        # same unambiguous string, so guard and connection agree
+        target = normalise(url)
+        with client.stream("GET", target, follow_redirects=False) as response:
             status = response.status_code
             headers = getattr(response, "headers", {}) or {}
             if status in (301, 302, 303, 307, 308):
@@ -337,6 +352,13 @@ def fetch(
             # counts COMPRESSED bytes while the cap is in characters.
             chunks, total, clipped = [], 0, False
             for chunk in response.iter_text():
+                # the deadline belongs INSIDE the read too: httpx's timeout is
+                # per-read and resets on every chunk, so a server dripping one
+                # character every 14s would otherwise hold the agent loop for
+                # weeks while never exceeding a single read timeout
+                if time.monotonic() > deadline:
+                    clipped = True
+                    break
                 chunks.append(chunk)
                 total += len(chunk)
                 if total >= MAX_BODY_CHARS:
@@ -378,13 +400,16 @@ def web_fetch_tool(client=None, char_limit: int = DEFAULT_CHAR_LIMIT) -> Tool:
         # the server decides Content-Type, so it must not decide whether the
         # stripper runs: a page opting out with text/plain would keep its
         # <script> bodies. Strip whenever the text looks like markup at all.
-        looks_like_markup = "html" in content_type.lower() or "<" in text
-        body = html_to_text(text) if looks_like_markup else text
+        # only when the server declares markup: sniffing for "<" mangled
+        # plain-text source files and JSON (eating `List<int>`, `a < b`).
+        # A text/plain body keeping a literal <script> is harmless — it is
+        # fenced as untrusted either way, and nothing executes it.
+        body = html_to_text(text) if "html" in content_type.lower() else text
         if not 200 <= status < 300:
             # a 4xx/5xx body is just as attacker-controlled as a 200 one, so it
             # is marked too — the status line goes outside the marker
             return (
-                f"Error: {final_url} returned HTTP {status}\n"
+                f"Error: {label(final_url)} returned HTTP {status}\n"
                 + mark_untrusted(final_url, truncate(body, 1000))
             )
         return mark_untrusted(final_url, truncate(body, char_limit))
@@ -432,7 +457,13 @@ def web_search_tool(provider: SearchProvider) -> Tool:
         try:
             results = provider.search(query, wanted)
         except Exception as error:  # noqa: BLE001 — a dead backend is a result
-            return f"Error searching for {query!r}: {type(error).__name__}: {error}"
+            # the message can embed server-supplied text (an HTTP error body
+            # via raise_for_status), so it is third-party like any other and
+            # gets the same fence — this was the one path that skipped it
+            return mark_untrusted(
+                f"search error: {query}",
+                f"{type(error).__name__}: {error}",
+            )
         if not results:
             return f"No results for {query!r}."  # say it; "" reads as a broken tool
         lines = []

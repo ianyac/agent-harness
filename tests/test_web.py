@@ -23,6 +23,17 @@ class FakeResponse:
         self.text = text
         self.headers = headers or {"content-type": "text/html"}
 
+    # the streaming seam: fetch reads incrementally so it can stop at a cap
+    def iter_text(self, chunk=4096):
+        for i in range(0, len(self.text), chunk):
+            yield self.text[i : i + chunk]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
     def json(self):
         import json
 
@@ -34,16 +45,35 @@ class FakeResponse:
 
 
 class FakeClient:
-    """Serves a scripted {url: FakeResponse} map; records what was requested."""
+    """Serves a scripted map; records what was requested.
+
+    Keys are the ORIGINAL urls; the code under test now requests the pinned IP
+    form, so lookups fall back to matching on path — the point being that
+    hostnames never reach the client any more.
+    """
 
     def __init__(self, pages):
         self.pages = pages
         self.requested = []
+        self.host_headers = []
 
-    def get(self, url, follow_redirects=False, **kwargs):
+    def stream(self, method, url, headers=None, **kwargs):
         self.requested.append(url)
-        if url not in self.pages:
-            raise AssertionError(f"unexpected fetch of {url}")
+        self.host_headers.append((headers or {}).get("Host"))
+        host = (headers or {}).get("Host")
+        path = url.split("//", 1)[1]
+        path = path[path.index("/"):] if "/" in path else "/"
+        for key, page in self.pages.items():
+            parsed = key.split("//", 1)[1]
+            key_host = parsed.split("/")[0]
+            key_path = parsed[len(key_host):] or "/"
+            if key_host == host and key_path == path:
+                return page
+        raise AssertionError(f"unexpected fetch of {url} (Host: {host})")
+
+    # search still uses a plain get
+    def get(self, url, **kwargs):
+        self.requested.append(url)
         return self.pages[url]
 
 
@@ -108,6 +138,31 @@ def test_html_to_text_strips_uppercase_and_attribute_heavy_tags():
     assert "SECRET" not in html_to_text('<script data-x="a>b">SECRET</script>tail')
 
 
+def test_html_to_text_does_not_crash_on_a_unicode_case_fold():
+    # re.I matches U+017F 'ſ' against 's', but .lower() does not map it back,
+    # so keying a dict on the matched text raised KeyError — a tool raising
+    # into the loop, which the harness forbids
+    assert html_to_text("<ſcript>X</script>") is not None
+
+
+def test_html_to_text_handles_mixed_case_tags():
+    assert "SECRET" not in html_to_text("<ScRiPt>SECRET</ScRiPt>tail")
+
+
+def test_html_to_text_keeps_a_hyphenated_custom_element():
+    # `\b` alone treats `<style-guide>` as an opening `<style>` tag and eats
+    # the element whole
+    assert html_to_text("<style-guide>keep me</style-guide>") == "keep me"
+
+
+def test_html_to_text_announces_a_dropped_unclosed_tag():
+    # dropping the remainder is right (a browser would treat it as script) but
+    # doing it silently would let a page hide its tail behind one bad tag
+    out = html_to_text("<p>head</p><script>rest of page")
+    assert "head" in out and "rest of page" not in out
+    assert "unclosed" in out
+
+
 def test_html_to_text_is_linear_on_unclosed_tags():
     # a lazy `<script>.*?</script>` is quadratic when the close tag never
     # comes, which an attacker-controlled page uses to stall the agent loop
@@ -132,7 +187,7 @@ def test_check_url_refuses_a_public_name_that_resolves_to_loopback(public_dns):
     # the whole reason the check resolves instead of matching on "localhost":
     # a perfectly public-looking name can point at this machine
     public_dns["totally-normal.com"] = "127.0.0.1"
-    with pytest.raises(ValueError, match="not a public address"):
+    with pytest.raises(ValueError, match="public address"):
         check_url("https://totally-normal.com/x")
 
 
@@ -144,7 +199,7 @@ def test_check_url_refuses_private_and_metadata_addresses(public_dns):
         ("d.com", "::1"),
     ):
         public_dns[host] = address
-        with pytest.raises(ValueError, match="not a public address"):
+        with pytest.raises(ValueError, match="public address"):
             check_url(f"http://{host}/")
 
 
@@ -153,13 +208,13 @@ def test_check_url_refuses_cgnat_shared_space(public_dns):
     # ipaddress reports is_private False for it, yet a whole Tailscale tailnet
     # lives there. This is why the guard allowlists is_global instead.
     public_dns["tailnet.example"] = "100.64.0.1"
-    with pytest.raises(ValueError, match="not a public address"):
+    with pytest.raises(ValueError, match="public address"):
         check_url("http://tailnet.example/")
 
 
 def test_check_url_refuses_ipv4_mapped_ipv6_loopback(public_dns):
     public_dns["sneaky.example"] = "::ffff:127.0.0.1"
-    with pytest.raises(ValueError, match="not a public address"):
+    with pytest.raises(ValueError, match="public address"):
         check_url("http://sneaky.example/")
 
 
@@ -173,7 +228,7 @@ def test_check_url_checks_every_resolved_address(monkeypatch):
         ]
 
     monkeypatch.setattr(socket, "getaddrinfo", two_records)
-    with pytest.raises(ValueError, match="not a public address"):
+    with pytest.raises(ValueError, match="public address"):
         check_url("http://split-horizon.example/")
 
 
@@ -220,7 +275,7 @@ def test_fetch_rechecks_every_hop_so_a_redirect_cannot_reach_localhost(public_dn
     client = FakeClient({
         "https://ex.com/a": FakeResponse(302, headers={"location": "http://internal.example/"}),
     })
-    with pytest.raises(ValueError, match="not a public address"):
+    with pytest.raises(ValueError, match="public address"):
         fetch("https://ex.com/a", client)
 
 
@@ -232,12 +287,24 @@ def test_fetch_reports_a_redirect_with_no_location(public_dns):
         fetch("https://ex.com/a", client)
 
 
-def test_fetch_refuses_an_oversized_declared_body(public_dns):
-    client = FakeClient({"https://ex.com/a": FakeResponse(
-        text="x", headers={"content-type": "text/html", "content-length": "999999999"}
-    )})
-    with pytest.raises(ValueError, match="over the"):
-        fetch("https://ex.com/a", client)
+def test_fetch_stops_reading_at_the_size_cap(public_dns, monkeypatch):
+    # Content-Length cannot do this job: it arrives before the body, may be
+    # absent or a lie, and counts COMPRESSED bytes. The bound has to come from
+    # how much we actually read.
+    monkeypatch.setattr("harness.tools.web.MAX_BODY_CHARS", 1000)
+    client = FakeClient({"https://ex.com/a": FakeResponse(text="x" * 500_000)})
+    _, _, text, _ = fetch("https://ex.com/a", client)
+    assert len(text) < 1200 and "truncated at the fetch size limit" in text
+
+
+def test_fetch_connects_to_the_verified_ip_not_the_hostname(public_dns):
+    # the architectural fix: check_url resolved with getaddrinfo while httpx
+    # resolved again itself (different IDNA rules, and DNS could change in
+    # between). Now the address we verified IS the address requested.
+    client = FakeClient({"https://ex.com/a": FakeResponse(text="ok")})
+    fetch("https://ex.com/a", client)
+    assert client.requested == ["https://93.184.216.34/a"]   # the pinned IP
+    assert client.host_headers == ["ex.com"]                 # name kept for vhost/SNI
 
 
 def test_fetch_caps_the_redirect_chain_and_names_the_first_url(public_dns):
@@ -281,12 +348,12 @@ def test_web_fetch_truncates_a_huge_page(public_dns):
 def test_web_fetch_turns_a_refusal_into_result_text(public_dns):
     public_dns["evil.com"] = "127.0.0.1"
     out = web_fetch_tool(FakeClient({})).execute(url="http://evil.com/")
-    assert out.startswith("Error:") and "not a public address" in out
+    assert out.startswith("Error:") and "public address" in out
 
 
 def test_web_fetch_turns_a_network_failure_into_result_text(public_dns):
     class Boom:
-        def get(self, *a, **k):
+        def stream(self, *a, **k):
             raise TimeoutError("timed out")
 
     out = web_fetch_tool(Boom()).execute(url="https://ex.com/a")

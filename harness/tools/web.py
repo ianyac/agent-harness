@@ -6,16 +6,21 @@ sandbox, whose profile says `deny network*`. A fetch runs IN-PROCESS, so the
 sandbox never sees it — meaning the model can reach more of the network here
 than it can through `curl`. Whatever confines this tool has to be built here.
 
-Two guards live in this module:
+Two guards live in this module, and both took several attempts:
 
-- `check_url` refuses anything that does not resolve to a **globally routable**
-  address. It is an allowlist ("must be public"), not a denylist of private
-  ranges: the first version enumerated ranges and missed 100.64.0.0/10, so a
-  Tailscale host read as public. Enumerating what is forbidden fails silently
-  when the list is incomplete; requiring what is permitted fails closed.
-- fetched text is wrapped in an untrusted marker, with any forged copy of that
-  marker defanged first. It is the first tool result authored by a third party
-  rather than by the user or a command they approved.
+- `pin` resolves the host ONCE, refuses unless every address is safe, and then
+  requests that verified IP directly (the hostname travels as the Host header
+  for virtual hosting and TLS SNI). The first version checked the URL string
+  and let httpx resolve independently — which meant the guard could validate a
+  different host than the connection reached (stdlib IDNA 2003 vs the `idna`
+  package's 2008), and DNS could change in between. A guard that does not
+  control the connection is not a guard.
+  `_reachable` then requires an address be `is_global` AND outside every
+  non-routable category: a hand-written range list missed CGNAT, and
+  `is_global` alone re-opened NAT64 space. Neither test is sufficient alone.
+- fetched text is wrapped in an untrusted marker, with anything marker-shaped
+  defanged first. It is the first tool result authored by a third party rather
+  than by the user or a command they approved.
 
 One risk is deliberately NOT guarded: a URL is an outbound channel, so a fetch
 can carry data out (`https://evil.com/?d=…`). These tools are `read_only=True`,
@@ -26,6 +31,7 @@ address guard is the only bound.
 
 import html as html_module
 import ipaddress
+import time
 import re
 import socket
 from typing import Protocol
@@ -35,7 +41,10 @@ from harness.tools.base import Tool
 from harness.truncate import truncate
 
 MAX_REDIRECTS = 5
-DEFAULT_TIMEOUT = 15
+DEFAULT_TIMEOUT = 15          # per request
+# aggregate deadline across a redirect chain: a per-request timeout inside a
+# 6-hop loop lets one call block the single-threaded agent loop for ~90s
+TOTAL_TIMEOUT = 30
 DEFAULT_CHAR_LIMIT = 10000
 SEARCH_CHAR_LIMIT = 4000
 MAX_RESULTS = 25
@@ -58,13 +67,18 @@ _TAG = re.compile(r"<[^>]+>")
 _BLANK_RUN = re.compile(r"\n{3,}")
 
 
-# `\b` is what distinguishes `<script>` from `<scriptable>`: after the tag name
-# the next character must not be a word character. The close pattern allows
-# whitespace before `>`, which HTML permits.
-_OPEN_ELEMENT = re.compile(r"<(script|style)\b", re.I)
-_CLOSE_ELEMENT = {
-    tag: re.compile(rf"</{tag}\s*>", re.I) for tag in ("script", "style")
-}
+# One (open, close) pair per element, so the close pattern is chosen by WHICH
+# pattern matched — never by looking the matched text up in a dict. That lookup
+# raised KeyError: `re.I` also matches Unicode case-folds (U+017F 'ſ' matches
+# 's'), and `.lower()` does not map them back, so the tool crashed into the
+# loop on `<ſcript>`.
+# `(?=[\s/>])` ends the tag name explicitly: `\b` alone also matches
+# `<style-guide>`, swallowing a custom element whole.
+_ELEMENTS = (
+    (re.compile(r"<script(?=[\s/>])", re.I), re.compile(r"</script\s*>", re.I)),
+    (re.compile(r"<style(?=[\s/>])", re.I), re.compile(r"</style\s*>", re.I)),
+)
+DROPPED_UNCLOSED = "\n[unclosed script/style tag: rest of the page not shown]"
 
 
 def _strip_elements(source: str) -> str:
@@ -85,14 +99,23 @@ def _strip_elements(source: str) -> str:
     out = []
     i = 0
     while True:
-        opened = _OPEN_ELEMENT.search(source, i)
-        if opened is None:
+        found = None
+        for open_pattern, close_pattern in _ELEMENTS:
+            match = open_pattern.search(source, i)
+            if match is not None and (found is None or match.start() < found[0].start()):
+                found = (match, close_pattern)
+        if found is None:
             out.append(source[i:])
             return "".join(out)
+        opened, close_pattern = found
         out.append(source[i : opened.start()])
-        closed = _CLOSE_ELEMENT[opened.group(1).lower()].search(source, opened.end())
+        closed = close_pattern.search(source, opened.end())
         if closed is None:
-            return "".join(out)  # unclosed: drop the remainder, do not rescan it
+            # unclosed: a browser would treat the rest as script, so drop it —
+            # but SAY so. Silently returning a truncated page would let a page
+            # hide its own tail behind one malformed tag.
+            out.append(DROPPED_UNCLOSED)
+            return "".join(out)
         i = closed.end()
 
 
@@ -113,36 +136,131 @@ def html_to_text(source: str) -> str:
     return _BLANK_RUN.sub("\n\n", text).strip()
 
 
+# case-insensitive: a page closes the fence with `[END WEB CONTENT]` just as
+# effectively as with the exact literal
+_MARKER_LIKE = re.compile(
+    r"\[end web content[^\]]*\]|\[web content from[^\]]*\]", re.I
+)
+
+
 def defang(text: str) -> str:
-    """Neutralise forged copies of our own markers inside third-party text.
+    """Neutralise anything marker-shaped inside third-party text.
 
     Without this a page can emit the footer, then append text that appears to
     sit OUTSIDE the untrusted region — the marker would fence only the content
     that chose to stay inside it.
     """
-    return text.replace(UNTRUSTED_FOOTER, "[end web content (defanged)]").replace(
-        "[web content from", "[web content from (defanged)"
-    )
+    return _MARKER_LIKE.sub("[defanged marker]", text)
 
 
 def mark_untrusted(url: str, body: str) -> str:
-    """Wrap third-party text in the untrusted marker. Every path that returns
-    fetched or searched text goes through here — including error paths, since
-    a 404 body is just as attacker-controlled as a 200 one."""
-    return f"{UNTRUSTED_HEADER.format(url=url)}\n{defang(body)}\n{UNTRUSTED_FOOTER}"
+    """Wrap third-party text in the untrusted marker. Every path returning
+    fetched or searched text goes through here — including error paths, since a
+    404 body is as attacker-controlled as a 200 one, and including `url`, which
+    on a redirect chain is a Location the page chose."""
+    return f"{UNTRUSTED_HEADER.format(url=defang(url))}\n{defang(body)}\n{UNTRUSTED_FOOTER}"
+
+
+# IPv6 forms that CARRY an IPv4 address. The connection ultimately reaches the
+# embedded address (a NAT64 gateway translates it), so the embedded one must be
+# checked too — `is_global` is True for 64:ff9b::a00:1, which is 10.0.0.1.
+_SITE_LOCAL_V6 = ipaddress.ip_network("fec0::/10")  # deprecated, is_global True
+
+_V4_IN_V6 = (
+    ipaddress.ip_network("64:ff9b::/96"),    # NAT64 well-known prefix
+    ipaddress.ip_network("64:ff9b:1::/48"),  # NAT64 local-use
+    ipaddress.ip_network("::/96"),           # IPv4-compatible (deprecated)
+)
+
+
+def _embedded_v4(ip):
+    """The IPv4 address an IPv6 form actually reaches, or None."""
+    if ip.version != 6:
+        return None
+    for attr in ("ipv4_mapped", "sixtofour"):
+        embedded = getattr(ip, attr, None)
+        if embedded is not None:
+            return embedded
+    teredo = getattr(ip, "teredo", None)
+    if teredo is not None:
+        return teredo[1]  # the client's own address
+    if any(ip in net for net in _V4_IN_V6):
+        return ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+    return None
 
 
 def _reachable(address: str) -> bool:
-    """True only for globally routable unicast addresses.
+    """True only for addresses that are safe to connect to.
 
-    `is_global` is the allowlist: it is False for loopback, private, link-local
-    (so cloud metadata at 169.254.169.254), unspecified, reserved, AND
-    100.64.0.0/10 shared/CGNAT space that a hand-written range list misses.
-    Multicast is excluded separately because some multicast ranges report
-    is_global True.
+    BOTH tests, not either: the address must be `is_global` AND outside every
+    non-routable category. Each alone has been wrong here — the original
+    denylist missed 100.64.0.0/10 (CGNAT), and replacing it with `is_global`
+    alone re-opened NAT64 and IPv4-compatible space that `is_reserved` caught.
+    A category list goes stale; `is_global` encodes a registry that has its own
+    gaps (it reports True for deprecated site-local fec0::/10). Requiring both
+    means a new gap in one is still caught by the other.
+
+    An IPv6 form carrying an IPv4 address is checked on the embedded address
+    too, since that is where the packet lands.
     """
     ip = ipaddress.ip_address(address)
-    return ip.is_global and not ip.is_multicast
+    embedded = _embedded_v4(ip)
+    if embedded is not None and not _reachable(str(embedded)):
+        return False
+    denied = (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local     # incl. cloud metadata 169.254.169.254
+        or ip.is_multicast
+        or ip.is_reserved       # incl. NAT64 / IPv4-compatible v6 space
+        or ip.is_unspecified
+        or ip in _SITE_LOCAL_V6
+    )
+    return ip.is_global and not denied
+
+
+
+def pin(url: str) -> tuple[str, str]:
+    """Verify `url` and return (url_to_request, host_header).
+
+    This is the fix for a guard that checked one thing and connected to
+    another. Previously `check_url` resolved with `socket.getaddrinfo` (IDNA
+    2003) and then handed the *hostname* to httpx, which resolved it again via
+    the `idna` package (IDNA 2008) — for hosts where the two encodings disagree
+    the guard validated a different name than the connection reached, and even
+    for identical names DNS could change in between (rebinding).
+
+    Resolving once and requesting the verified IP directly removes both: the
+    address checked IS the address connected to. The original hostname travels
+    as the Host header so virtual hosting and TLS SNI still work.
+    """
+    check_url(url)
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    address = _resolve(url, host, parsed.port)[0]
+    literal = f"[{address}]" if ":" in address else address  # IPv6 needs brackets
+    port = f":{parsed.port}" if parsed.port else ""
+    rest = url.split("//", 1)[1]
+    path = rest[rest.index("/"):] if "/" in rest else ""
+    netloc_host = parsed.hostname or ""
+    return f"{parsed.scheme}://{literal}{port}{path}", netloc_host
+
+
+def _resolve(url: str, host: str, port) -> list[str]:
+    """Every address `host` resolves to, refusing unless all are reachable."""
+    try:
+        resolved = socket.getaddrinfo(host, port or 0, proto=socket.IPPROTO_TCP)
+    except (OSError, UnicodeError, ValueError) as error:
+        raise ValueError(f"refused {url!r}: cannot resolve {host!r} ({error})") from None
+    addresses = [str(info[4][0]) for info in resolved]
+    for address in addresses:
+        if not _reachable(address):
+            raise ValueError(
+                f"refused {url!r}: {host!r} does not resolve to a public address"
+            )
+    if not addresses:
+        raise ValueError(f"refused {url!r}: {host!r} resolved to nothing")
+    return addresses
 
 
 def check_url(url: str) -> None:
@@ -171,49 +289,63 @@ def check_url(url: str) -> None:
         )
     if not host:
         raise ValueError(f"refused {url!r}: no host in the URL")
-    try:
-        resolved = socket.getaddrinfo(host, port or 0, proto=socket.IPPROTO_TCP)
-    except (OSError, UnicodeError, ValueError) as error:
-        # UnicodeError: idna encoding of an absurd hostname; OSError: DNS
-        raise ValueError(f"refused {url!r}: cannot resolve {host!r} ({error})") from None
-    for info in resolved:
-        address = str(info[4][0])
-        if not _reachable(address):
-            raise ValueError(
-                f"refused {url!r}: {host!r} resolves to {address}, which is not a "
-                "public address. Fetching may not reach this machine's network."
-            )
+    # the refusal deliberately does NOT name the resolved address: reporting it
+    # would turn web_fetch into an internal DNS/topology oracle, which pairs
+    # badly with the deliberately-open outbound channel
+    _resolve(url, host, port)
 
 
-def fetch(url: str, client, *, max_redirects: int = MAX_REDIRECTS):
+def fetch(
+    url: str,
+    client,
+    *,
+    max_redirects: int = MAX_REDIRECTS,
+    total_timeout: float = TOTAL_TIMEOUT,
+):
     """Fetch `url`, following redirects MANUALLY so every hop is re-checked.
 
     Auto-following would defeat check_url: a public URL may redirect to
     http://127.0.0.1. Returns (final_url, status_code, text, content_type).
     """
     original = url  # keep for error messages; `url` is rebound per hop
+    deadline = time.monotonic() + total_timeout
     for _ in range(max_redirects + 1):
-        check_url(url)  # every hop, not just the first
-        response = client.get(url, follow_redirects=False)
-        status = response.status_code
-        headers = getattr(response, "headers", {}) or {}
-        if status in (301, 302, 303, 307, 308):
-            location = headers.get("location")
-            if not location:
-                # a redirect that says nowhere: report what actually happened
-                raise ValueError(
-                    f"refused {url!r}: HTTP {status} redirect with no Location header"
-                )
-            url = urljoin(url, location)  # relative and protocol-relative both resolve
-            continue
-        declared = headers.get("content-length")
-        if declared and declared.isdigit() and int(declared) > MAX_BODY_CHARS:
+        if time.monotonic() > deadline:
             raise ValueError(
-                f"refused {url!r}: response declares {declared} bytes, over the "
-                f"{MAX_BODY_CHARS} limit"
+                f"refused {original!r}: exceeded {total_timeout}s across redirects"
             )
-        text = response.text or ""
-        return url, status, text[:MAX_BODY_CHARS], headers.get("content-type", "")
+        # resolve + verify + rewrite to the verified IP, all in one step: the
+        # address we checked is the address the request goes to
+        target, host_header = pin(url)
+        with client.stream(
+            "GET", target, headers={"Host": host_header}, follow_redirects=False,
+            extensions={"sni_hostname": host_header},
+        ) as response:
+            status = response.status_code
+            headers = getattr(response, "headers", {}) or {}
+            if status in (301, 302, 303, 307, 308):
+                location = headers.get("location")
+                if not location:
+                    # a redirect that says nowhere: report what actually happened
+                    raise ValueError(
+                        f"refused {url!r}: HTTP {status} redirect with no Location header"
+                    )
+                url = urljoin(url, location)  # relative and protocol-relative resolve
+                continue
+            # read incrementally and stop at the cap. Content-Length cannot do
+            # this job: it arrives before the body, may be absent or a lie, and
+            # counts COMPRESSED bytes while the cap is in characters.
+            chunks, total, clipped = [], 0, False
+            for chunk in response.iter_text():
+                chunks.append(chunk)
+                total += len(chunk)
+                if total >= MAX_BODY_CHARS:
+                    clipped = True
+                    break
+            text = "".join(chunks)[:MAX_BODY_CHARS]
+            if clipped:
+                text += "\n[body truncated at the fetch size limit]"
+            return url, status, text, headers.get("content-type", "")
     raise ValueError(
         f"refused: more than {max_redirects} redirects starting at {original!r}"
     )
@@ -235,13 +367,19 @@ def web_fetch_tool(client=None, char_limit: int = DEFAULT_CHAR_LIMIT) -> Tool:
         try:
             final_url, status, text, content_type = fetch(url, active)
         except ValueError as error:  # our own refusals, already explained
-            return f"Error: {error}"
+            # a refusal can quote a redirect target the PAGE chose, so it is
+            # third-party text too — defang before it reaches the model
+            return f"Error: {defang(str(error))}"
         except Exception as error:  # noqa: BLE001 — network failures are results
-            return f"Error fetching {url!r}: {type(error).__name__}: {error}"
+            return f"Error fetching {defang(repr(url))}: {type(error).__name__}"
         finally:
             if owned:
                 active.close()
-        body = html_to_text(text) if "html" in content_type.lower() else text
+        # the server decides Content-Type, so it must not decide whether the
+        # stripper runs: a page opting out with text/plain would keep its
+        # <script> bodies. Strip whenever the text looks like markup at all.
+        looks_like_markup = "html" in content_type.lower() or "<" in text
+        body = html_to_text(text) if looks_like_markup else text
         if not 200 <= status < 300:
             # a 4xx/5xx body is just as attacker-controlled as a 200 one, so it
             # is marked too — the status line goes outside the marker

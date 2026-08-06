@@ -357,6 +357,32 @@ def test_web_fetch_turns_a_network_failure_into_result_text(public_dns):
     assert out.startswith("Error fetching") and "TimeoutError" in out
 
 
+def test_web_fetch_owned_client_ignores_environment_proxies(monkeypatch):
+    # The resolved-address guard applies only when httpx connects directly.
+    # Its default trust_env=True would let HTTP(S)_PROXY pick a different
+    # resolver and reachability policy.
+    import httpx
+
+    created = {}
+
+    class OwnedClient:
+        def __init__(self, **kwargs):
+            created.update(kwargs)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(httpx, "Client", OwnedClient)
+    monkeypatch.setattr(
+        "harness.tools.web.fetch",
+        lambda url, client: (url, 200, "ok", "text/plain"),
+    )
+
+    web_fetch_tool().execute(url="https://example.com/")
+
+    assert created["trust_env"] is False
+
+
 def test_web_fetch_reports_a_non_2xx_status(public_dns):
     client = FakeClient({"https://ex.com/a": FakeResponse(404, text="<p>gone</p>")})
     out = web_fetch_tool(client).execute(url="https://ex.com/a")

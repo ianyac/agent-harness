@@ -383,7 +383,12 @@ def web_fetch_tool(client=None, char_limit: int = DEFAULT_CHAR_LIMIT) -> Tool:
             import httpx
 
             active = httpx.Client(
-                timeout=DEFAULT_TIMEOUT, headers={"User-Agent": USER_AGENT}
+                timeout=DEFAULT_TIMEOUT,
+                headers={"User-Agent": USER_AGENT},
+                # The public-address guard must constrain the connection that
+                # is actually made. Environment HTTP(S)_PROXY settings would
+                # delegate resolution and reachability to a proxy instead.
+                trust_env=False,
             )
             owned = True  # we made it, so we close it
         try:

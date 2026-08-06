@@ -27,6 +27,7 @@ from harness.prompts import (
     build_system_prompt,
 )
 from harness.sandbox import LinuxSandbox, NoSandbox, SandboxPolicy, default_sandbox
+from harness.search import default_provider
 from harness.session import SessionLog, lock, unlock
 from harness.skills import (
     Skill,
@@ -42,6 +43,7 @@ from harness.tools.bash import bash_tool, run_sandboxed
 from harness.tools.list_dir import list_dir_tool
 from harness.tools.plan import exit_plan_mode_tool
 from harness.tools.read_file import read_file_tool
+from harness.tools.web import web_fetch_tool, web_search_tool
 from harness.tools.write_file import write_file_tool
 
 KEEP_RECENT = 8  # messages kept verbatim through a compaction
@@ -416,8 +418,19 @@ def main():
         write_file_tool(workspace=workspace),
         list_dir_tool(workspace=workspace),
         bash_tool(sandbox=sandbox),
+        # in-process, so the sandbox's `deny network*` does NOT apply to it —
+        # its own guard (public addresses only) is the whole confinement
+        web_fetch_tool(),
     ]
     tools = {tool.name: tool for tool in registry}
+    # search is a capability, not policy: with no key the tool is absent rather
+    # than present-and-always-failing (the mcp.json rule)
+    provider = default_provider()
+    if provider is not None:
+        tools["web_search"] = web_search_tool(provider)
+        print(f"(web search: enabled via {getattr(provider, 'name', 'provider')})")
+    else:
+        print("(web search: no API key — set BRAVE_API_KEY to enable)")
     # foreign tools join before the agent tool: subagents inherit them, and
     # the in-place hook wrapping below covers them like any native tool
     for tool in foreign_tools:

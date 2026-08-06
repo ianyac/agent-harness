@@ -52,7 +52,9 @@ DEFAULT_TIMEOUT = 15          # per request
 TOTAL_TIMEOUT = 30
 DEFAULT_CHAR_LIMIT = 10000
 SEARCH_CHAR_LIMIT = 4000
-MAX_RESULTS = 25
+# Brave's Web Search endpoint accepts at most 20 results per request. This is
+# also the limit advertised by the tool registered with the default provider.
+MAX_RESULTS = 20
 # hard ceiling on how much fetched text we process. The download itself is
 # bounded only when the server sends Content-Length (see fetch); this cap is
 # what keeps a huge or lying body from reaching the converter and the context.
@@ -76,6 +78,44 @@ _BLANK_RUN = re.compile(r"\n{3,}")
 
 
 _HIDDEN_ELEMENTS = frozenset({"script", "style"})
+_BLOCK_ELEMENTS = frozenset({
+    "address",
+    "article",
+    "aside",
+    "blockquote",
+    "dd",
+    "div",
+    "dl",
+    "dt",
+    "fieldset",
+    "figcaption",
+    "figure",
+    "footer",
+    "form",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "header",
+    "hr",
+    "li",
+    "main",
+    "nav",
+    "ol",
+    "p",
+    "pre",
+    "section",
+    "table",
+    "tbody",
+    "td",
+    "tfoot",
+    "th",
+    "thead",
+    "tr",
+    "ul",
+})
 
 
 class _TextExtractor(HTMLParser):
@@ -94,13 +134,22 @@ class _TextExtractor(HTMLParser):
         self.parts: list[str] = []
         self._hidden = 0
 
+    def _break(self):
+        """Keep adjacent block elements from running into one another."""
+        if self.parts and not self.parts[-1].endswith("\n"):
+            self.parts.append("\n")
+
     def handle_starttag(self, tag, attrs):
         if tag in _HIDDEN_ELEMENTS:
             self._hidden += 1
+        elif not self._hidden and (tag in _BLOCK_ELEMENTS or tag == "br"):
+            self._break()
 
     def handle_endtag(self, tag):
         if tag in _HIDDEN_ELEMENTS and self._hidden:
             self._hidden -= 1
+        elif not self._hidden and tag in _BLOCK_ELEMENTS:
+            self._break()
 
     def handle_data(self, data):
         if not self._hidden:
@@ -253,13 +302,14 @@ def normalise(url: str) -> str:
             host = host.encode("idna").decode("ascii")
         except (UnicodeError, ValueError) as error:
             raise ValueError(f"refused {url!r}: invalid international host ({error})") from None
+    port, username, password = parsed.port, parsed.username, parsed.password
     netloc = f"[{host}]" if ":" in host else host
-    if parsed.port:
-        netloc = f"{netloc}:{parsed.port}"
-    if parsed.username:
-        credentials = parsed.username
-        if parsed.password:
-            credentials = f"{credentials}:{parsed.password}"
+    if port is not None:
+        netloc = f"{netloc}:{port}"
+    if username is not None:
+        credentials = username
+        if password is not None:
+            credentials = f"{credentials}:{password}"
         netloc = f"{credentials}@{netloc}"
     ascii_url = urlunparse(parsed._replace(netloc=netloc))
     check_url(ascii_url)
@@ -357,8 +407,9 @@ def fetch(
                 # character every 14s would otherwise hold the agent loop for
                 # weeks while never exceeding a single read timeout
                 if time.monotonic() > deadline:
-                    clipped = True
-                    break
+                    raise ValueError(
+                        f"refused {original!r}: exceeded {total_timeout}s across redirects"
+                    )
                 chunks.append(chunk)
                 total += len(chunk)
                 if total >= MAX_BODY_CHARS:
@@ -395,8 +446,9 @@ def web_fetch_tool(client=None, char_limit: int = DEFAULT_CHAR_LIMIT) -> Tool:
             final_url, status, text, content_type = fetch(url, active)
         except ValueError as error:  # our own refusals, already explained
             # a refusal can quote a redirect target the PAGE chose, so it is
-            # third-party text too — defang before it reaches the model
-            return f"Error: {defang(str(error))}"
+            # third-party text too. Fence the entire diagnostic rather than
+            # merely defanging marker-shaped fragments inside it.
+            return "Error: fetch refused\n" + mark_untrusted(url, str(error))
         except Exception as error:  # noqa: BLE001 — network failures are results
             return f"Error fetching {defang(repr(url))}: {type(error).__name__}"
         finally:
@@ -411,10 +463,10 @@ def web_fetch_tool(client=None, char_limit: int = DEFAULT_CHAR_LIMIT) -> Tool:
         # fenced as untrusted either way, and nothing executes it.
         body = html_to_text(text) if "html" in content_type.lower() else text
         if not 200 <= status < 300:
-            # a 4xx/5xx body is just as attacker-controlled as a 200 one, so it
-            # is marked too — the status line goes outside the marker
+            # Both the body and a redirect-controlled final URL are
+            # attacker-controlled. Only the numeric status stays outside.
             return (
-                f"Error: {label(final_url)} returned HTTP {status}\n"
+                f"Error: HTTP {status}\n"
                 + mark_untrusted(final_url, truncate(body, 1000))
             )
         return mark_untrusted(final_url, truncate(body, char_limit))

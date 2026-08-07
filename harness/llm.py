@@ -14,6 +14,7 @@ class LLMClient(Protocol):
         tools: list[dict] | None = None,
         system: str | None = None,
         on_text_delta: Callable[[str], None] | None = None,
+        projection_hash: str | None = None,
     ) -> dict: ...
 
 
@@ -223,6 +224,7 @@ class CodexAdapter:
         tools: list[dict] | None = None,
         system: str | None = None,
         on_text_delta: Callable[[str], None] | None = None,
+        projection_hash: str | None = None,
     ) -> dict:
         body = build_request_body(
             self.model, self.instructions, messages, tools, system
@@ -232,10 +234,15 @@ class CodexAdapter:
         # Caveat for streaming: a retry regenerates from scratch, so chunks
         # already shown from the dead attempt are stale — the assembled
         # message (the box, not the texts) is the only source of truth.
-        return with_retries(lambda: self._attempt(body, on_text_delta))
+        return with_retries(
+            lambda: self._attempt(body, on_text_delta, projection_hash)
+        )
 
     def _attempt(
-        self, body: dict, on_text_delta: Callable[[str], None] | None
+        self,
+        body: dict,
+        on_text_delta: Callable[[str], None] | None,
+        projection_hash: str | None,
     ) -> dict:
         output_items: list[dict] = []
         final = None
@@ -243,7 +250,15 @@ class CodexAdapter:
             with client.stream(
                 "POST",
                 CODEX_URL,
-                headers={**self._headers, "session_id": str(uuid.uuid4())},
+                headers={
+                    **self._headers,
+                    "session_id": str(uuid.uuid4()),
+                    **(
+                        {"x-agent-projection-hash": projection_hash}
+                        if projection_hash is not None
+                        else {}
+                    ),
+                },
                 json=body,
             ) as resp:
                 if resp.status_code in RETRYABLE_STATUSES:

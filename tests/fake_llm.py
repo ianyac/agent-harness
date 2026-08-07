@@ -17,7 +17,13 @@ class FakeLLM:
 
     def __init__(self, script: list[dict]):
         self.turns = [
-            {"output": entry, "messages": None, "tools": None, "system": None}
+            {
+                "output": entry,
+                "messages": None,
+                "tools": None,
+                "system": None,
+                "projection_hash": None,
+            }
             for entry in script
         ]
         self.current_line = 0
@@ -29,12 +35,14 @@ class FakeLLM:
         tools: list[dict] | None = None,
         system: str | None = None,
         on_text_delta: Callable[[str], None] | None = None,
+        projection_hash: str | None = None,
     ) -> dict:
         turn = self.turns[self.current_line]
         self.current_line += 1
         turn["messages"] = deepcopy(messages)
         turn["tools"] = deepcopy(tools)
         turn["system"] = system
+        turn["projection_hash"] = projection_hash
         entry = turn["output"]
         match entry["type"]:
             case "text":

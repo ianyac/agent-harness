@@ -1,4 +1,5 @@
 import json
+import hashlib
 
 import pytest
 
@@ -39,6 +40,28 @@ def test_loop_sends_projection_but_retains_full_shadow_history(tmp_path):
 
     assert llm.turns[0]["messages"][2]["content"].startswith("[folded m2.r0")
     assert messages[2]["content"] == "full evidence"
+
+
+def test_each_model_dispatch_records_the_exact_projection_hash(tmp_path):
+    messages = completed_history()
+    context = context_for(tmp_path)
+    context.sync(messages, {"read_file": noop_tool(name="read_file")})
+    context.fold("m2.r0", "finished", rich_note())
+    llm = FakeLLM([{"type": "text", "content": "done"}])
+
+    run_turn(messages, "next", llm, context=context)
+
+    exact = json.dumps(
+        llm.turns[0]["messages"],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    record = context.projection_chain()[-1]
+    assert record["kind"] == "request"
+    assert record["projection_hash"] == hashlib.sha256(exact.encode()).hexdigest()
+    assert llm.turns[0]["projection_hash"] == record["projection_hash"]
+    assert "workspace after checkpoint" in exact
 
 
 def test_loop_applies_pending_folds_at_the_next_turn_boundary(tmp_path):

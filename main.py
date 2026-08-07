@@ -396,6 +396,8 @@ def main():
         action_log.touch()
     except OSError as error:
         parser.error(f"cannot create action log {action_log}: {error}")
+    if folding is not None:
+        folding.register_purge_path(action_log)
 
     def record_action(actor: str, name: str, args: dict) -> None:
         try:

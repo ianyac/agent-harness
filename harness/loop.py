@@ -81,11 +81,24 @@ def run_turn(
                 messages[:] = compacted  # in place: the caller owns this list
                 if on_compact is not None:
                     on_compact(summarized)
-        # the kwarg travels only when streaming is on: pre-seam LLMClient
-        # implementations keep working until their caller opts in
+        # Streaming stays opt-in; folding additionally carries its persisted
+        # projection hash so retries can identify the exact request bytes.
         extra = {"on_text_delta": on_text_delta} if on_text_delta is not None else {}
         outgoing = context.project(messages) if context is not None else messages
-        reply = llm.complete(outgoing, tools=defs, system=sys_prompt, **extra)
+        request_hash = None
+        if context is not None:
+            request_hash = context.record_request(outgoing)
+        reply = llm.complete(
+            outgoing,
+            tools=defs,
+            system=sys_prompt,
+            **extra,
+            **(
+                {"projection_hash": request_hash}
+                if request_hash is not None
+                else {}
+            ),
+        )
         messages.append(reply)
         if context is not None:
             context.sync(messages, tools)

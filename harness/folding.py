@@ -47,7 +47,8 @@ _INSTRUCTION_NOTE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 _IMPERATIVE_NOTE = re.compile(
-    r"^\s*(?:please\s+)?(?:always\s+|never\s+)?(?:answer|call|change|delete|"
+    r"(?:^|[.!?;:]\s+)(?:please\s+)?(?:always\s+|never\s+)?"
+    r"(?:answer|call|change|delete|"
     r"download|execute|ignore|open|remove|replace|return|send|upload|"
     r"(?:install|read|run|write)(?!\s+(?:completed|confirmed|failed|found|returned|"
     r"showed|succeeded)\b))\b|\b(?:you|the agent|the assistant)\s+"
@@ -66,6 +67,7 @@ _SECRET_PATTERNS = (
     ),
 )
 _REDACTION_MARKER = "[redacted — credential detected in tool output]"
+_SCHEMA_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -146,6 +148,7 @@ CREATE TABLE IF NOT EXISTS projections (
     projection_id    INTEGER PRIMARY KEY AUTOINCREMENT,
     projection_hash  TEXT NOT NULL,
     parent_hash      TEXT,
+    kind             TEXT NOT NULL,
     turn             INTEGER NOT NULL,
     tokens_est       INTEGER NOT NULL
 );
@@ -153,6 +156,10 @@ CREATE TABLE IF NOT EXISTS projections (
 CREATE TABLE IF NOT EXISTS session_config (
     session_id   TEXT PRIMARY KEY,
     config_json  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS schema_meta (
+    version  INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS pins (
@@ -253,10 +260,39 @@ class FoldingContext:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(self.path)
         self._db.row_factory = sqlite3.Row
+        self._db.execute("PRAGMA secure_delete = ON")
+        tables = {
+            row["name"]
+            for row in self._db.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND name NOT LIKE 'sqlite_%'"
+            ).fetchall()
+        }
+        if tables and "schema_meta" not in tables:
+            self._db.close()
+            raise FoldError(
+                "folding ledger schema is incompatible; start a new session "
+                "or migrate the ledger explicitly"
+            )
+        if "schema_meta" in tables:
+            version = self._db.execute(
+                "SELECT version FROM schema_meta LIMIT 1"
+            ).fetchone()
+            if version is None or version["version"] != _SCHEMA_VERSION:
+                self._db.close()
+                raise FoldError(
+                    "folding ledger schema version is incompatible with this harness"
+                )
         self._db.executescript(_SCHEMA)
+        if "schema_meta" not in tables:
+            self._db.execute(
+                "INSERT INTO schema_meta(version) VALUES (?)", (_SCHEMA_VERSION,)
+            )
+            self._db.commit()
         snapshot = _canonical(
             {
                 "harness_version": "0.1.0",
+                "schema_version": _SCHEMA_VERSION,
                 "marker_template_version": 2,
                 "token_estimator_version": "o200k_base-v1",
                 "tier1_ruleset_hash": _sha(
@@ -284,6 +320,11 @@ class FoldingContext:
         self._active_ids: list[str] = []
         self._snapshots: list[str] = []
         self._shadow_ref: list[dict] | None = None
+        self._purge_paths: set[Path] = set()
+        if self.session_log_path is not None:
+            self._purge_paths.add(self.session_log_path)
+        if self.decision_log_path is not None:
+            self._purge_paths.add(self.decision_log_path)
         self._event_seq = 0
         self._current_notices: list[str] = []
         self._turn_start_length = 0
@@ -956,6 +997,10 @@ class FoldingContext:
         ).fetchall()
         return [json.loads(row["message_json"]) for row in rows]
 
+    def register_purge_path(self, path: Path) -> None:
+        """Register a local JSONL artifact that may mirror foldable payloads."""
+        self._purge_paths.add(Path(path))
+
     def pin(self, span_id: str) -> str:
         entry = self._db.execute(
             "SELECT 1 FROM entries WHERE span_id = ? AND session_id = ? AND active = 1",
@@ -970,6 +1015,29 @@ class FoldingContext:
             )
         self._event("user_pin", span=span_id, decider="user")
         return f"pinned {span_id}; automatic and agent folds are disabled"
+
+    def _overlapping_pin(self, span_id: str) -> str | None:
+        current: str | None = span_id
+        while current is not None:
+            pinned = self._db.execute(
+                "SELECT 1 FROM pins WHERE span_id = ?", (current,)
+            ).fetchone()
+            if pinned is not None:
+                return current
+            entry = self._db.execute(
+                "SELECT parent_id FROM entries WHERE span_id = ? AND active = 1",
+                (current,),
+            ).fetchone()
+            current = entry["parent_id"] if entry is not None else None
+        descendant = self._db.execute(
+            "WITH RECURSIVE descendants(span_id) AS ("
+            "SELECT span_id FROM entries WHERE parent_id = ? AND active = 1 "
+            "UNION ALL SELECT e.span_id FROM entries e "
+            "JOIN descendants d ON e.parent_id = d.span_id WHERE e.active = 1"
+            ") SELECT p.span_id FROM pins p JOIN descendants d USING(span_id) LIMIT 1",
+            (span_id,),
+        ).fetchone()
+        return descendant["span_id"] if descendant is not None else None
 
     def delete(self, span_id: str) -> str:
         entry = self._db.execute(
@@ -1012,46 +1080,109 @@ class FoldingContext:
                     (candidate, self.turn, self.turn),
                 )
             self._rewrite_message_for_purge(target, "[deleted by user]")
+            self._scrub_sqlite(erased, "[deleted by user]")
+        # secure_delete overwrites changed cells; VACUUM also eliminates free
+        # pages that could retain a pre-purge copy after variable-size updates.
+        self._db.execute("VACUUM")
         self._event("user_delete", span=target, decider="user")
         return f"deleted {target}; content is no longer recoverable"
+
+    @staticmethod
+    def _scrub_value(value: object, erased: list[str], marker: str) -> object:
+        if isinstance(value, dict):
+            return {
+                key: FoldingContext._scrub_value(item, erased, marker)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [FoldingContext._scrub_value(item, erased, marker) for item in value]
+        if not isinstance(value, str):
+            return value
+        stripped = value.strip()
+        if stripped.startswith(("{", "[")):
+            try:
+                nested = json.loads(value)
+            except json.JSONDecodeError:
+                pass
+            else:
+                cleaned_nested = FoldingContext._scrub_value(
+                    nested, erased, marker
+                )
+                return value if cleaned_nested == nested else _canonical(cleaned_nested)
+        cleaned = value
+        for content in erased:
+            if content:
+                cleaned = cleaned.replace(content, marker)
+        return cleaned
+
+    @classmethod
+    def _scrub_text(
+        cls, value: str, erased: list[str], marker: str, *, encoded_json: bool
+    ) -> str:
+        if encoded_json:
+            try:
+                decoded = json.loads(value)
+            except json.JSONDecodeError:
+                pass
+            else:
+                cleaned_decoded = cls._scrub_value(decoded, erased, marker)
+                return (
+                    value
+                    if cleaned_decoded == decoded
+                    else _canonical(cleaned_decoded)
+                )
+        return str(cls._scrub_value(value, erased, marker))
+
+    def _scrub_sqlite(self, erased: list[str], marker: str) -> None:
+        columns = (
+            ("entries", "meta_json", True),
+            ("folds", "note", False),
+            ("messages", "message_json", True),
+            ("tool_calls", "args_json", True),
+            ("notices", "content", False),
+        )
+        for table, column, encoded_json in columns:
+            rows = self._db.execute(
+                f"SELECT rowid AS scrub_rowid, {column} AS value FROM {table} "
+                f"WHERE {column} IS NOT NULL"
+            ).fetchall()
+            for row in rows:
+                cleaned = self._scrub_text(
+                    row["value"], erased, marker, encoded_json=encoded_json
+                )
+                if cleaned != row["value"]:
+                    self._db.execute(
+                        f"UPDATE {table} SET {column} = ? WHERE rowid = ?",
+                        (cleaned, row["scrub_rowid"]),
+                    )
 
     def _purge_session_log(
         self, erased: list[str], marker: str = "[deleted by user]"
     ) -> None:
-        path = self.session_log_path
-        if path is None or not path.exists() or not erased:
+        if not erased:
             return
 
         def scrub(value: object) -> object:
-            if isinstance(value, dict):
-                return {key: scrub(item) for key, item in value.items()}
-            if isinstance(value, list):
-                return [scrub(item) for item in value]
-            if not isinstance(value, str):
-                return value
-            if value in erased:
-                return marker
-            cleaned = value
-            for content in erased:
-                if len(content) >= 20:
-                    cleaned = cleaned.replace(content, marker)
-            return cleaned
+            return self._scrub_value(value, erased, marker)
 
-        try:
-            lines = path.read_text().splitlines()
-            rendered: list[str] = []
-            for line in lines:
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    rendered.append(line)
-                    continue
-                rendered.append(json.dumps(scrub(event), ensure_ascii=False))
-            temporary = path.with_suffix(path.suffix + ".purge.tmp")
-            temporary.write_text("\n".join(rendered) + ("\n" if rendered else ""))
-            os.replace(temporary, path)
-        except OSError as error:
-            raise FoldError(f"could not purge external session log: {error}") from error
+        for path in self._purge_paths:
+            if not path.exists():
+                continue
+            try:
+                lines = path.read_text().splitlines()
+                rendered: list[str] = []
+                for line in lines:
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        rendered.append(line)
+                        continue
+                    rendered.append(json.dumps(scrub(event), ensure_ascii=False))
+                temporary = path.with_suffix(path.suffix + ".purge.tmp")
+                temporary.write_text("\n".join(rendered) + ("\n" if rendered else ""))
+                os.replace(temporary, path)
+            except OSError as error:
+                raise FoldError(f"could not purge external artifact {path}: {error}") from error
 
     def _rewrite_message_for_purge(self, span_id: str, marker: str) -> None:
         message_id = span_id.split(".", 1)[0]
@@ -1216,14 +1347,18 @@ class FoldingContext:
         ).fetchone()
         if entry is None:
             raise self._unknown_span(span_id)
-        pinned = self._db.execute(
-            "SELECT 1 FROM pins WHERE span_id = ?",
-            (span_id,),
-        ).fetchone()
+        pinned = self._overlapping_pin(span_id)
         if pinned is not None:
-            raise FoldError(f"{span_id} is pinned and cannot be folded")
+            raise FoldError(f"{span_id} overlaps pinned span {pinned} and cannot be folded")
         if reason not in AGENT_REASONS:
             raise FoldError(f"invalid fold reason {reason!r}")
+        if reason == "poisoned" and entry["origin"] == "assistant":
+            for related in self._assistant_exchange_spans(span_id):
+                pinned = self._overlapping_pin(related)
+                if pinned is not None:
+                    raise FoldError(
+                        f"{span_id} poison cascade overlaps pinned span {pinned}"
+                    )
         if decider == "agent":
             self._validate_note(note)
         elif not note:
@@ -1324,21 +1459,8 @@ class FoldingContext:
             count = cursor.rowcount
             if count:
                 projection = self.reconstruct()
-                projection_hash = _sha(_canonical(projection))
-                parent = self._db.execute(
-                    "SELECT projection_hash FROM projections "
-                    "ORDER BY projection_id DESC LIMIT 1"
-                ).fetchone()
-                parent_hash = parent["projection_hash"] if parent is not None else None
-                self._db.execute(
-                    "INSERT INTO projections(projection_hash, parent_hash, turn, tokens_est) "
-                    "VALUES (?, ?, ?, ?)",
-                    (
-                        projection_hash,
-                        parent_hash,
-                        self.turn,
-                        estimate_tokens(projection),
-                    ),
+                projection_hash, parent_hash = self._record_projection(
+                    projection, kind="checkpoint"
                 )
         if count:
             open_row = self._db.execute(
@@ -1377,10 +1499,44 @@ class FoldingContext:
 
     def projection_chain(self) -> list[dict]:
         rows = self._db.execute(
-            "SELECT projection_hash, parent_hash, turn, tokens_est "
+            "SELECT projection_hash, parent_hash, kind, turn, tokens_est "
             "FROM projections ORDER BY projection_id"
         ).fetchall()
         return [dict(row) for row in rows]
+
+    def _record_projection(
+        self, messages: list[dict], *, kind: str
+    ) -> tuple[str, str | None]:
+        projection_hash = _sha(_canonical(messages))
+        parent = self._db.execute(
+            "SELECT projection_hash FROM projections ORDER BY projection_id DESC LIMIT 1"
+        ).fetchone()
+        parent_hash = parent["projection_hash"] if parent is not None else None
+        self._db.execute(
+            "INSERT INTO projections(projection_hash, parent_hash, kind, turn, "
+            "tokens_est) VALUES (?, ?, ?, ?, ?)",
+            (
+                projection_hash,
+                parent_hash,
+                kind,
+                self.turn,
+                estimate_tokens(messages),
+            ),
+        )
+        return projection_hash, parent_hash
+
+    def record_request(self, messages: list[dict]) -> str:
+        """Persist the hash of the exact array about to cross the LLM seam."""
+        with self._db:
+            projection_hash, parent_hash = self._record_projection(
+                messages, kind="request"
+            )
+        self._event(
+            "request_dispatch",
+            projection_hash=projection_hash,
+            parent_hash=parent_hash,
+        )
+        return projection_hash
 
     def unfold(self, span_id: str, decider: str = "agent") -> str:
         entry = self._db.execute(

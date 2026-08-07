@@ -735,6 +735,34 @@ def test_user_delete_scrubs_the_external_session_log_when_mounted(tmp_path):
     assert SessionLog(session_path).load()[2]["content"] == "[deleted by user]"
 
 
+@pytest.mark.parametrize("payload", ["true", "error", "done"])
+def test_user_delete_preserves_unrelated_prose_containing_common_payloads(
+    tmp_path, payload
+):
+    # Regression caught: broad lexical deletion rewrites unrelated messages
+    # which happen to use the same common word as a deleted result.
+    messages = [
+        {"role": "system", "content": f"keep the {payload} branch intact"},
+        *tool_exchange("noop", {}, payload),
+        {"role": "user", "content": f"the word {payload} here is unrelated"},
+    ]
+    context = FoldingContext(
+        tmp_path / "folds.sqlite3",
+        "session",
+        config=FoldConfig(min_span_tokens=0),
+    )
+    context.sync(messages, {"noop": noop_tool()})
+    system_before = deepcopy(messages[0])
+    user_before = deepcopy(messages[-1])
+
+    context.delete("m3.r0")
+
+    assert messages[0] == system_before
+    assert messages[-1] == user_before
+    assert context.state("m3.r0") == "purged"
+    assert context.project(messages)[3]["content"] == "[deleted by user]"
+
+
 def test_incompatible_legacy_schema_fails_with_an_explicit_version_error(tmp_path):
     path = tmp_path / "legacy.sqlite3"
     database = sqlite3.connect(path)
@@ -833,7 +861,7 @@ def test_user_delete_of_short_payload_preserves_message_structure(tmp_path):
     assert context.project(messages)[2]["content"] == "[deleted by user]"
 
 
-def test_user_delete_scrubs_payload_split_across_duplicate_chunks(tmp_path):
+def test_user_delete_preserves_unrelated_result_with_payload_across_chunks(tmp_path):
     payload = "XYZ12345"
     messages = tool_exchange("first", {}, payload)
     messages.extend(
@@ -860,9 +888,9 @@ def test_user_delete_scrubs_payload_split_across_duplicate_chunks(tmp_path):
     child_copy = "".join(
         context.content(span_id) or "" for span_id in context.child_ids("m5.r0")
     )
-    assert parent == "prefix [deleted by user] suffix"
+    assert parent == "prefix XYZ12345 suffix"
     assert child_copy == parent
-    assert payload not in child_copy
+    assert messages[5]["content"] == "prefix XYZ12345 suffix"
 
 
 def test_user_delete_does_not_reconcile_tool_inputs_as_result_chunks(tmp_path):
@@ -894,7 +922,7 @@ def test_user_delete_does_not_reconcile_tool_inputs_as_result_chunks(tmp_path):
     assert retained in context._entry("m1.i0")["meta_json"]
 
 
-def test_user_delete_reconciles_inactive_crash_tail_chunks(tmp_path):
+def test_user_delete_preserves_unrelated_inactive_crash_tail_chunks(tmp_path):
     payload = "XYZ12345"
     completed = tool_exchange("first", {}, payload) + [
         {"role": "assistant", "content": "done"}
@@ -922,10 +950,36 @@ def test_user_delete_reconciles_inactive_crash_tail_chunks(tmp_path):
         "SELECT content, active FROM entries WHERE parent_id = 'm6.r0' ORDER BY rowid"
     ).fetchall()
     child_copy = "".join(child["content"] or "" for child in children)
-    assert context.content("m6.r0") == "prefix [deleted by user] suffix"
+    assert context.content("m6.r0") == "prefix XYZ12345 suffix"
     assert child_copy == context.content("m6.r0")
-    assert payload not in child_copy
+    assert payload in child_copy
     assert all(child["active"] == 0 for child in children)
+
+
+def test_user_delete_purges_an_inactive_exact_duplicate_and_its_chunks(tmp_path):
+    payload = "alpha beta gamma delta epsilon zeta"
+    completed = tool_exchange("first", {}, payload) + [
+        {"role": "assistant", "content": "done"}
+    ]
+    crashed = completed + tool_exchange("second", {}, payload, call_id="call_1")
+    context = FoldingContext(
+        tmp_path / "folds.sqlite3",
+        "session",
+        config=FoldConfig(min_span_tokens=0, chunk_tokens=3),
+    )
+    tools = {"first": noop_tool(name="first"), "second": noop_tool(name="second")}
+    context.sync(crashed, tools)
+    context.sync(completed, {"first": tools["first"]})
+
+    context.delete("m2.r0")
+
+    children = context._db.execute(
+        "SELECT e.content, e.active, s.state FROM entries e "
+        "JOIN span_state s USING(span_id) WHERE e.parent_id = 'm6.r0' ORDER BY e.rowid"
+    ).fetchall()
+    assert context.state("m6.r0") == "purged"
+    assert all(child["content"] is None for child in children)
+    assert all(child["state"] == "purged" and child["active"] == 0 for child in children)
 
 
 def test_user_delete_reconciles_an_exact_duplicate_result_chunk(tmp_path):
@@ -958,7 +1012,7 @@ def test_user_delete_reconciles_an_exact_duplicate_result_chunk(tmp_path):
     assert context.project(messages)[5]["content"].count("[deleted by user]") == 1
 
 
-def test_resume_restores_every_scrubbed_message_before_sync(tmp_path):
+def test_resume_restores_only_provenance_targeted_messages_before_sync(tmp_path):
     payload = "XYZ12345"
     messages = tool_exchange("first", {}, payload)
     messages.extend(
@@ -987,9 +1041,9 @@ def test_resume_restores_every_scrubbed_message_before_sync(tmp_path):
     )
     assert resumed.span_ids() == original_ids
     assert resumed.state("m2.r0") == "purged"
-    assert resumed.content("m5.r0") == "prefix [deleted by user] suffix"
+    assert resumed.content("m5.r0") == "prefix XYZ12345 suffix"
     assert child_copy == resumed.content("m5.r0")
-    assert payload not in json.dumps(pre_delete)
+    assert pre_delete[5]["content"] == "prefix XYZ12345 suffix"
 
 
 def test_resume_ignores_a_crash_tail_without_reusing_its_ids(tmp_path):

@@ -2282,14 +2282,27 @@ class FoldingContext:
                         continue
                     if operation["kind"] == "indexed_content":
                         content = message.get("content")
+                        target = content
+                        header = ""
+                        separator = ""
+                        if source.startswith("span:"):
+                            if not isinstance(content, str):
+                                continue
+                            header, separator, target = content.partition("\n")
+                            if not separator:
+                                continue
                         cleaned = self._scrub_data(
-                            content,
+                            target,
                             [str(operation["payload"])],
                             marker,
                             replace_substrings=True,
                         )
-                        if cleaned != content:
-                            message["content"] = cleaned
+                        if cleaned != target:
+                            message["content"] = (
+                                f"{header}{separator}{cleaned}"
+                                if separator
+                                else cleaned
+                            )
                             changed = True
                         continue
                     if operation["kind"] in {"content", "result"}:

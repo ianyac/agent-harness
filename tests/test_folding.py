@@ -2009,6 +2009,114 @@ def test_user_delete_redacts_indexed_child_alias_in_stored_unfolded_tail(tmp_pat
     assert payload not in json.dumps(resumed.reconstruct_projection(projection_id))
 
 
+@pytest.mark.parametrize(("payload", "chunk_tokens"), [("turn", 1), ("m5", 2)])
+def test_user_delete_scopes_indexed_child_tail_redaction_to_body(
+    tmp_path, payload, chunk_tokens
+):
+    # Regression caught: common payload text can also occur in a synthetic
+    # tail's generated header, which is not provenance-owned result data.
+    marker = "[deleted by user]"
+    path = tmp_path / "folds.sqlite3"
+    messages = tool_exchange("first", {}, payload)
+    messages.extend(
+        tool_exchange(
+            "second",
+            {},
+            f"prefix\n{payload}\nsuffix\n",
+            call_id="call_1",
+        )
+    )
+    messages[3]["content"] = f"unrelated {payload} prose remains"
+    config = FoldConfig(min_span_tokens=0, chunk_tokens=chunk_tokens)
+    context = FoldingContext(path, "session", config=config)
+    context.sync(
+        messages,
+        {"first": noop_tool(name="first"), "second": noop_tool(name="second")},
+    )
+    child_id = next(
+        span_id
+        for span_id in context.child_ids("m5.r0")
+        if context.content(span_id) == payload
+    )
+    context.fold(child_id, "finished", rich_note())
+    context.checkpoint()
+    context.unfold(child_id)
+    context.record_request(context.project(messages))
+    before = context.projection_chain()[-1]
+    stored = context._db.execute(
+        "SELECT projection_json, source_ids_json FROM projections "
+        "WHERE projection_id = ?",
+        (before["projection_id"],),
+    ).fetchone()
+    sources_before = json.loads(stored["source_ids_json"])
+    tail_index = sources_before.index(f"span:{child_id}")
+    before_tail = json.loads(stored["projection_json"])[tail_index]["content"]
+    before_header, separator, before_body = before_tail.partition("\n")
+    assert separator == "\n"
+    assert payload in before_header
+    assert payload in before_body
+
+    # A source claiming to be a synthetic span but lacking the body separator
+    # cannot safely be widened into a whole-content replacement.
+    malformed = [
+        {
+            "role": "user",
+            "content": f"[unfolded {child_id}, originally from {payload}]",
+        }
+    ]
+    malformed_json = json.dumps(
+        malformed, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    context._last_projection_sources = (
+        hashlib.sha256(malformed_json.encode()).hexdigest(),
+        [f"span:{child_id}"],
+    )
+    context.record_request(malformed)
+    malformed_before = context.projection_chain()[-1]
+
+    context.delete("m2.r0")
+
+    chain = {row["projection_id"]: row for row in context.projection_chain()}
+    after = chain[before["projection_id"]]
+    historical = context.reconstruct_projection(after["projection_id"])
+    after_header, after_separator, after_body = historical[tail_index][
+        "content"
+    ].partition("\n")
+    assert after_separator == "\n"
+    assert after_header == before_header
+    assert after_body == before_body.replace(payload, marker)
+    assert payload not in after_body
+    assert "prefix" in historical[5]["content"]
+    assert "suffix" in historical[5]["content"]
+    assert historical[3] == {
+        "role": "user",
+        "content": f"unrelated {payload} prose remains",
+    }
+    assert messages[5]["content"] == f"prefix\n{marker}\nsuffix\n"
+    assert context.content("m5.r0") == f"prefix\n{marker}\nsuffix\n"
+    stored_after = context._db.execute(
+        "SELECT projection_json, source_ids_json FROM projections "
+        "WHERE projection_id = ?",
+        (after["projection_id"],),
+    ).fetchone()
+    assert json.loads(stored_after["source_ids_json"]) == sources_before
+    stored_tail = json.loads(stored_after["projection_json"])[tail_index]["content"]
+    assert stored_tail.partition("\n")[2] == after_body
+    assert after["projection_hash"] == before["projection_hash"]
+    assert after["parent_hash"] == before["parent_hash"]
+    assert after["redacted"] is True
+    malformed_after = chain[malformed_before["projection_id"]]
+    assert context.reconstruct_projection(malformed_after["projection_id"]) == malformed
+    assert malformed_after["redacted"] is False
+    projection_id = after["projection_id"]
+    malformed_id = malformed_after["projection_id"]
+    context.close()
+
+    resumed = FoldingContext(path, "session", config=config)
+    assert resumed.reconstruct_projection(projection_id) == historical
+    assert resumed.reconstruct_projection(malformed_id) == malformed
+
+
 def test_user_delete_scrubs_only_matching_in_memory_notices(tmp_path):
     context, _messages = context_with_result(tmp_path, "delete me permanently")
     notice = context._db.execute(

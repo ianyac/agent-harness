@@ -2117,6 +2117,188 @@ def test_user_delete_scopes_indexed_child_tail_redaction_to_body(
     assert resumed.reconstruct_projection(malformed_id) == malformed
 
 
+@pytest.mark.parametrize(("payload", "chunk_tokens"), [("turn", 1), ("m5", 2)])
+def test_user_delete_targets_only_exact_blocks_in_stored_rendered_result(
+    tmp_path, payload, chunk_tokens
+):
+    # Regression caught: an ordinary message source contains generated span
+    # headers and sibling bodies, none of which belong to an exact child alias.
+    marker = "[deleted by user]"
+    path = tmp_path / "folds.sqlite3"
+    messages = tool_exchange("first", {}, payload)
+    messages.extend(
+        tool_exchange(
+            "second",
+            {},
+            f"prefix {payload} stays\n{payload}\n{payload}",
+            call_id="call_1",
+        )
+    )
+    messages[3]["content"] = f"unrelated {payload} prose remains"
+    config = FoldConfig(min_span_tokens=0, chunk_tokens=chunk_tokens)
+    context = FoldingContext(path, "session", config=config)
+    context.sync(
+        messages,
+        {"first": noop_tool(name="first"), "second": noop_tool(name="second")},
+    )
+    target_ids = [
+        span_id
+        for span_id in context.child_ids("m5.r0")
+        if context.content(span_id) == payload
+    ]
+    assert len(target_ids) == 2
+    context.record_request(context.project(messages))
+    before = context.projection_chain()[-1]
+    stored = context._db.execute(
+        "SELECT projection_json, source_ids_json FROM projections "
+        "WHERE projection_id = ?",
+        (before["projection_id"],),
+    ).fetchone()
+    sources_before = json.loads(stored["source_ids_json"])
+    message_index = sources_before.index("message:m5")
+    before_rendered = json.loads(stored["projection_json"])[message_index]["content"]
+    headers_before = [
+        line
+        for line in before_rendered.splitlines()
+        if " · ~" in line and line.endswith(" tok]")
+    ]
+
+    def rendered_blocks(content: str) -> dict[str, str]:
+        lines = content.splitlines(keepends=True)
+        positions = [
+            (index, line.removesuffix("\n"))
+            for index, line in enumerate(lines)
+            if " · ~" in line and line.removesuffix("\n").endswith(" tok]")
+        ]
+        return {
+            header: "".join(
+                lines[
+                    index + 1 : positions[position + 1][0]
+                    if position + 1 < len(positions)
+                    else len(lines)
+                ]
+            )
+            for position, (index, header) in enumerate(positions)
+        }
+
+    blocks_before = rendered_blocks(before_rendered)
+    expected = before_rendered
+    target_headers: set[str] = set()
+    for target_id in target_ids:
+        target_header = next(
+            line for line in headers_before if line.startswith(f"[{target_id} · ~")
+        )
+        target_headers.add(target_header)
+        expected = expected.replace(
+            f"{target_header}\n{payload}",
+            f"{target_header}\n{marker}",
+            1,
+        )
+
+    context.delete("m2.r0")
+
+    after = context.projection_chain()[-1]
+    historical = context.reconstruct_projection(after["projection_id"])
+    after_rendered = historical[message_index]["content"]
+    headers_after = [
+        line
+        for line in after_rendered.splitlines()
+        if " · ~" in line and line.endswith(" tok]")
+    ]
+    assert headers_after == headers_before
+    assert after_rendered == expected
+    blocks_after = rendered_blocks(after_rendered)
+    for header, before_body in blocks_before.items():
+        if header in target_headers:
+            assert blocks_after[header] == before_body.replace(payload, marker)
+        else:
+            assert blocks_after[header] == before_body
+    assert after_rendered.count(marker) == len(target_ids)
+    assert historical[3] == {
+        "role": "user",
+        "content": f"unrelated {payload} prose remains",
+    }
+    stored_after = context._db.execute(
+        "SELECT projection_json, source_ids_json FROM projections "
+        "WHERE projection_id = ?",
+        (after["projection_id"],),
+    ).fetchone()
+    assert json.loads(stored_after["source_ids_json"]) == sources_before
+    assert json.loads(stored_after["projection_json"])[message_index] == historical[
+        message_index
+    ]
+    assert after["projection_hash"] == before["projection_hash"]
+    assert after["parent_hash"] == before["parent_hash"]
+    assert after["redacted"] is True
+    projection_id = after["projection_id"]
+    context.close()
+
+    resumed = FoldingContext(path, "session", config=config)
+    assert resumed.reconstruct_projection(projection_id) == historical
+
+
+def test_user_delete_scopes_rendered_root_body_and_skips_malformed_layout(tmp_path):
+    # Regression caught: a no-child root has one target body, while a render
+    # without the deterministic header/body separator is unsafe to interpret.
+    payload = "m5"
+    marker = "[deleted by user]"
+    messages = tool_exchange("first", {}, payload)
+    messages.extend(
+        tool_exchange(
+            "second",
+            {},
+            f"prefix\n{payload}\nsuffix\n",
+            call_id="call_1",
+        )
+    )
+    config = FoldConfig(min_span_tokens=0, chunk_tokens=2)
+    context = FoldingContext(tmp_path / "folds.sqlite3", "session", config=config)
+    context.sync(
+        messages,
+        {"first": noop_tool(name="first"), "second": noop_tool(name="second")},
+    )
+
+    def record_with_owner(content: str) -> dict:
+        projection = [{"role": "tool", "tool_call_id": "call_1", "content": content}]
+        projection_json = json.dumps(
+            projection, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        context._last_projection_sources = (
+            hashlib.sha256(projection_json.encode()).hexdigest(),
+            ["message:m5"],
+        )
+        context.record_request(projection)
+        return context.projection_chain()[-1]
+
+    root_content = f"[m5.r0 · ~1 tok]\n{payload}"
+    root_before = record_with_owner(root_content)
+    malformed_content = f"[m5.r0 · ~1 tok] {payload}"
+    malformed_before = record_with_owner(malformed_content)
+    ambiguous_content = f"[m5.r0 · ~1 tok]\n{payload}\n[not a rendered block]"
+    ambiguous_before = record_with_owner(ambiguous_content)
+
+    context.delete("m2.r0")
+
+    chain = {row["projection_id"]: row for row in context.projection_chain()}
+    root_after = chain[root_before["projection_id"]]
+    assert context.reconstruct_projection(root_after["projection_id"])[0]["content"] == (
+        f"[m5.r0 · ~1 tok]\n{marker}"
+    )
+    assert root_after["projection_hash"] == root_before["projection_hash"]
+    assert root_after["parent_hash"] == root_before["parent_hash"]
+    assert root_after["redacted"] is True
+    malformed_after = chain[malformed_before["projection_id"]]
+    assert context.reconstruct_projection(malformed_after["projection_id"])[0][
+        "content"
+    ] == malformed_content
+    assert malformed_after["redacted"] is False
+    ambiguous_after = chain[ambiguous_before["projection_id"]]
+    assert context.reconstruct_projection(ambiguous_after["projection_id"])[0][
+        "content"
+    ] == ambiguous_content
+    assert ambiguous_after["redacted"] is False
+
+
 def test_user_delete_scrubs_only_matching_in_memory_notices(tmp_path):
     context, _messages = context_with_result(tmp_path, "delete me permanently")
     notice = context._db.execute(

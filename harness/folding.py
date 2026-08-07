@@ -1147,6 +1147,9 @@ class FoldingContext:
         span_ids, _owner_ids = self._user_delete_aliases(target)
         indexed_parents = self._user_delete_indexed_parents(payload) - span_ids
         indexed_span_ids = indexed_parents | self._user_delete_descendants(indexed_parents)
+        indexed_target_ids = indexed_parents | self._user_delete_indexed_children(
+            indexed_parents, payload
+        )
         indexed_owner_ids = {span_id.split(".", 1)[0] for span_id in indexed_parents}
         input_aliases = self._user_delete_input_aliases(span_ids)
         metadata_span_ids = (
@@ -1173,6 +1176,7 @@ class FoldingContext:
                 root_owner_ids,
                 indexed_owner_ids,
                 indexed_span_ids,
+                indexed_target_ids,
                 input_aliases,
                 payload,
             )
@@ -1228,6 +1232,7 @@ class FoldingContext:
         root_owner_ids: set[str],
         indexed_owner_ids: set[str],
         indexed_span_ids: set[str],
+        indexed_target_ids: set[str],
         input_aliases: list[dict[str, str]],
         payload: str,
     ) -> dict[str, list[dict[str, object]]]:
@@ -1239,13 +1244,33 @@ class FoldingContext:
 
         for owner_id in root_owner_ids:
             add(owner_id, {"kind": "content", "marker": marker})
-        for source_id in indexed_owner_ids | indexed_span_ids:
+        for owner_id in indexed_owner_ids:
+            add(
+                owner_id,
+                {
+                    "kind": "indexed_content",
+                    "marker": marker,
+                    "payload": payload,
+                    "target_span_ids": sorted(
+                        span_id
+                        for span_id in indexed_target_ids
+                        if span_id.split(".", 1)[0] == owner_id
+                    ),
+                    "render_span_ids": sorted(
+                        span_id
+                        for span_id in indexed_span_ids
+                        if span_id.split(".", 1)[0] == owner_id
+                    ),
+                },
+            )
+        for source_id in indexed_target_ids:
             add(
                 source_id,
                 {
                     "kind": "indexed_content",
                     "marker": marker,
                     "payload": payload,
+                    "target_span_ids": [source_id],
                 },
             )
         for span_id in span_ids:
@@ -1338,6 +1363,19 @@ class FoldingContext:
             (self.session_id, payload),
         ).fetchall()
         return {str(row["parent_id"]) for row in rows}
+
+    def _user_delete_indexed_children(
+        self, parent_ids: set[str], payload: str
+    ) -> set[str]:
+        if not parent_ids:
+            return set()
+        placeholders = ",".join("?" for _ in parent_ids)
+        rows = self._db.execute(
+            f"SELECT span_id FROM entries WHERE parent_id IN ({placeholders}) "
+            "AND content = ?",
+            [*parent_ids, payload],
+        ).fetchall()
+        return {str(row["span_id"]) for row in rows}
 
     def _user_delete_input_aliases(self, span_ids: set[str]) -> list[dict[str, str]]:
         if not span_ids:
@@ -2238,6 +2276,60 @@ class FoldingContext:
                     (_canonical(cleaned), row["projection_id"]),
                 )
 
+    @staticmethod
+    def _redact_rendered_result_bodies(
+        content: str,
+        target_span_ids: list[str],
+        render_span_ids: list[str],
+        payload: str,
+        marker: str,
+    ) -> str:
+        headers: dict[str, list[int]] = {
+            span_id: [] for span_id in target_span_ids
+        }
+        offset = 0
+        for line in content.splitlines(keepends=True):
+            header = line.removesuffix("\n")
+            for span_id in headers:
+                if header.startswith(f"[{span_id} · ~") and header.endswith(" tok]"):
+                    headers[span_id].append(offset + len(line))
+            offset += len(line)
+
+        replacements: list[tuple[int, int]] = []
+        for body_offsets in headers.values():
+            if len(body_offsets) != 1:
+                continue
+            start = body_offsets[0]
+            if not content.startswith(payload, start):
+                continue
+            end = start + len(payload)
+            if end != len(content):
+                if not content.startswith("\n", end):
+                    continue
+                next_line = content[end + 1 :].partition("\n")[0]
+                generated = next_line in {
+                    marker,
+                    _REDACTION_MARKER,
+                } or next_line.startswith("[dup of ")
+                for span_id in render_span_ids:
+                    generated = generated or (
+                        next_line.startswith(f"[{span_id} · ~")
+                        and next_line.endswith(" tok]")
+                    )
+                    generated = generated or next_line.startswith(
+                        (
+                            f"[folded {span_id},",
+                            f"[unfolded {span_id} →",
+                            f"[removed {span_id} —",
+                        )
+                    )
+                if not generated:
+                    continue
+            replacements.append((start, end))
+        for start, end in sorted(replacements, reverse=True):
+            content = f"{content[:start]}{marker}{content[end:]}"
+        return content
+
     def _redact_user_projections(
         self, operations: dict[str, list[dict[str, object]]]
     ) -> None:
@@ -2282,27 +2374,36 @@ class FoldingContext:
                         continue
                     if operation["kind"] == "indexed_content":
                         content = message.get("content")
-                        target = content
-                        header = ""
-                        separator = ""
                         if source.startswith("span:"):
                             if not isinstance(content, str):
                                 continue
                             header, separator, target = content.partition("\n")
                             if not separator:
                                 continue
-                        cleaned = self._scrub_data(
-                            target,
-                            [str(operation["payload"])],
-                            marker,
-                            replace_substrings=True,
-                        )
-                        if cleaned != target:
-                            message["content"] = (
-                                f"{header}{separator}{cleaned}"
-                                if separator
-                                else cleaned
+                            cleaned = self._scrub_data(
+                                target,
+                                [str(operation["payload"])],
+                                marker,
+                                replace_substrings=True,
                             )
+                            if cleaned == target:
+                                continue
+                            message["content"] = f"{header}{separator}{cleaned}"
+                            changed = True
+                            continue
+                        if not source.startswith("message:") or not isinstance(
+                            content, str
+                        ):
+                            continue
+                        cleaned = self._redact_rendered_result_bodies(
+                            content,
+                            [str(value) for value in operation["target_span_ids"]],
+                            [str(value) for value in operation["render_span_ids"]],
+                            str(operation["payload"]),
+                            marker,
+                        )
+                        if cleaned != content:
+                            message["content"] = cleaned
                             changed = True
                         continue
                     if operation["kind"] in {"content", "result"}:

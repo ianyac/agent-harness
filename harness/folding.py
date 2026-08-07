@@ -231,6 +231,8 @@ class FoldingContext:
         self._snapshots: list[str] = []
         self._event_seq = 0
         self._current_notices: list[str] = []
+        self._turn_start_length = 0
+        self._turn_user_id: str | None = None
         row = self._db.execute(
             "SELECT COALESCE(MAX(created_turn), 0) AS turn FROM messages "
             "WHERE session_id = ?",
@@ -299,6 +301,12 @@ class FoldingContext:
             self._active_ids.append(message_id)
             self._snapshots.append(current)
             next_order += 1
+        if (
+            self._turn_user_id is None
+            and len(messages) > self._turn_start_length
+            and messages[self._turn_start_length].get("role") == "user"
+        ):
+            self._turn_user_id = self._active_ids[self._turn_start_length]
         self._db.commit()
 
     def _ingest_message(
@@ -670,6 +678,8 @@ class FoldingContext:
 
     def begin_turn(self, messages: list[dict], tools: dict[str, Tool] | None = None) -> None:
         self.sync(messages, tools)
+        self._turn_start_length = len(messages)
+        self._turn_user_id = None
         self.turn += 1
         self._event_seq = 0
         self.checkpoint(reason="turn boundary")
@@ -692,6 +702,15 @@ class FoldingContext:
 
     def turn_notice(self) -> str:
         return "\n".join(self._current_notices)
+
+    def should_checkpoint(self, projected_tokens: int) -> bool:
+        row = self._db.execute(
+            "SELECT COALESCE(SUM(e.tokens_est), 0) AS marked FROM folds f "
+            "JOIN entries e USING(span_id) WHERE f.unfolded_turn IS NULL "
+            "AND f.placement IS NULL"
+        ).fetchone()
+        marked = int(row["marked"])
+        return marked > 0 and marked / max(projected_tokens, 1) >= self.config.checkpoint_ratio
 
     def shadow_messages(self) -> list[dict]:
         rows = self._db.execute(
@@ -929,6 +948,8 @@ class FoldingContext:
                 continue
             if role == "assistant":
                 self._project_input_payloads(message, message_id)
+            if role == "user" and message_id == self._turn_user_id and self._current_notices:
+                message["content"] = f"{self.turn_notice()}\n\n{message.get('content') or ''}"
             if role == "tool":
                 if message.get("tool_call_id") in removed_call_ids:
                     continue

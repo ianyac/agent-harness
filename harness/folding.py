@@ -1139,6 +1139,7 @@ class FoldingContext:
             ("folds", "note", False),
             ("messages", "message_json", True),
             ("tool_calls", "args_json", True),
+            ("tool_calls", "canonical_key", False),
             ("notices", "content", False),
         )
         for table, column, encoded_json in columns:

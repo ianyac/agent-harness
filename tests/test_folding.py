@@ -614,8 +614,8 @@ def test_incompatible_legacy_schema_fails_with_an_explicit_version_error(tmp_pat
         FoldingContext(path, "session")
 
 
-def test_user_delete_scrubs_short_quoted_tool_input_from_every_local_copy(tmp_path):
-    payload = 'x"\ny'
+@pytest.mark.parametrize("payload", ["SEKRET7", 'x"\ny'])
+def test_user_delete_scrubs_short_tool_input_from_every_local_copy(tmp_path, payload):
     messages = tool_exchange("write", {"content": payload}, "ok")
     tool = Tool(
         name="write",
@@ -645,11 +645,12 @@ def test_user_delete_scrubs_short_quoted_tool_input_from_every_local_copy(tmp_pa
     context.delete("m1.i0")
 
     stored = context._db.execute(  # local audit assertion across mirrored columns
-        "SELECT e.meta_json, t.args_json FROM entries e "
+        "SELECT e.meta_json, t.args_json, t.canonical_key FROM entries e "
         "JOIN tool_calls t ON t.message_id = e.parent_id WHERE e.span_id = 'm1.i0'"
     ).fetchone()
     assert payload not in stored["meta_json"]
     assert payload not in stored["args_json"]
+    assert payload not in stored["canonical_key"]
     assert payload not in actions_path.read_text()
     assert payload.encode() not in database_path.read_bytes()
 

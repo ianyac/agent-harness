@@ -919,6 +919,72 @@ def test_user_delete_of_tool_input_preserves_unrelated_metadata_fields(tmp_path)
     assert result_meta["canonical_key"] == 'write:{"content":"[deleted by user]","note":"keep true"}'
 
 
+def test_user_delete_metadata_scopes_reused_call_ids_to_their_owner_message(tmp_path):
+    messages = tool_exchange(
+        "write_content",
+        {"content": "true", "note": "first true note"},
+        "first result",
+        call_id="reused",
+    )
+    messages.extend(
+        tool_exchange(
+            "write_body",
+            {"body": "true", "note": "second true note"},
+            "second result",
+            call_id="reused",
+        )
+    )
+    content_tool = Tool(
+        name="write_content",
+        description="consume content",
+        parameters={"type": "object", "properties": {"content": {"type": "string"}}},
+        execute=lambda content: "first result",
+        foldable_inputs=("content",),
+    )
+    body_tool = Tool(
+        name="write_body",
+        description="consume body",
+        parameters={"type": "object", "properties": {"body": {"type": "string"}}},
+        execute=lambda body: "second result",
+        foldable_inputs=("body",),
+    )
+    context = FoldingContext(
+        tmp_path / "folds.sqlite3", "session", config=FoldConfig(min_span_tokens=0)
+    )
+    context.sync(messages, {"write_content": content_tool, "write_body": body_tool})
+    first_before = deepcopy(messages[1])
+    second_before = deepcopy(messages[4])
+
+    context.delete("m1.i0")
+
+    assert context.state("m1.i0") == "purged"
+    assert context.state("m4.i0") == "purged"
+    first_input = json.loads(context._entry("m1.i0")["meta_json"])
+    first_result = json.loads(context._entry("m2.r0")["meta_json"])
+    second_input = json.loads(context._entry("m4.i0")["meta_json"])
+    second_result = json.loads(context._entry("m5.r0")["meta_json"])
+    for metadata, field, note in (
+        (first_input, "content", "first true note"),
+        (first_result, "content", "first true note"),
+        (second_input, "body", "second true note"),
+        (second_result, "body", "second true note"),
+    ):
+        arguments = json.loads(metadata["args_json"])
+        assert arguments[field] == "[deleted by user]"
+        assert arguments["note"] == note
+    assert messages[1]["tool_calls"][0]["id"] == first_before["tool_calls"][0]["id"]
+    assert messages[4]["tool_calls"][0]["id"] == second_before["tool_calls"][0]["id"]
+    assert messages[1]["content"] == first_before["content"]
+    assert messages[4]["content"] == second_before["content"]
+    result_spans = context._db.execute(
+        "SELECT message_id, result_span FROM tool_calls ORDER BY tool_call_id"
+    ).fetchall()
+    assert [(row["message_id"], row["result_span"]) for row in result_spans] == [
+        ("m1", "m2.r0"),
+        ("m4", "m5.r0"),
+    ]
+
+
 def test_user_delete_purges_duplicate_entry_and_live_shadow_copies(tmp_path):
     payload = "ERASE_DUPLICATE_77"
     messages = tool_exchange("first", {}, payload)

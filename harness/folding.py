@@ -539,7 +539,7 @@ class FoldingContext:
     ) -> None:
         call_id = message["tool_call_id"]
         call = self._db.execute(
-            "SELECT tool_name, args_json, canonical_key FROM tool_calls "
+            "SELECT tool_call_id, tool_name, args_json, canonical_key FROM tool_calls "
             "WHERE call_id = ? AND active = 1 ORDER BY tool_call_id DESC LIMIT 1",
             (call_id,),
         ).fetchone()
@@ -632,8 +632,8 @@ class FoldingContext:
                 )
         if call is not None:
             self._db.execute(
-                "UPDATE tool_calls SET result_span = ? WHERE call_id = ? AND active = 1",
-                (span_id, call_id),
+                "UPDATE tool_calls SET result_span = ? WHERE tool_call_id = ?",
+                (span_id, call["tool_call_id"]),
             )
             self._apply_heuristics(span_id, call, tool)
 
@@ -1317,13 +1317,24 @@ class FoldingContext:
             f"SELECT span_id, meta_json FROM entries WHERE span_id IN ({placeholders})",
             list(span_ids),
         ).fetchall()
+        aliases_by_span = {
+            alias["span_id"]: alias for alias in input_aliases
+        }
+        for alias in input_aliases:
+            linked = self._db.execute(
+                "SELECT result_span FROM tool_calls WHERE message_id = ? "
+                "AND call_id = ? AND result_span IS NOT NULL",
+                (alias["message_id"], alias["call_id"]),
+            ).fetchone()
+            if linked is None:
+                continue
+            result_span = str(linked["result_span"])
+            aliases_by_span[result_span] = alias
+            for descendant in self._user_delete_descendants({result_span}):
+                aliases_by_span[descendant] = alias
         for row in rows:
             metadata = json.loads(row["meta_json"])
-            call_id = metadata.get("call_id")
-            alias = next(
-                (candidate for candidate in input_aliases if candidate["call_id"] == call_id),
-                None,
-            )
+            alias = aliases_by_span.get(str(row["span_id"]))
             if alias is None:
                 continue
             try:

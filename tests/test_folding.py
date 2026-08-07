@@ -604,17 +604,22 @@ def test_post_scanner_failure_rolls_back_the_whole_sync_transaction(tmp_path):
     path = tmp_path / "folds.sqlite3"
 
     class FailingAfterScannerContext(FoldingContext):
+        fail_after_scanner = True
+
         def _event(self, event: str, **fields: object) -> None:
-            if event == "scanner_hit":
+            if event == "scanner_hit" and self.fail_after_scanner:
+                self.fail_after_scanner = False
                 raise RuntimeError("forced post-scanner failure")
             super()._event(event, **fields)
 
     context = FailingAfterScannerContext(path, "session")
     messages = tool_exchange("leak", {}, f"diagnostic {secret}")
+    before = deepcopy(messages)
 
     with pytest.raises(RuntimeError, match="forced post-scanner failure"):
         context.sync(messages, {"leak": noop_tool(name="leak")})
 
+    assert messages == before
     context.record_request([])
     row_counts = {
         table: context._db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
@@ -624,7 +629,6 @@ def test_post_scanner_failure_rolls_back_the_whole_sync_transaction(tmp_path):
             "span_state",
             "tool_calls",
             "folds",
-            "scanner_aliases",
         )
     }
     assert set(row_counts.values()) == {0}
@@ -633,11 +637,22 @@ def test_post_scanner_failure_rolls_back_the_whole_sync_transaction(tmp_path):
     assert context._shadow_ref is None
     assert context._vacuum_pending is False
     assert secret.encode() not in path.read_bytes()
+
+    context.sync(messages, {"leak": noop_tool(name="leak")})
+
+    stored_result = context._db.execute(
+        "SELECT scrubbed FROM messages WHERE message_id = 'm2'"
+    ).fetchone()
+    assert stored_result["scrubbed"] == 1
+    assert context.state("m2.r0") == "purged"
+    assert context._db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 3
+    assert secret not in json.dumps(messages)
+    assert secret.encode() not in path.read_bytes()
     context.close()
 
     resumed = FoldingContext(path, "session")
-    assert resumed.shadow_messages() == []
-    assert resumed.span_ids() == []
+    assert len(resumed.shadow_messages()) == 3
+    assert resumed.state("m2.r0") == "purged"
     assert secret.encode() not in path.read_bytes()
 
 
@@ -1179,6 +1194,46 @@ def test_schema_version_two_is_rejected_explicitly(tmp_path):
     context.close()
 
     with pytest.raises(FoldError, match="schema version is incompatible"):
+        FoldingContext(path, "session")
+
+
+def test_schema_version_three_uses_only_its_declared_tables(tmp_path):
+    context = FoldingContext(tmp_path / "folds.sqlite3", "session")
+
+    tables = {
+        row["name"]
+        for row in context._db.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+    }
+
+    assert tables == {
+        "entries",
+        "folds",
+        "messages",
+        "notices",
+        "pins",
+        "projections",
+        "schema_meta",
+        "session_config",
+        "span_state",
+        "tool_calls",
+    }
+
+
+def test_schema_version_three_rejects_the_undeclared_scanner_alias_table(tmp_path):
+    path = tmp_path / "folds.sqlite3"
+    context = FoldingContext(path, "session")
+    context._db.execute(
+        "CREATE TABLE scanner_aliases ("
+        "session_id TEXT NOT NULL, secret_sha TEXT NOT NULL, "
+        "replacement TEXT NOT NULL, PRIMARY KEY(session_id, secret_sha))"
+    )
+    context._db.commit()
+    context.close()
+
+    with pytest.raises(FoldError, match="schema.*incompatible"):
         FoldingContext(path, "session")
 
 

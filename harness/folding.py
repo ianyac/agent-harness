@@ -78,7 +78,14 @@ _SECRET_PATTERNS = (
         r"[\"']?(?P<secret>[A-Za-z0-9_./+=-]{20,})"
     ),
 )
+_IDENTIFIER_SECRET_PATTERNS = (
+    re.compile(r"sk-[A-Za-z0-9_-]{24,}"),
+    re.compile(r"gh[pousr]_[A-Za-z0-9]{30,}"),
+    re.compile(r"AKIA[A-Z0-9]{16}"),
+)
 _REDACTION_MARKER = "[redacted — credential detected in tool output]"
+_SCANNER_ALIAS_PATTERN = re.compile(r"redacted_[a-z2-7]{52}")
+_SECRET_SHA_PATTERN = re.compile(r"[0-9a-f]{64}")
 _IDENTIFIER_VALUE_KEYS = frozenset(
     {"call_id", "id", "name", "tool_call_id", "tool_name"}
 )
@@ -195,13 +202,6 @@ CREATE TABLE IF NOT EXISTS notices (
     created_turn  INTEGER NOT NULL,
     emitted_turn  INTEGER
 );
-
-CREATE TABLE IF NOT EXISTS scanner_aliases (
-    session_id   TEXT NOT NULL,
-    secret_sha   TEXT NOT NULL,
-    replacement  TEXT NOT NULL,
-    PRIMARY KEY(session_id, secret_sha)
-);
 """
 
 
@@ -300,6 +300,13 @@ class FoldingContext:
                 "folding ledger schema is incompatible; start a new session "
                 "or migrate the ledger explicitly"
             )
+        if "scanner_aliases" in tables:
+            self._db.close()
+            raise FoldError(
+                "folding ledger schema is incompatible: schema v3 contains the "
+                "undeclared scanner_aliases table; start a new session or "
+                "migrate the ledger explicitly"
+            )
         if "schema_meta" in tables:
             version = self._db.execute(
                 "SELECT version FROM schema_meta LIMIT 1"
@@ -360,14 +367,10 @@ class FoldingContext:
         self._turn_start_length = 0
         self._turn_user_id: str | None = None
         self._scanner_identifier_replacements: dict[str, str] = {}
-        self._scanner_aliases = {
-            row["secret_sha"]: row["replacement"]
-            for row in self._db.execute(
-                "SELECT secret_sha, replacement FROM scanner_aliases "
-                "WHERE session_id = ?",
-                (self.session_id,),
-            ).fetchall()
-        }
+        (
+            self._scanner_aliases,
+            self._reserved_scanner_tool_names,
+        ) = self._load_scanner_metadata()
         row = self._db.execute(
             "SELECT COALESCE(MAX(created_turn), 0) AS turn FROM messages "
             "WHERE session_id = ?",
@@ -391,6 +394,7 @@ class FoldingContext:
         messages: list[dict],
         tools: dict[str, Tool] | None = None,
     ) -> None:
+        message_snapshot = deepcopy(messages)
         active_ids = self._active_ids.copy()
         snapshots = self._snapshots.copy()
         last_projection_sources = deepcopy(self._last_projection_sources)
@@ -402,6 +406,7 @@ class FoldingContext:
         event_seq = self._event_seq
         scanner_identifier_replacements = self._scanner_identifier_replacements.copy()
         scanner_aliases = self._scanner_aliases.copy()
+        reserved_scanner_tool_names = self._reserved_scanner_tool_names.copy()
         sync_in_progress = self._sync_in_progress
         self._sync_in_progress = True
         try:
@@ -409,6 +414,7 @@ class FoldingContext:
             self._db.commit()
         except BaseException:
             self._db.rollback()
+            messages[:] = message_snapshot
             self._active_ids = active_ids
             self._snapshots = snapshots
             self._last_projection_sources = last_projection_sources
@@ -420,6 +426,7 @@ class FoldingContext:
             self._event_seq = event_seq
             self._scanner_identifier_replacements = scanner_identifier_replacements
             self._scanner_aliases = scanner_aliases
+            self._reserved_scanner_tool_names = reserved_scanner_tool_names
             self._sync_in_progress = sync_in_progress
             raise
         self._sync_in_progress = sync_in_progress
@@ -649,12 +656,6 @@ class FoldingContext:
             for secret, replacement in identifier_replacements.items():
                 secret_sha = _sha(secret)
                 self._scanner_aliases[secret_sha] = replacement
-                self._db.execute(
-                    "INSERT INTO scanner_aliases(session_id, secret_sha, replacement) "
-                    "VALUES (?, ?, ?) ON CONFLICT(session_id, secret_sha) "
-                    "DO UPDATE SET replacement = excluded.replacement",
-                    (self.session_id, secret_sha, replacement),
-                )
             sanitized_meta = dict(
                 self._scrub_structured(
                     meta,
@@ -665,6 +666,16 @@ class FoldingContext:
                     identifier_replacements=identifier_replacements,
                 )
             )
+            sanitized_meta["scanner_aliases"] = {
+                _sha(secret): replacement
+                for secret, replacement in identifier_replacements.items()
+            }
+            sanitized_tool_name = sanitized_meta.get("tool_name")
+            if (
+                isinstance(sanitized_tool_name, str)
+                and _SCANNER_ALIAS_PATTERN.search(sanitized_tool_name)
+            ):
+                self._reserved_scanner_tool_names.add(sanitized_tool_name)
             self._scrub_sqlite(
                 secrets,
                 _REDACTION_MARKER,
@@ -779,6 +790,16 @@ class FoldingContext:
             for match in pattern.finditer(content):
                 value = match.groupdict().get("secret") or match.group(0)
                 if value and value not in values:
+                    values.append(value)
+        return tuple(sorted(values, key=len, reverse=True))
+
+    @classmethod
+    def _identifier_secret_values(cls, identifier: str) -> tuple[str, ...]:
+        values = list(cls._secret_values(identifier))
+        for pattern in _IDENTIFIER_SECRET_PATTERNS:
+            for match in pattern.finditer(identifier):
+                value = match.group(0)
+                if value not in values:
                     values.append(value)
         return tuple(sorted(values, key=len, reverse=True))
 
@@ -1158,13 +1179,160 @@ class FoldingContext:
         """Register a local JSONL artifact that may mirror foldable payloads."""
         self._purge_paths.add(Path(path))
 
+    def _load_scanner_metadata(self) -> tuple[dict[str, str], set[str]]:
+        aliases: dict[str, str] = {}
+        reserved_tool_names: set[str] = set()
+        rows = self._db.execute(
+            "SELECT e.meta_json FROM entries e JOIN folds f USING(span_id) "
+            "WHERE e.session_id = ? AND f.reason = 'sensitive' "
+            "ORDER BY f.fold_id",
+            (self.session_id,),
+        ).fetchall()
+        for row in rows:
+            try:
+                metadata = json.loads(row["meta_json"])
+            except (json.JSONDecodeError, TypeError):
+                raise FoldError("stored scanner metadata is invalid; refusing resume")
+            if not isinstance(metadata, dict):
+                raise FoldError("stored scanner metadata is invalid; refusing resume")
+            tool_name = metadata.get("tool_name")
+            if isinstance(tool_name, str) and _SCANNER_ALIAS_PATTERN.search(tool_name):
+                reserved_tool_names.add(tool_name)
+            stored_aliases = metadata.get("scanner_aliases", {})
+            if not isinstance(stored_aliases, dict):
+                raise FoldError("stored scanner alias metadata is invalid; refusing resume")
+            for secret_sha, replacement in stored_aliases.items():
+                if not (
+                    isinstance(secret_sha, str)
+                    and _SECRET_SHA_PATTERN.fullmatch(secret_sha)
+                    and isinstance(replacement, str)
+                    and _SCANNER_ALIAS_PATTERN.fullmatch(replacement)
+                ):
+                    raise FoldError(
+                        "stored scanner alias metadata is invalid; refusing resume"
+                    )
+                prior = aliases.get(secret_sha)
+                if prior is not None and prior != replacement:
+                    raise FoldError(
+                        "stored scanner alias metadata conflicts; refusing resume"
+                    )
+                other_owner = next(
+                    (
+                        owner
+                        for owner, alias in aliases.items()
+                        if alias == replacement and owner != secret_sha
+                    ),
+                    None,
+                )
+                if other_owner is not None:
+                    raise FoldError(
+                        "stored scanner alias metadata conflicts; refusing resume"
+                    )
+                aliases[secret_sha] = replacement
+        return aliases, reserved_tool_names
+
+    def _recover_scanner_aliases(
+        self,
+        tool_name: str,
+        secrets: tuple[str, ...],
+    ) -> None:
+        missing = [
+            secret for secret in secrets if _sha(secret) not in self._scanner_aliases
+        ]
+        if not missing:
+            return
+
+        group_names = {secret: f"alias_{index}" for index, secret in enumerate(missing)}
+        seen: set[str] = set()
+        pieces = ["^"]
+        position = 0
+        while position < len(tool_name):
+            occurrences = [
+                (index, -len(secret), secret)
+                for secret in secrets
+                if (index := tool_name.find(secret, position)) >= 0
+            ]
+            if not occurrences:
+                pieces.append(re.escape(tool_name[position:]))
+                break
+            index, _negative_length, secret = min(occurrences)
+            pieces.append(re.escape(tool_name[position:index]))
+            replacement = self._scanner_aliases.get(_sha(secret))
+            if replacement is not None:
+                pieces.append(re.escape(replacement))
+            elif secret in seen:
+                pieces.append(f"(?P={group_names[secret]})")
+            else:
+                pieces.append(
+                    f"(?P<{group_names[secret]}>{_SCANNER_ALIAS_PATTERN.pattern})"
+                )
+                seen.add(secret)
+            position = index + len(secret)
+        pieces.append("$")
+        historical_pattern = re.compile("".join(pieces))
+
+        recovered: set[tuple[tuple[str, str], ...]] = set()
+        unsafe_match = False
+        for historical_name in self._reserved_scanner_tool_names:
+            match = historical_pattern.fullmatch(historical_name)
+            if match is None:
+                continue
+            candidate_mapping = {
+                secret: match.group(group_names[secret]) for secret in seen
+            }
+            valid = True
+            for secret, candidate in candidate_mapping.items():
+                if not any(
+                    self._identifier_alias(secret, nonce) == candidate
+                    for nonce in range(10_000)
+                ):
+                    valid = False
+                    unsafe_match = True
+                    break
+            if valid:
+                recovered.add(tuple(sorted(candidate_mapping.items())))
+
+        if unsafe_match or len(recovered) > 1:
+            raise FoldError(
+                "cannot safely recover stored scanner alias; refusing tool dispatch"
+            )
+        if not recovered:
+            if self._reserved_scanner_tool_names and not self._scanner_aliases:
+                raise FoldError(
+                    "cannot safely recover stored scanner alias; refusing tool dispatch"
+                )
+            return
+        for secret, replacement in recovered.pop():
+            self._scanner_aliases[_sha(secret)] = replacement
+
     def model_tool_names(self, tools: dict[str, Tool]) -> dict[str, str]:
         """Return scanner-safe names for definitions offered to the model."""
         aliases: dict[str, str] = {}
         offered_names: set[str] = set()
-        for tool in tools.values():
+        registered_tools = list(tools.values())
+        for tool in registered_tools:
+            secrets = self._identifier_secret_values(tool.name)
+            self._recover_scanner_aliases(tool.name, secrets)
+        reserved_aliases = {
+            replacement: secret_sha
+            for secret_sha, replacement in self._scanner_aliases.items()
+        }
+        for tool in registered_tools:
+            if tool.name in self._reserved_scanner_tool_names:
+                raise FoldError(
+                    "scanner tool alias conflicts: registered tool name uses a "
+                    "reserved scanner alias; "
+                    "start a new session with non-conflicting tool names"
+                )
+            owner = reserved_aliases.get(tool.name)
+            if owner is not None and _sha(tool.name) != owner:
+                raise FoldError(
+                    "scanner tool alias conflicts: registered tool name uses a "
+                    "reserved scanner alias; "
+                    "start a new session with non-conflicting tool names"
+                )
             replacements = dict(self._scanner_identifier_replacements)
-            for secret in self._secret_values(tool.name):
+            for secret in self._identifier_secret_values(tool.name):
                 replacement = self._scanner_aliases.get(_sha(secret))
                 if replacement is not None:
                     replacements[secret] = replacement
@@ -2125,17 +2293,27 @@ class FoldingContext:
                     continue
                 self._collect_identifier_values(decoded, identifiers)
 
-        replacements: dict[str, str] = {}
+        replacements = {
+            secret: self._scanner_aliases[_sha(secret)]
+            for secret in secrets
+            if _sha(secret) in self._scanner_aliases
+        }
         for secret in secrets:
+            if secret in replacements:
+                continue
+            current_identifiers = {
+                self._replace_identifiers(original, replacements)
+                for original in identifiers
+            }
             nonce = 0
             while True:
                 candidate = self._identifier_alias(secret, nonce)
-                trial = {**replacements, secret: candidate}
+                trial = {secret: candidate}
                 transformed: dict[str, str] = {}
                 collision = False
-                for original in identifiers:
+                for original in current_identifiers:
                     cleaned = self._replace_identifiers(original, trial)
-                    if cleaned != original and cleaned in identifiers:
+                    if cleaned != original and cleaned in current_identifiers:
                         collision = True
                         break
                     prior = transformed.get(cleaned)

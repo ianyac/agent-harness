@@ -5,6 +5,7 @@ from copy import deepcopy
 
 import pytest
 
+from harness.compaction import count_text_tokens
 from harness.folding import FoldConfig, FoldError, FoldingContext, ProjectionError
 from harness.session import SessionLog
 from harness.tools.base import Tool
@@ -2237,6 +2238,89 @@ def test_user_delete_targets_only_exact_blocks_in_stored_rendered_result(
     assert resumed.reconstruct_projection(projection_id) == historical
 
 
+def test_user_delete_redacts_indexed_body_identical_to_its_generated_header(tmp_path):
+    # Regression caught: the body can itself look exactly like its generated
+    # header, so only structurally valid header/body candidates are ambiguous.
+    marker = "[deleted by user]"
+    path = tmp_path / "folds.sqlite3"
+    token_count = 0
+    for _ in range(10):
+        payload = f"[m5.r0.c1 · ~{token_count} tok]"
+        next_count = count_text_tokens(payload)
+        if next_count == token_count:
+            break
+        token_count = next_count
+    assert count_text_tokens(payload) == token_count
+
+    messages = tool_exchange("first", {}, payload)
+    messages.extend(
+        tool_exchange("second", {}, f"prefix\n{payload}", call_id="call_1")
+    )
+    messages[3]["content"] = "unrelated body prose remains"
+    config = FoldConfig(min_span_tokens=0, chunk_tokens=token_count)
+    context = FoldingContext(path, "session", config=config)
+    context.sync(
+        messages,
+        {"first": noop_tool(name="first"), "second": noop_tool(name="second")},
+    )
+    target_id = "m5.r0.c1"
+    assert context.content(target_id) == payload
+
+    context.record_request(context.project(messages))
+    before = context.projection_chain()[-1]
+    stored = context._db.execute(
+        "SELECT projection_json, source_ids_json FROM projections "
+        "WHERE projection_id = ?",
+        (before["projection_id"],),
+    ).fetchone()
+    sources_before = json.loads(stored["source_ids_json"])
+    message_index = sources_before.index("message:m5")
+    before_rendered = json.loads(stored["projection_json"])[message_index]["content"]
+    target_header = next(
+        line
+        for line in before_rendered.splitlines()
+        if line.startswith(f"[{target_id} · ~") and line.endswith(" tok]")
+    )
+    assert target_header == payload
+    assert f"{target_header}\n{payload}" in before_rendered
+
+    context.delete("m2.r0")
+
+    after = context.projection_chain()[-1]
+    historical = context.reconstruct_projection(after["projection_id"])
+    after_rendered = historical[message_index]["content"]
+    assert f"{target_header}\n{marker}" in after_rendered
+    assert f"{target_header}\n{payload}" not in after_rendered
+    assert [
+        line
+        for line in after_rendered.splitlines()
+        if line.startswith(f"[{target_id} · ~") and line.endswith(" tok]")
+    ] == [target_header]
+    assert historical[3] == {
+        "role": "user",
+        "content": "unrelated body prose remains",
+    }
+    assert messages[5]["content"] == f"prefix\n{marker}"
+    assert context.content("m5.r0") == f"prefix\n{marker}"
+    stored_after = context._db.execute(
+        "SELECT projection_json, source_ids_json FROM projections "
+        "WHERE projection_id = ?",
+        (after["projection_id"],),
+    ).fetchone()
+    assert json.loads(stored_after["source_ids_json"]) == sources_before
+    assert json.loads(stored_after["projection_json"])[message_index] == historical[
+        message_index
+    ]
+    assert after["projection_hash"] == before["projection_hash"]
+    assert after["parent_hash"] == before["parent_hash"]
+    assert after["redacted"] is True
+    projection_id = after["projection_id"]
+    context.close()
+
+    resumed = FoldingContext(path, "session", config=config)
+    assert resumed.reconstruct_projection(projection_id) == historical
+
+
 def test_user_delete_scopes_rendered_root_body_and_skips_malformed_layout(tmp_path):
     # Regression caught: a no-child root has one target body, while a render
     # without the deterministic header/body separator is unsafe to interpret.
@@ -2276,6 +2360,10 @@ def test_user_delete_scopes_rendered_root_body_and_skips_malformed_layout(tmp_pa
     malformed_before = record_with_owner(malformed_content)
     ambiguous_content = f"[m5.r0 · ~1 tok]\n{payload}\n[not a rendered block]"
     ambiguous_before = record_with_owner(ambiguous_content)
+    duplicate_content = (
+        f"[m5.r0 · ~1 tok]\n{payload}\n[m5.r0 · ~1 tok]\n{payload}"
+    )
+    duplicate_before = record_with_owner(duplicate_content)
 
     context.delete("m2.r0")
 
@@ -2297,6 +2385,11 @@ def test_user_delete_scopes_rendered_root_body_and_skips_malformed_layout(tmp_pa
         "content"
     ] == ambiguous_content
     assert ambiguous_after["redacted"] is False
+    duplicate_after = chain[duplicate_before["projection_id"]]
+    assert context.reconstruct_projection(duplicate_after["projection_id"])[0][
+        "content"
+    ] == duplicate_content
+    assert duplicate_after["redacted"] is False
 
 
 def test_user_delete_scrubs_only_matching_in_memory_notices(tmp_path):

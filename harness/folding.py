@@ -2297,35 +2297,36 @@ class FoldingContext:
 
         replacements: list[tuple[int, int]] = []
         for body_offsets in headers.values():
-            if len(body_offsets) != 1:
-                continue
-            start = body_offsets[0]
-            if not content.startswith(payload, start):
-                continue
-            end = start + len(payload)
-            if end != len(content):
-                if not content.startswith("\n", end):
+            candidates: list[tuple[int, int]] = []
+            for start in body_offsets:
+                if not content.startswith(payload, start):
                     continue
-                next_line = content[end + 1 :].partition("\n")[0]
-                generated = next_line in {
-                    marker,
-                    _REDACTION_MARKER,
-                } or next_line.startswith("[dup of ")
-                for span_id in render_span_ids:
-                    generated = generated or (
-                        next_line.startswith(f"[{span_id} · ~")
-                        and next_line.endswith(" tok]")
-                    )
-                    generated = generated or next_line.startswith(
-                        (
-                            f"[folded {span_id},",
-                            f"[unfolded {span_id} →",
-                            f"[removed {span_id} —",
+                end = start + len(payload)
+                if end != len(content):
+                    if not content.startswith("\n", end):
+                        continue
+                    next_line = content[end + 1 :].partition("\n")[0]
+                    generated = next_line in {
+                        marker,
+                        _REDACTION_MARKER,
+                    } or next_line.startswith("[dup of ")
+                    for span_id in render_span_ids:
+                        generated = generated or (
+                            next_line.startswith(f"[{span_id} · ~")
+                            and next_line.endswith(" tok]")
                         )
-                    )
-                if not generated:
-                    continue
-            replacements.append((start, end))
+                        generated = generated or next_line.startswith(
+                            (
+                                f"[folded {span_id},",
+                                f"[unfolded {span_id} →",
+                                f"[removed {span_id} —",
+                            )
+                        )
+                    if not generated:
+                        continue
+                candidates.append((start, end))
+            if len(candidates) == 1:
+                replacements.append(candidates[0])
         for start, end in sorted(replacements, reverse=True):
             content = f"{content[:start]}{marker}{content[end:]}"
         return content

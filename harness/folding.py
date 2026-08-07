@@ -2543,7 +2543,7 @@ class FoldingContext:
         return projection_hash, parent_hash
 
     def record_request(self, messages: list[dict]) -> str:
-        """Persist the hash of the exact array about to cross the LLM seam."""
+        """Persist the exact request array and aligned projection sources."""
         with self._db:
             projection_hash, parent_hash = self._record_projection(
                 messages, kind="request"

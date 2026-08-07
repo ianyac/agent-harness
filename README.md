@@ -36,6 +36,18 @@ survive process restarts. The context-management mode is persisted too; a
 folding session resumes with folding automatically and cannot silently fall
 back to compaction.
 
+## Request replay and erasure
+
+Each model dispatch stores its exact projected request and aligned ledger
+sources. `reconstruct_projection(id)` verifies non-redacted snapshots against
+the persisted hash.
+
+User deletion and sensitive scanning rewrite affected historical snapshots to
+markers, preserve the original hash chain, and expose `redacted: true` because
+hard-erased bytes are intentionally no longer reconstructable. User deletion
+follows ledger provenance and exact aliases; it is not a global
+find-and-replace operation.
+
 `--fold-context` and `--compact-threshold` are intentionally mutually
 exclusive. Two context managers rewriting the same message array would make
 neither one's state reconstructable.

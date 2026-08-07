@@ -1184,6 +1184,158 @@ def test_reconstruct_projection_rejects_unknown_malformed_and_corrupt_rows(tmp_p
         context.reconstruct_projection(projection_id)
 
 
+@pytest.mark.parametrize("erasure", ["user_delete", "scanner"])
+@pytest.mark.parametrize(
+    ("projection_json", "source_ids_json"),
+    [
+        ('{"content":"not a message list"}', '["message:m0"]'),
+        ('[42]', '["message:m0"]'),
+        ('[{"content":"unrelated","role":"user"}]', '{"0":"message:m0"}'),
+        ('[{"content":"unrelated","role":"user"}]', '[42]'),
+        ('[{"content":"unrelated","role":"user"}]', '[]'),
+    ],
+)
+def test_projection_erasure_rejects_invalid_structure_before_any_mutation(
+    tmp_path, erasure, projection_json, source_ids_json
+):
+    # Regression caught: zip-truncation and unchecked scanner snapshots could
+    # silently bless malformed provenance after partially changing earlier rows.
+    secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
+    messages = tool_exchange("read_file", {"path": "auth.py"}, "delete target")
+    messages[0]["content"] = f"inspect {secret}"
+    context = FoldingContext(
+        tmp_path / "folds.sqlite3",
+        "session",
+        config=FoldConfig(min_span_tokens=0),
+    )
+    context.sync(messages, {"read_file": noop_tool(name="read_file")})
+    context.record_request(context.project(messages))
+    first_id = context.projection_chain()[0]["projection_id"]
+    context.record_request([{"role": "user", "content": "unrelated"}])
+    second_id = context.projection_chain()[1]["projection_id"]
+    context._db.execute(
+        "UPDATE projections SET projection_json = ?, source_ids_json = ? "
+        "WHERE projection_id = ?",
+        (projection_json, source_ids_json, second_id),
+    )
+    context._db.commit()
+    projections_before = [
+        dict(row)
+        for row in context._db.execute(
+            "SELECT projection_id, projection_hash, parent_hash, projection_json, "
+            "source_ids_json, redacted FROM projections ORDER BY projection_id"
+        ).fetchall()
+    ]
+    shadow_before = context.shadow_messages()
+    if erasure == "scanner":
+        messages.extend(
+            tool_exchange("leak", {}, f"observed {secret}", call_id="call_1")
+        )
+    live_before = deepcopy(messages)
+
+    with pytest.raises(ProjectionError, match="malformed"):
+        if erasure == "user_delete":
+            context.delete("m2.r0")
+        else:
+            context.sync(
+                messages,
+                {
+                    "read_file": noop_tool(name="read_file"),
+                    "leak": noop_tool(name="leak"),
+                },
+            )
+
+    projections_after = [
+        dict(row)
+        for row in context._db.execute(
+            "SELECT projection_id, projection_hash, parent_hash, projection_json, "
+            "source_ids_json, redacted FROM projections ORDER BY projection_id"
+        ).fetchall()
+    ]
+    assert projections_after == projections_before
+    assert context.projection_chain()[0]["projection_id"] == first_id
+    assert context.state("m2.r0") == "visible"
+    assert context.content("m2.r0") == "delete target"
+    assert context.shadow_messages() == shadow_before
+    assert messages == live_before
+
+
+@pytest.mark.parametrize("erasure", ["user_delete", "scanner"])
+def test_projection_erasure_rejects_nonredacted_hash_tampering_and_rolls_back(
+    tmp_path, erasure
+):
+    # Regression caught: setting redacted after an erasure must not launder
+    # unrelated bytes that already disagree with the immutable request hash.
+    secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
+    messages = tool_exchange("read_file", {"path": "auth.py"}, "delete target")
+    messages[0]["content"] = f"inspect {secret}"
+    context = FoldingContext(
+        tmp_path / "folds.sqlite3",
+        "session",
+        config=FoldConfig(min_span_tokens=0),
+    )
+    context.sync(messages, {"read_file": noop_tool(name="read_file")})
+    context.record_request(context.project(messages))
+    projection_id = context.projection_chain()[0]["projection_id"]
+    stored = context._db.execute(
+        "SELECT projection_json FROM projections WHERE projection_id = ?",
+        (projection_id,),
+    ).fetchone()
+    tampered = json.loads(stored["projection_json"])
+    tampered[1]["content"] = "unrelated tampering"
+    tampered_json = json.dumps(
+        tampered, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    context._db.execute(
+        "UPDATE projections SET projection_json = ? WHERE projection_id = ?",
+        (tampered_json, projection_id),
+    )
+    context._db.commit()
+    before = dict(
+        context._db.execute(
+            "SELECT projection_hash, parent_hash, projection_json, "
+            "source_ids_json, redacted FROM projections WHERE projection_id = ?",
+            (projection_id,),
+        ).fetchone()
+    )
+    shadow_before = context.shadow_messages()
+    with pytest.raises(ProjectionError, match="hash mismatch"):
+        context.reconstruct_projection(projection_id)
+    if erasure == "scanner":
+        messages.extend(
+            tool_exchange("leak", {}, f"observed {secret}", call_id="call_1")
+        )
+    live_before = deepcopy(messages)
+
+    with pytest.raises(ProjectionError, match="hash mismatch"):
+        if erasure == "user_delete":
+            context.delete("m2.r0")
+        else:
+            context.sync(
+                messages,
+                {
+                    "read_file": noop_tool(name="read_file"),
+                    "leak": noop_tool(name="leak"),
+                },
+            )
+
+    after = dict(
+        context._db.execute(
+            "SELECT projection_hash, parent_hash, projection_json, "
+            "source_ids_json, redacted FROM projections WHERE projection_id = ?",
+            (projection_id,),
+        ).fetchone()
+    )
+    assert after == before
+    assert after["redacted"] == 0
+    assert context.state("m2.r0") == "visible"
+    assert context.content("m2.r0") == "delete target"
+    assert context.shadow_messages() == shadow_before
+    assert messages == live_before
+    with pytest.raises(ProjectionError, match="hash mismatch"):
+        context.reconstruct_projection(projection_id)
+
+
 def test_schema_version_two_is_rejected_explicitly(tmp_path):
     # Regression caught: opening an unreleased v2 ledger without its immutable
     # request snapshots would make reconstruction silently incomplete.
@@ -1398,6 +1550,46 @@ def test_sensitive_scan_redacts_stored_requests_without_changing_hash_chain(tmp_
     assert after["redacted"] is True
     assert after["projection_hash"] == before["projection_hash"]
     assert after["parent_hash"] == before["parent_hash"]
+
+
+def test_sensitive_scan_can_redact_a_valid_already_redacted_projection(tmp_path):
+    # Regression caught: an intentional prior erasure no longer reproduces the
+    # original hash, but its valid aligned snapshot must support later erasure.
+    secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
+    messages = tool_exchange("read_file", {"path": "auth.py"}, "delete target")
+    messages[0]["content"] = f"inspect {secret}"
+    context = FoldingContext(
+        tmp_path / "folds.sqlite3",
+        "session",
+        config=FoldConfig(min_span_tokens=0),
+    )
+    context.sync(messages, {"read_file": noop_tool(name="read_file")})
+    context.record_request(context.project(messages))
+    before = context.projection_chain()[0]
+    projection_id = before["projection_id"]
+    context.delete("m2.r0")
+    after_delete = context.projection_chain()[0]
+    assert after_delete["redacted"] is True
+    assert context.reconstruct_projection(projection_id)[2]["content"] == (
+        "[deleted by user]"
+    )
+    messages.extend(tool_exchange("leak", {}, f"observed {secret}", call_id="call_1"))
+
+    context.sync(
+        messages,
+        {
+            "read_file": noop_tool(name="read_file"),
+            "leak": noop_tool(name="leak"),
+        },
+    )
+
+    after_scan = context.projection_chain()[0]
+    historical = context.reconstruct_projection(projection_id)
+    assert secret not in json.dumps(historical)
+    assert historical[2]["content"] == "[deleted by user]"
+    assert after_scan["redacted"] is True
+    assert after_scan["projection_hash"] == before["projection_hash"]
+    assert after_scan["parent_hash"] == before["parent_hash"]
 
 
 def test_sensitive_scan_exhaustively_scrubs_stored_snapshot_data(tmp_path):
@@ -2629,10 +2821,6 @@ def test_user_delete_scopes_rendered_root_body_and_skips_malformed_layout(tmp_pa
     malformed_before = record_with_owner(malformed_content)
     ambiguous_content = f"[m5.r0 · ~1 tok]\n{payload}\n[not a rendered block]"
     ambiguous_before = record_with_owner(ambiguous_content)
-    duplicate_content = (
-        f"[m5.r0 · ~1 tok]\n{payload}\n[m5.r0 · ~1 tok]\n{payload}"
-    )
-    duplicate_before = record_with_owner(duplicate_content)
 
     context.delete("m2.r0")
 
@@ -2654,11 +2842,70 @@ def test_user_delete_scopes_rendered_root_body_and_skips_malformed_layout(tmp_pa
         "content"
     ] == ambiguous_content
     assert ambiguous_after["redacted"] is False
-    duplicate_after = chain[duplicate_before["projection_id"]]
-    assert context.reconstruct_projection(duplicate_after["projection_id"])[0][
-        "content"
-    ] == duplicate_content
-    assert duplicate_after["redacted"] is False
+
+
+def test_user_delete_rejects_ambiguous_render_without_partial_erasure(tmp_path):
+    # Regression caught: two valid blocks for one target cannot be safely
+    # attributed, and succeeding would leave selected bytes recoverable.
+    payload = "m5"
+    messages = tool_exchange("first", {}, payload)
+    messages.extend(
+        tool_exchange("second", {}, f"prefix\n{payload}\nsuffix", call_id="call_1")
+    )
+    context = FoldingContext(
+        tmp_path / "folds.sqlite3",
+        "session",
+        config=FoldConfig(min_span_tokens=0, chunk_tokens=2),
+    )
+    context.sync(
+        messages,
+        {"first": noop_tool(name="first"), "second": noop_tool(name="second")},
+    )
+    context.record_request(context.project(messages))
+    duplicate_content = (
+        f"[m5.r0 · ~1 tok]\n{payload}\n[m5.r0 · ~1 tok]\n{payload}"
+    )
+    duplicate_projection = [
+        {"role": "tool", "tool_call_id": "call_1", "content": duplicate_content}
+    ]
+    duplicate_json = json.dumps(
+        duplicate_projection,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    context._last_projection_sources = (
+        hashlib.sha256(duplicate_json.encode()).hexdigest(),
+        ["message:m5"],
+    )
+    context.record_request(duplicate_projection)
+    projections_before = [
+        dict(row)
+        for row in context._db.execute(
+            "SELECT projection_id, projection_hash, parent_hash, projection_json, "
+            "source_ids_json, redacted FROM projections ORDER BY projection_id"
+        ).fetchall()
+    ]
+    shadow_before = context.shadow_messages()
+    live_before = deepcopy(messages)
+
+    with pytest.raises(ProjectionError, match="ambiguous"):
+        context.delete("m2.r0")
+
+    projections_after = [
+        dict(row)
+        for row in context._db.execute(
+            "SELECT projection_id, projection_hash, parent_hash, projection_json, "
+            "source_ids_json, redacted FROM projections ORDER BY projection_id"
+        ).fetchall()
+    ]
+    assert projections_after == projections_before
+    assert all(row["redacted"] == 0 for row in projections_after)
+    assert context.state("m2.r0") == "visible"
+    assert context.content("m2.r0") == payload
+    assert context.content("m5.r0") == f"prefix\n{payload}\nsuffix"
+    assert context.shadow_messages() == shadow_before
+    assert messages == live_before
 
 
 def test_user_delete_scrubs_only_matching_in_memory_notices(tmp_path):

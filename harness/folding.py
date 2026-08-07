@@ -644,6 +644,9 @@ class FoldingContext:
                 secrets,
                 tuple(tool.name for tool in tools.values()),
             )
+            projection_updates = self._prepare_sensitive_projection_redactions(
+                secrets, identifier_replacements
+            )
             self._scanner_identifier_replacements.update(identifier_replacements)
             self._scanner_identifier_replacements = dict(
                 sorted(
@@ -696,7 +699,7 @@ class FoldingContext:
                 exhaustive=True,
                 identifier_replacements=identifier_replacements,
             )
-            self._redact_sensitive_projections(secrets, identifier_replacements)
+            self._apply_projection_redactions(projection_updates)
             self._scrub_live_shadow(
                 secrets,
                 _REDACTION_MARKER,
@@ -1536,6 +1539,21 @@ class FoldingContext:
             | self._user_delete_linked_result_spans(input_aliases)
         )
         root_owner_ids = self._user_delete_root_owners(span_ids)
+        projection_operations = self._user_projection_operations(
+            span_ids,
+            root_owner_ids,
+            indexed_owner_ids,
+            indexed_span_ids,
+            indexed_target_ids,
+            input_aliases,
+            payload,
+        )
+        self._add_user_projection_notice_operations(
+            projection_operations, metadata_span_ids, [payload]
+        )
+        projection_updates = self._prepare_user_projection_redactions(
+            projection_operations
+        )
 
         # Mounted artifacts do not carry ledger provenance. Exact-value
         # replacement clears independent copies without rewriting unrelated
@@ -1546,19 +1564,7 @@ class FoldingContext:
                 metadata_span_ids, input_aliases, payload
             )
             self._scrub_delete_tool_calls(input_aliases, payload)
-            projection_operations = self._user_projection_operations(
-                span_ids,
-                root_owner_ids,
-                indexed_owner_ids,
-                indexed_span_ids,
-                indexed_target_ids,
-                input_aliases,
-                payload,
-            )
-            self._add_user_projection_notice_operations(
-                projection_operations, metadata_span_ids, [payload]
-            )
-            self._redact_user_projections(projection_operations)
+            self._apply_projection_redactions(projection_updates)
             notice_updates = self._scrub_delete_folds_and_notices(
                 metadata_span_ids, [payload]
             )
@@ -2649,33 +2655,63 @@ class FoldingContext:
                             (_sha(cleaned), row["scrub_rowid"]),
                         )
 
-    def _redact_sensitive_projections(
-        self, secrets: tuple[str, ...], identifier_replacements: dict[str, str]
-    ) -> None:
+    def _validated_projection_rows(
+        self,
+    ) -> list[tuple[int, list[dict], list[str]]]:
         rows = self._db.execute(
-            "SELECT projection_id, projection_json FROM projections"
+            "SELECT projection_id, projection_hash, projection_json, "
+            "source_ids_json, redacted FROM projections ORDER BY projection_id"
         ).fetchall()
+        validated: list[tuple[int, list[dict], list[str]]] = []
         for row in rows:
+            projection_id = int(row["projection_id"])
             try:
-                decoded = json.loads(row["projection_json"])
-            except json.JSONDecodeError as error:
+                messages = json.loads(row["projection_json"])
+                sources = json.loads(row["source_ids_json"])
+            except (TypeError, json.JSONDecodeError) as error:
                 raise ProjectionError(
-                    f"projection {row['projection_id']} is malformed"
+                    f"projection {projection_id} is malformed"
                 ) from error
+            if not (
+                isinstance(messages, list)
+                and all(isinstance(message, dict) for message in messages)
+                and isinstance(sources, list)
+                and all(isinstance(source, str) for source in sources)
+                and len(sources) == len(messages)
+            ):
+                raise ProjectionError(f"projection {projection_id} is malformed")
+            if (
+                not row["redacted"]
+                and _sha(_canonical(messages)) != row["projection_hash"]
+            ):
+                raise ProjectionError(f"projection {projection_id} hash mismatch")
+            validated.append((projection_id, messages, sources))
+        return validated
+
+    def _prepare_sensitive_projection_redactions(
+        self, secrets: tuple[str, ...], identifier_replacements: dict[str, str]
+    ) -> list[tuple[int, str]]:
+        updates: list[tuple[int, str]] = []
+        for projection_id, messages, _sources in self._validated_projection_rows():
             cleaned = self._scrub_structured(
-                decoded,
+                messages,
                 secrets,
                 _REDACTION_MARKER,
                 replace_substrings=True,
                 exhaustive=True,
                 identifier_replacements=identifier_replacements,
             )
-            if cleaned != decoded:
-                self._db.execute(
-                    "UPDATE projections SET projection_json = ?, redacted = 1 "
-                    "WHERE projection_id = ?",
-                    (_canonical(cleaned), row["projection_id"]),
-                )
+            if cleaned != messages:
+                updates.append((projection_id, _canonical(cleaned)))
+        return updates
+
+    def _apply_projection_redactions(self, updates: list[tuple[int, str]]) -> None:
+        for projection_id, projection_json in updates:
+            self._db.execute(
+                "UPDATE projections SET projection_json = ?, redacted = 1 "
+                "WHERE projection_id = ?",
+                (projection_json, projection_id),
+            )
 
     @staticmethod
     def _redact_rendered_result_bodies(
@@ -2697,7 +2733,7 @@ class FoldingContext:
             offset += len(line)
 
         replacements: list[tuple[int, int]] = []
-        for body_offsets in headers.values():
+        for span_id, body_offsets in headers.items():
             candidates: list[tuple[int, int]] = []
             for start in body_offsets:
                 if not content.startswith(payload, start):
@@ -2726,30 +2762,23 @@ class FoldingContext:
                     if not generated:
                         continue
                 candidates.append((start, end))
-            if len(candidates) == 1:
+            if len(candidates) > 1:
+                raise ProjectionError(
+                    f"rendered projection target {span_id} is ambiguous"
+                )
+            if candidates:
                 replacements.append(candidates[0])
         for start, end in sorted(replacements, reverse=True):
             content = f"{content[:start]}{marker}{content[end:]}"
         return content
 
-    def _redact_user_projections(
+    def _prepare_user_projection_redactions(
         self, operations: dict[str, list[dict[str, object]]]
-    ) -> None:
+    ) -> list[tuple[int, str]]:
         if not operations:
-            return
-        rows = self._db.execute(
-            "SELECT projection_id, projection_json, source_ids_json FROM projections"
-        ).fetchall()
-        for row in rows:
-            try:
-                messages = json.loads(row["projection_json"])
-                sources = json.loads(row["source_ids_json"])
-            except json.JSONDecodeError as error:
-                raise ProjectionError(
-                    f"projection {row['projection_id']} is malformed"
-                ) from error
-            if not isinstance(messages, list) or not isinstance(sources, list):
-                raise ProjectionError(f"projection {row['projection_id']} is malformed")
+            return []
+        updates: list[tuple[int, str]] = []
+        for projection_id, messages, sources in self._validated_projection_rows():
             changed = False
             for message, source in zip(messages, sources):
                 if not isinstance(message, dict) or not isinstance(source, str):
@@ -2834,11 +2863,8 @@ class FoldingContext:
                         function["arguments"] = _canonical(arguments)
                         changed = True
             if changed:
-                self._db.execute(
-                    "UPDATE projections SET projection_json = ?, redacted = 1 "
-                    "WHERE projection_id = ?",
-                    (_canonical(messages), row["projection_id"]),
-                )
+                updates.append((projection_id, _canonical(messages)))
+        return updates
 
     def _purge_session_log(
         self,

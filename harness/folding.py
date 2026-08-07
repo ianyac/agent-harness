@@ -1172,6 +1172,7 @@ class FoldingContext:
                 span_ids,
                 root_owner_ids,
                 indexed_owner_ids,
+                indexed_parents,
                 input_aliases,
                 payload,
             )
@@ -1226,6 +1227,7 @@ class FoldingContext:
         span_ids: set[str],
         root_owner_ids: set[str],
         indexed_owner_ids: set[str],
+        indexed_parent_ids: set[str],
         input_aliases: list[dict[str, str]],
         payload: str,
     ) -> dict[str, list[dict[str, object]]]:
@@ -1237,9 +1239,9 @@ class FoldingContext:
 
         for owner_id in root_owner_ids:
             add(owner_id, {"kind": "content", "marker": marker})
-        for owner_id in indexed_owner_ids:
+        for source_id in indexed_owner_ids | indexed_parent_ids:
             add(
-                owner_id,
+                source_id,
                 {
                     "kind": "indexed_content",
                     "marker": marker,

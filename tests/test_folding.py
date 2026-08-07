@@ -1872,6 +1872,72 @@ def test_user_delete_rewrites_only_selected_chunk_in_stored_projection(tmp_path)
     assert after["redacted"] is True
 
 
+def test_user_delete_redacts_indexed_alias_in_stored_unfolded_tail(tmp_path):
+    # Regression caught: an unfolded synthetic tail is sourced by its result
+    # span, not the owning transcript message, so both provenance forms must
+    # receive the same indexed-content deletion operation.
+    payload = "XYZ12345"
+    path = tmp_path / "folds.sqlite3"
+    messages = tool_exchange("first", {}, payload)
+    messages.extend(
+        tool_exchange(
+            "second",
+            {},
+            f"prefix\n{payload}\nsuffix\n",
+            call_id="call_1",
+        )
+    )
+    messages[3]["content"] = "keep unrelated source prose"
+    context = FoldingContext(
+        path,
+        "session",
+        config=FoldConfig(min_span_tokens=0, chunk_tokens=3),
+    )
+    context.sync(
+        messages,
+        {"first": noop_tool(name="first"), "second": noop_tool(name="second")},
+    )
+    context.fold("m5.r0", "finished", rich_note())
+    context.checkpoint()
+    context.unfold("m5.r0")
+    context.record_request(context.project(messages))
+    before = context.projection_chain()[-1]
+    stored = context._db.execute(
+        "SELECT projection_json, source_ids_json FROM projections "
+        "WHERE projection_id = ?",
+        (before["projection_id"],),
+    ).fetchone()
+    sources = json.loads(stored["source_ids_json"])
+    tail_index = sources.index("span:m5.r0")
+    assert payload in json.loads(stored["projection_json"])[tail_index]["content"]
+
+    context.delete("m2.r0")
+
+    after = context.projection_chain()[-1]
+    historical = context.reconstruct_projection(after["projection_id"])
+    tail_content = historical[tail_index]["content"]
+    assert "prefix" in tail_content
+    assert "suffix" in tail_content
+    assert payload not in tail_content
+    assert tail_content.count("[deleted by user]") == 1
+    assert historical[3] == {
+        "role": "user",
+        "content": "keep unrelated source prose",
+    }
+    assert messages[5]["content"] == "prefix\n[deleted by user]\nsuffix\n"
+    assert context.content("m5.r0") == "prefix\n[deleted by user]\nsuffix\n"
+    assert context.state("m2.r0") == "purged"
+    projection_json = context._db.execute(
+        "SELECT projection_json FROM projections WHERE projection_id = ?",
+        (after["projection_id"],),
+    ).fetchone()["projection_json"]
+    assert payload not in projection_json
+    assert payload.encode() not in path.read_bytes()
+    assert after["projection_hash"] == before["projection_hash"]
+    assert after["parent_hash"] == before["parent_hash"]
+    assert after["redacted"] is True
+
+
 def test_user_delete_scrubs_only_matching_in_memory_notices(tmp_path):
     context, _messages = context_with_result(tmp_path, "delete me permanently")
     notice = context._db.execute(

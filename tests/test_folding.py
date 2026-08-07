@@ -374,6 +374,28 @@ def test_secret_scanner_purges_tool_output_and_rebuilds_immediately(tmp_path):
     )
 
 
+def test_secret_scanner_scrubs_a_raw_mounted_session_on_resume(tmp_path):
+    secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
+    session_path = tmp_path / "session.jsonl"
+    messages = tool_exchange("leak", {}, secret) + [
+        {"role": "assistant", "content": "done"}
+    ]
+    SessionLog(session_path).record_turn(messages)
+    context = FoldingContext(
+        tmp_path / "folds.sqlite3",
+        "session",
+        session_log_path=session_path,
+        config=FoldConfig(min_span_tokens=0),
+    )
+
+    context.sync(messages, {"leak": noop_tool(name="leak")})
+
+    assert secret not in session_path.read_text()
+    assert SessionLog(session_path).load()[2]["content"] == (
+        "[redacted — credential detected in tool output]"
+    )
+
+
 def test_reconstruct_at_turn_replays_fold_and_unfold_history(tmp_path):
     # Regression caught: using today's span_state for every historical query
     # makes failure forensics lie about what the model actually saw then.
@@ -527,3 +549,25 @@ def test_resume_ignores_a_crash_tail_without_reusing_its_ids(tmp_path):
     resumed.sync(continued, {"fresh": noop_tool(name="fresh")})
     assert resumed.state("m9.r0") == "visible"
     assert resumed.project(continued)[-1]["content"].startswith("[m9.r0 · ~")
+
+
+def test_same_process_rollback_deactivates_the_abandoned_tool_branch(tmp_path):
+    completed = tool_exchange("noop", {}, "ok") + [
+        {"role": "assistant", "content": "done"}
+    ]
+    crashed = completed + tool_exchange("dump", {}, "abandoned", call_id="call_1")
+    context = FoldingContext(
+        tmp_path / "folds.sqlite3",
+        "session",
+        config=FoldConfig(min_span_tokens=0),
+    )
+    context.sync(crashed, {"noop": noop_tool(), "dump": noop_tool(name="dump")})
+
+    context.sync(completed, {"noop": noop_tool()})
+    continued = completed + tool_exchange(
+        "fresh", {}, "abandoned", call_id="call_1"
+    )
+    context.sync(continued, {"fresh": noop_tool(name="fresh")})
+
+    assert context.state("m9.r0") == "visible"
+    assert context.project(continued)[-1]["content"].startswith("[m9.r0 · ~")

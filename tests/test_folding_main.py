@@ -2,6 +2,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from harness.folding import FoldingContext
 from main import folding_paths
 
 
@@ -57,6 +58,7 @@ def test_resume_rejects_compaction_for_a_persisted_folding_session(tmp_path):
         '{"type":"message","message":{"role":"assistant","content":"done"}}\n'
     )
     (sessions / "s.context-mode").write_text("folding\n")
+    FoldingContext(sessions / "s.folds.sqlite3", "s").close()
 
     result = subprocess.run(
         [
@@ -85,6 +87,7 @@ def test_resume_automatically_restores_the_persisted_folding_mode(tmp_path):
         '{"type":"message","message":{"role":"assistant","content":"done"}}\n'
     )
     (sessions / "s.context-mode").write_text("folding\n")
+    FoldingContext(sessions / "s.folds.sqlite3", "s").close()
 
     result = subprocess.run(
         [
@@ -102,3 +105,28 @@ def test_resume_automatically_restores_the_persisted_folding_mode(tmp_path):
     assert result.returncode == 0
     assert "recoverable context folding enabled; compaction disabled" in result.stdout
     assert (sessions / "s.folds.sqlite3").exists()
+
+
+def test_resume_refuses_to_silently_replace_a_missing_folding_ledger(tmp_path):
+    sessions = tmp_path / ".agent" / "sessions"
+    sessions.mkdir(parents=True)
+    (sessions / "s.jsonl").write_text(
+        '{"type":"message","message":{"role":"assistant","content":"done"}}\n'
+    )
+    (sessions / "s.context-mode").write_text("folding\n")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "main.py"),
+            "--workspace",
+            str(tmp_path),
+            "--resume",
+            "s",
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "folding ledger is missing" in result.stderr

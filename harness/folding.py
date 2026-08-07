@@ -321,8 +321,10 @@ class FoldingContext:
                 break
             common += 1
         if common < len(self._snapshots):
+            abandoned = self._active_ids[common:]
             self._active_ids = self._active_ids[:common]
             self._snapshots = self._snapshots[:common]
+            self._deactivate_messages(abandoned)
 
         if not self._snapshots:
             persisted = self._db.execute(
@@ -337,22 +339,7 @@ class FoldingContext:
                 self._snapshots.append(current)
             if len(self._snapshots) == len(serialized) < len(persisted):
                 abandoned = [row["message_id"] for row in persisted[len(serialized) :]]
-                placeholders = ",".join("?" for _ in abandoned)
-                with self._db:
-                    self._db.execute(
-                        f"UPDATE messages SET active = 0 WHERE message_id IN ({placeholders})",
-                        abandoned,
-                    )
-                    self._db.execute(
-                        f"UPDATE entries SET active = 0 WHERE "
-                        f"substr(span_id, 1, instr(span_id || '.', '.') - 1) "
-                        f"IN ({placeholders})",
-                        abandoned,
-                    )
-                    self._db.execute(
-                        f"UPDATE tool_calls SET active = 0 WHERE message_id IN ({placeholders})",
-                        abandoned,
-                    )
+                self._deactivate_messages(abandoned)
 
         next_order_row = self._db.execute(
             "SELECT COALESCE(MAX(ledger_order), -1) + 1 AS next_order "
@@ -390,6 +377,26 @@ class FoldingContext:
                 (self._turn_user_id, self.turn),
             )
         self._db.commit()
+
+    def _deactivate_messages(self, message_ids: list[str]) -> None:
+        if not message_ids:
+            return
+        placeholders = ",".join("?" for _ in message_ids)
+        with self._db:
+            self._db.execute(
+                f"UPDATE messages SET active = 0 WHERE message_id IN ({placeholders})",
+                message_ids,
+            )
+            self._db.execute(
+                f"UPDATE entries SET active = 0 WHERE "
+                f"substr(span_id, 1, instr(span_id || '.', '.') - 1) "
+                f"IN ({placeholders})",
+                message_ids,
+            )
+            self._db.execute(
+                f"UPDATE tool_calls SET active = 0 WHERE message_id IN ({placeholders})",
+                message_ids,
+            )
 
     def _restore_purged_messages(self, messages: list[dict]) -> None:
         """Keep a raw SessionLog from resurrecting locally-erased bytes."""
@@ -500,6 +507,7 @@ class FoldingContext:
             "untrusted": bool(tool and tool.untrusted_output),
         }
         if self._contains_secret(content):
+            self._purge_session_log([content], _REDACTION_MARKER)
             self._insert_entry(
                 span_id,
                 None,
@@ -1007,7 +1015,9 @@ class FoldingContext:
         self._event("user_delete", span=target, decider="user")
         return f"deleted {target}; content is no longer recoverable"
 
-    def _purge_session_log(self, erased: list[str]) -> None:
+    def _purge_session_log(
+        self, erased: list[str], marker: str = "[deleted by user]"
+    ) -> None:
         path = self.session_log_path
         if path is None or not path.exists() or not erased:
             return
@@ -1020,11 +1030,11 @@ class FoldingContext:
             if not isinstance(value, str):
                 return value
             if value in erased:
-                return "[deleted by user]"
+                return marker
             cleaned = value
             for content in erased:
                 if len(content) >= 20:
-                    cleaned = cleaned.replace(content, "[deleted by user]")
+                    cleaned = cleaned.replace(content, marker)
             return cleaned
 
         try:

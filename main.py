@@ -338,7 +338,13 @@ def main():
             f"invalid persisted context mode for {session_path.name}: "
             f"{stored_context_mode!r}"
         )
-    if stored_context_mode is None and folding_paths(session_path)[0].exists():
+    fold_db_path = folding_paths(session_path)[0]
+    if stored_context_mode == "folding" and resuming and not fold_db_path.exists():
+        parser.error(
+            f"session {session_path.name} uses context folding but its folding "
+            "ledger is missing"
+        )
+    if stored_context_mode is None and fold_db_path.exists():
         # Compatibility with folding sessions created before the sidecar was
         # introduced: the stable ledger is authoritative evidence of the mode.
         stored_context_mode = "folding"

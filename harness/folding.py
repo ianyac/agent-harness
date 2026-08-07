@@ -67,7 +67,7 @@ _SECRET_PATTERNS = (
     ),
 )
 _REDACTION_MARKER = "[redacted — credential detected in tool output]"
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -127,6 +127,7 @@ CREATE TABLE IF NOT EXISTS messages (
     message_json  TEXT NOT NULL,
     content_sha   TEXT NOT NULL,
     created_turn  INTEGER NOT NULL,
+    scrubbed      INTEGER NOT NULL DEFAULT 0,
     active        INTEGER NOT NULL DEFAULT 1,
     UNIQUE(session_id, ledger_order)
 );
@@ -399,7 +400,8 @@ class FoldingContext:
             current = _canonical(message)
             if current != raw:
                 self._db.execute(
-                    "UPDATE messages SET message_json = ?, content_sha = ? "
+                    "UPDATE messages SET message_json = ?, content_sha = ?, "
+                    "scrubbed = 1 "
                     "WHERE message_id = ?",
                     (current, _sha(current), message_id),
                 )
@@ -442,7 +444,7 @@ class FoldingContext:
     def _restore_purged_messages(self, messages: list[dict]) -> None:
         """Keep a raw SessionLog from resurrecting locally-erased bytes."""
         rows = self._db.execute(
-            "SELECT m.message_json, EXISTS ("
+            "SELECT m.message_json, m.scrubbed, EXISTS ("
             "SELECT 1 FROM entries e JOIN span_state s USING(span_id) "
             "WHERE e.active = 1 AND s.state = 'purged' "
             "AND (e.span_id = m.message_id OR e.span_id GLOB m.message_id || '.*')"
@@ -453,7 +455,7 @@ class FoldingContext:
         for index, row in enumerate(rows):
             if index >= len(messages):
                 break
-            if row["has_purge"]:
+            if row["scrubbed"] or row["has_purge"]:
                 messages[index].clear()
                 messages[index].update(json.loads(row["message_json"]))
 
@@ -1362,7 +1364,8 @@ class FoldingContext:
                     )
                     if table == "messages" and column == "message_json":
                         self._db.execute(
-                            "UPDATE messages SET content_sha = ? WHERE rowid = ?",
+                            "UPDATE messages SET content_sha = ?, scrubbed = 1 "
+                            "WHERE rowid = ?",
                             (_sha(cleaned), row["scrub_rowid"]),
                         )
 

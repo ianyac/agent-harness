@@ -826,6 +826,40 @@ def test_user_delete_reconciles_an_exact_duplicate_result_chunk(tmp_path):
     assert context.project(messages)[5]["content"].count("[deleted by user]") == 1
 
 
+def test_resume_restores_every_scrubbed_message_before_sync(tmp_path):
+    payload = "XYZ12345"
+    messages = tool_exchange("first", {}, payload)
+    messages.extend(
+        tool_exchange(
+            "second",
+            {},
+            f"prefix {payload} suffix",
+            call_id="call_1",
+        )
+    )
+    pre_delete = deepcopy(messages)
+    path = tmp_path / "folds.sqlite3"
+    config = FoldConfig(min_span_tokens=0, chunk_tokens=3)
+    first = FoldingContext(path, "session", config=config)
+    tools = {"first": noop_tool(name="first"), "second": noop_tool(name="second")}
+    first.sync(messages, tools)
+    original_ids = first.span_ids()
+    first.delete("m2.r0")
+    first.close()
+
+    resumed = FoldingContext(path, "session", config=config)
+    resumed.sync(pre_delete, tools)
+
+    child_copy = "".join(
+        resumed.content(span_id) or "" for span_id in resumed.child_ids("m5.r0")
+    )
+    assert resumed.span_ids() == original_ids
+    assert resumed.state("m2.r0") == "purged"
+    assert resumed.content("m5.r0") == "prefix [deleted by user] suffix"
+    assert child_copy == resumed.content("m5.r0")
+    assert payload not in json.dumps(pre_delete)
+
+
 def test_resume_ignores_a_crash_tail_without_reusing_its_ids(tmp_path):
     # Regression caught: SQLite may ingest an in-flight exchange before the
     # SessionLog commits it. Resume must use the completed transcript, while new

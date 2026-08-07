@@ -885,6 +885,40 @@ def test_user_delete_of_tool_input_only_rewrites_its_selected_call_field(tmp_pat
     assert context._entry("m3.r0")["meta_json"] == unrelated_meta_before
 
 
+def test_user_delete_of_tool_input_preserves_unrelated_metadata_fields(tmp_path):
+    messages = tool_exchange("write", {"content": "true", "note": "keep true"}, "written")
+    write = Tool(
+        name="write",
+        description="consume content",
+        parameters={
+            "type": "object",
+            "properties": {"content": {"type": "string"}},
+            "required": ["content"],
+        },
+        execute=lambda content: "written",
+        foldable_inputs=("content",),
+    )
+    context = FoldingContext(
+        tmp_path / "folds.sqlite3", "session", config=FoldConfig(min_span_tokens=0)
+    )
+    context.sync(messages, {"write": write})
+
+    context.delete("m1.i0")
+
+    input_meta = json.loads(context._entry("m1.i0")["meta_json"])
+    result_meta = json.loads(context._entry("m2.r0")["meta_json"])
+    assert json.loads(input_meta["args_json"]) == {
+        "content": "[deleted by user]",
+        "note": "keep true",
+    }
+    assert json.loads(result_meta["args_json"]) == {
+        "content": "[deleted by user]",
+        "note": "keep true",
+    }
+    assert input_meta["canonical_key"] == 'write:{"content":"[deleted by user]","note":"keep true"}'
+    assert result_meta["canonical_key"] == 'write:{"content":"[deleted by user]","note":"keep true"}'
+
+
 def test_user_delete_purges_duplicate_entry_and_live_shadow_copies(tmp_path):
     payload = "ERASE_DUPLICATE_77"
     messages = tool_exchange("first", {}, payload)
@@ -1084,7 +1118,7 @@ def test_user_delete_reconciles_an_exact_duplicate_result_chunk(tmp_path):
 
 def test_user_delete_scrubs_only_matching_in_memory_notices(tmp_path):
     context, _messages = context_with_result(tmp_path, "delete me permanently")
-    context._db.execute(
+    notice = context._db.execute(
         "INSERT INTO notices(span_id, kind, content, created_turn) VALUES (?, ?, ?, ?)",
         ("m2.r0", "auto", "notice: delete me permanently", context.turn),
     )
@@ -1093,10 +1127,41 @@ def test_user_delete_scrubs_only_matching_in_memory_notices(tmp_path):
         "notice: delete me permanently",
         "unrelated notice remains",
     ]
+    context._current_notice_ids = [notice.lastrowid, None]
 
     context.delete("m2.r0")
 
     assert context.turn_notice() == "notice: [deleted by user]\nunrelated notice remains"
+
+
+def test_user_delete_keeps_identical_unrelated_live_notice_unchanged(tmp_path):
+    context, _messages = context_with_result(tmp_path, "delete me permanently")
+    first = context._db.execute(
+        "INSERT INTO notices(span_id, kind, content, created_turn) VALUES (?, ?, ?, ?)",
+        ("m2.r0", "auto", "notice: delete me permanently", context.turn),
+    )
+    second = context._db.execute(
+        "INSERT INTO notices(span_id, kind, content, created_turn) VALUES (?, ?, ?, ?)",
+        ("m0", "auto", "notice: delete me permanently", context.turn),
+    )
+    context._db.commit()
+    context._current_notices = [
+        "notice: delete me permanently",
+        "notice: delete me permanently",
+    ]
+    context._current_notice_ids = [first.lastrowid, second.lastrowid]
+
+    context.delete("m2.r0")
+
+    rows = context._db.execute(
+        "SELECT notice_id, content FROM notices ORDER BY notice_id"
+    ).fetchall()
+    assert rows[-2]["content"] == "notice: [deleted by user]"
+    assert rows[-1]["content"] == "notice: delete me permanently"
+    assert context._current_notices == [
+        "notice: [deleted by user]",
+        "notice: delete me permanently",
+    ]
 
 
 def test_resume_restores_only_provenance_targeted_messages_before_sync(tmp_path):

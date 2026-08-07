@@ -330,6 +330,7 @@ class FoldingContext:
             self._purge_paths.add(self.decision_log_path)
         self._event_seq = 0
         self._current_notices: list[str] = []
+        self._current_notice_ids: list[int | None] = []
         self._turn_start_length = 0
         self._turn_user_id: str | None = None
         row = self._db.execute(
@@ -911,6 +912,7 @@ class FoldingContext:
         self.turn += 1
         self._event_seq = 0
         self._current_notices = []
+        self._current_notice_ids = []
         self.checkpoint(reason="turn boundary")
         self._queue_pressure_notice()
         rows = self._db.execute(
@@ -923,6 +925,7 @@ class FoldingContext:
         # Deferred notices describe decisions made before this boundary, so
         # present them before the checkpoint's newly-computed workspace map.
         self._current_notices[0:0] = [row["content"] for row in rows]
+        self._current_notice_ids[0:0] = [int(row["notice_id"]) for row in rows]
         if rows:
             ids = [row["notice_id"] for row in rows]
             placeholders = ",".join("?" for _ in ids)
@@ -1026,12 +1029,13 @@ class FoldingContext:
             ).fetchone()
             if exists is not None:
                 continue
-            self._db.execute(
+            cursor = self._db.execute(
                 "INSERT INTO notices(span_id, message_id, kind, content, "
                 "created_turn, emitted_turn) VALUES (?, ?, 'reference', ?, ?, ?)",
                 (span_id, message_id, notice, self.turn, self.turn),
             )
             self._current_notices.append(notice)
+            self._current_notice_ids.append(int(cursor.lastrowid))
             self._event("notice_emitted", kind="reference", ref=span_id)
 
     def turn_notice(self) -> str:
@@ -1132,7 +1136,9 @@ class FoldingContext:
         # prose that merely contains the same payload.
         self._purge_session_log([payload], replace_substrings=False)
         with self._db:
-            self._scrub_delete_entry_metadata(metadata_span_ids, [payload])
+            self._scrub_delete_entry_metadata(
+                metadata_span_ids, input_aliases, payload
+            )
             self._scrub_delete_tool_calls(input_aliases, payload)
             self._scrub_delete_messages(
                 root_owner_ids, indexed_owner_ids, input_aliases, payload
@@ -1165,7 +1171,13 @@ class FoldingContext:
                 root_owner_ids, indexed_owner_ids, input_aliases, payload
             )
             self._current_notices = [
-                notice_updates.get(notice, notice) for notice in self._current_notices
+                notice_updates.get(
+                    self._current_notice_ids[index]
+                    if index < len(self._current_notice_ids)
+                    else None,
+                    notice,
+                )
+                for index, notice in enumerate(self._current_notices)
             ]
         # secure_delete overwrites changed cells; VACUUM also eliminates free
         # pages that could retain a pre-purge copy after variable-size updates.
@@ -1293,7 +1305,10 @@ class FoldingContext:
             )
 
     def _scrub_delete_entry_metadata(
-        self, span_ids: set[str], erased: list[str]
+        self,
+        span_ids: set[str],
+        input_aliases: list[dict[str, str]],
+        payload: str,
     ) -> None:
         if not span_ids:
             return
@@ -1303,13 +1318,27 @@ class FoldingContext:
             list(span_ids),
         ).fetchall()
         for row in rows:
-            cleaned = self._scrub_text(
-                row["meta_json"],
-                erased,
-                "[deleted by user]",
-                mode="structured",
-                replace_substrings=True,
+            metadata = json.loads(row["meta_json"])
+            call_id = metadata.get("call_id")
+            alias = next(
+                (candidate for candidate in input_aliases if candidate["call_id"] == call_id),
+                None,
             )
+            if alias is None:
+                continue
+            try:
+                arguments = json.loads(metadata.get("args_json", ""))
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(arguments, dict) or arguments.get(alias["field"]) != payload:
+                continue
+            arguments[alias["field"]] = "[deleted by user]"
+            args_json = _canonical(arguments)
+            metadata["args_json"] = args_json
+            tool_name = metadata.get("tool_name")
+            if isinstance(tool_name, str):
+                metadata["canonical_key"] = f"{tool_name}:{args_json}"
+            cleaned = _canonical(metadata)
             if cleaned != row["meta_json"]:
                 self._db.execute(
                     "UPDATE entries SET meta_json = ? WHERE span_id = ?",
@@ -1412,7 +1441,7 @@ class FoldingContext:
 
     def _scrub_delete_folds_and_notices(
         self, span_ids: set[str], erased: list[str]
-    ) -> dict[str, str]:
+    ) -> dict[int, str]:
         if span_ids:
             placeholders = ",".join("?" for _ in span_ids)
             rows = self._db.execute(
@@ -1436,14 +1465,14 @@ class FoldingContext:
             f"SELECT notice_id, content FROM notices WHERE span_id IN ({placeholders})",
             list(span_ids),
         ).fetchall()
-        updates: dict[str, str] = {}
+        updates: dict[int, str] = {}
         for row in rows:
             cleaned = self._scrub_text(
                 row["content"], erased, "[deleted by user]", mode="data",
                 replace_substrings=True,
             )
             if cleaned != row["content"]:
-                updates[str(row["content"])] = cleaned
+                updates[int(row["notice_id"])] = cleaned
                 self._db.execute(
                     "UPDATE notices SET content = ? WHERE notice_id = ?",
                     (cleaned, row["notice_id"]),
@@ -2225,13 +2254,14 @@ class FoldingContext:
                 f"~{_token_label(open_row['tokens'])} tok; "
                 f"{folded_row['spans']} folded]"
             )
-            self._current_notices.append(workspace_notice)
             with self._db:
-                self._db.execute(
+                cursor = self._db.execute(
                     "INSERT INTO notices(message_id, kind, content, created_turn, "
                     "emitted_turn) VALUES (?, 'workspace', ?, ?, ?)",
                     (self._turn_user_id, workspace_notice, self.turn, self.turn),
                 )
+            self._current_notices.append(workspace_notice)
+            self._current_notice_ids.append(int(cursor.lastrowid))
             self._event(
                 "checkpoint_rebuild",
                 reason=reason,

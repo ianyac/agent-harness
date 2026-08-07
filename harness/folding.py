@@ -1068,12 +1068,7 @@ class FoldingContext:
             self._scrub_sqlite(erased, "[deleted by user]")
             self._scrub_live_shadow(erased, "[deleted by user]")
             self._current_notices = [
-                self._scrub_text(
-                    notice,
-                    erased,
-                    "[deleted by user]",
-                    encoded_json=False,
-                )
+                str(self._scrub_data(notice, erased, "[deleted by user]"))
                 for notice in self._current_notices
             ]
         # secure_delete overwrites changed cells; VACUUM also eliminates free
@@ -1088,7 +1083,7 @@ class FoldingContext:
         ).fetchall()
         for row in rows:
             content = row["content"]
-            cleaned = str(self._scrub_value(content, erased, marker))
+            cleaned = str(self._scrub_data(content, erased, marker))
             if cleaned == content:
                 continue
             span_id = row["span_id"]
@@ -1122,7 +1117,7 @@ class FoldingContext:
         if self._shadow_ref is None:
             return
         for index, message in enumerate(self._shadow_ref):
-            cleaned = self._scrub_value(deepcopy(message), erased, marker)
+            cleaned = self._scrub_structured(deepcopy(message), erased, marker)
             if cleaned == message or not isinstance(cleaned, dict):
                 continue
             message.clear()
@@ -1130,17 +1125,74 @@ class FoldingContext:
             if index < len(self._snapshots):
                 self._snapshots[index] = _canonical(message)
 
-    @staticmethod
-    def _scrub_value(value: object, erased: list[str], marker: str) -> object:
+    @classmethod
+    def _scrub_structured(
+        cls, value: object, erased: list[str], marker: str
+    ) -> object:
+        """Scrub user data without changing the surrounding protocol shape."""
+        if isinstance(value, dict):
+            cleaned: dict[object, object] = {}
+            for key, item in value.items():
+                # Keys define message, event, and tool schemas. Rewriting one
+                # can make an otherwise valid transcript impossible to replay.
+                if key in {"args", "arguments", "args_json"}:
+                    cleaned[key] = cls._scrub_arguments(item, erased, marker)
+                elif key == "canonical_key":
+                    cleaned[key] = cls._scrub_canonical_key(item, erased, marker)
+                elif key in {
+                    "content",
+                    "note",
+                    "output",
+                    "payload",
+                    "result",
+                    "summary_text",
+                    "text",
+                }:
+                    cleaned[key] = cls._scrub_data(item, erased, marker)
+                elif key in {
+                    "actor",
+                    "call_id",
+                    "decider",
+                    "ev",
+                    "event",
+                    "field",
+                    "id",
+                    "message_id",
+                    "name",
+                    "origin",
+                    "parent_id",
+                    "placement",
+                    "reason",
+                    "role",
+                    "session_id",
+                    "span",
+                    "span_id",
+                    "state",
+                    "tool_call_id",
+                    "tool_name",
+                    "type",
+                }:
+                    cleaned[key] = item
+                else:
+                    cleaned[key] = cls._scrub_structured(item, erased, marker)
+            return cleaned
+        if isinstance(value, list):
+            return [cls._scrub_structured(item, erased, marker) for item in value]
+        if not isinstance(value, str):
+            return value
+        # Unknown scalar fields may be copies of the payload, but partial
+        # replacement is unsafe: they may also be protocol identifiers.
+        return marker if value in erased else value
+
+    @classmethod
+    def _scrub_data(cls, value: object, erased: list[str], marker: str) -> object:
         if isinstance(value, dict):
             return {
-                str(FoldingContext._scrub_value(key, erased, marker)): (
-                    FoldingContext._scrub_value(item, erased, marker)
-                )
+                key: cls._scrub_data(item, erased, marker)
                 for key, item in value.items()
             }
         if isinstance(value, list):
-            return [FoldingContext._scrub_value(item, erased, marker) for item in value]
+            return [cls._scrub_data(item, erased, marker) for item in value]
         if not isinstance(value, str):
             return value
         if value in erased:
@@ -1152,51 +1204,91 @@ class FoldingContext:
             except json.JSONDecodeError:
                 pass
             else:
-                cleaned_nested = FoldingContext._scrub_value(
-                    nested, erased, marker
-                )
+                cleaned_nested = cls._scrub_data(nested, erased, marker)
                 return value if cleaned_nested == nested else _canonical(cleaned_nested)
         cleaned = value
         for content in erased:
-            if content:
+            if not content:
+                continue
+            if len(content) >= 4 and re.fullmatch(r"[\w-]+", content):
+                cleaned = re.sub(
+                    rf"(?<![\w-]){re.escape(content)}(?![\w-])",
+                    lambda _match: marker,
+                    cleaned,
+                )
+            elif len(content) >= 8:
                 cleaned = cleaned.replace(content, marker)
         return cleaned
 
     @classmethod
-    def _scrub_text(
-        cls, value: str, erased: list[str], marker: str, *, encoded_json: bool
-    ) -> str:
-        if encoded_json:
+    def _scrub_arguments(
+        cls, value: object, erased: list[str], marker: str
+    ) -> object:
+        if isinstance(value, str):
+            if value in erased:
+                return marker
             try:
                 decoded = json.loads(value)
             except json.JSONDecodeError:
-                pass
+                return cls._scrub_data(value, erased, marker)
             else:
-                cleaned_decoded = cls._scrub_value(decoded, erased, marker)
+                cleaned_decoded = cls._scrub_data(decoded, erased, marker)
                 return (
                     value
                     if cleaned_decoded == decoded
                     else _canonical(cleaned_decoded)
                 )
-        return str(cls._scrub_value(value, erased, marker))
+        return cls._scrub_data(value, erased, marker)
+
+    @classmethod
+    def _scrub_canonical_key(
+        cls, value: object, erased: list[str], marker: str
+    ) -> object:
+        if not isinstance(value, str):
+            return value
+        if value in erased:
+            return marker
+        tool_name, separator, arguments = value.partition(":")
+        if not separator:
+            return value
+        cleaned = cls._scrub_arguments(arguments, erased, marker)
+        return value if cleaned == arguments else f"{tool_name}:{cleaned}"
+
+    @classmethod
+    def _scrub_text(
+        cls, value: str, erased: list[str], marker: str, *, mode: str
+    ) -> str:
+        if mode in {"arguments", "structured"}:
+            try:
+                decoded = json.loads(value)
+            except json.JSONDecodeError:
+                return value
+            if mode == "arguments":
+                cleaned_decoded = cls._scrub_data(decoded, erased, marker)
+            else:
+                cleaned_decoded = cls._scrub_structured(decoded, erased, marker)
+            return value if cleaned_decoded == decoded else _canonical(cleaned_decoded)
+        if mode == "canonical_key":
+            return str(cls._scrub_canonical_key(value, erased, marker))
+        return str(cls._scrub_data(value, erased, marker))
 
     def _scrub_sqlite(self, erased: list[str], marker: str) -> None:
         columns = (
-            ("entries", "meta_json", True),
-            ("folds", "note", False),
-            ("messages", "message_json", True),
-            ("tool_calls", "args_json", True),
-            ("tool_calls", "canonical_key", False),
-            ("notices", "content", False),
+            ("entries", "meta_json", "structured"),
+            ("folds", "note", "data"),
+            ("messages", "message_json", "structured"),
+            ("tool_calls", "args_json", "arguments"),
+            ("tool_calls", "canonical_key", "canonical_key"),
+            ("notices", "content", "data"),
         )
-        for table, column, encoded_json in columns:
+        for table, column, mode in columns:
             rows = self._db.execute(
                 f"SELECT rowid AS scrub_rowid, {column} AS value FROM {table} "
                 f"WHERE {column} IS NOT NULL"
             ).fetchall()
             for row in rows:
                 cleaned = self._scrub_text(
-                    row["value"], erased, marker, encoded_json=encoded_json
+                    row["value"], erased, marker, mode=mode
                 )
                 if cleaned != row["value"]:
                     self._db.execute(
@@ -1216,7 +1308,7 @@ class FoldingContext:
             return
 
         def scrub(value: object) -> object:
-            return self._scrub_value(value, erased, marker)
+            return self._scrub_structured(value, erased, marker)
 
         for path in self._purge_paths:
             if not path.exists():

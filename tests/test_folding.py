@@ -680,6 +680,27 @@ def test_user_delete_purges_duplicate_entry_and_live_shadow_copies(tmp_path):
     assert payload.encode() not in database_path.read_bytes()
 
 
+def test_user_delete_of_short_payload_preserves_message_structure(tmp_path):
+    messages = tool_exchange("noop", {}, "a") + [
+        {"role": "assistant", "content": "task remains"}
+    ]
+    messages[0]["content"] = "task"
+    context = FoldingContext(
+        tmp_path / "folds.sqlite3",
+        "session",
+        config=FoldConfig(min_span_tokens=0),
+    )
+    context.sync(messages, {"noop": noop_tool()})
+
+    context.delete("m2.r0")
+
+    assert messages[0] == {"role": "user", "content": "task"}
+    assert messages[1]["role"] == "assistant"
+    assert messages[1]["tool_calls"][0]["function"]["name"] == "noop"
+    assert messages[3] == {"role": "assistant", "content": "task remains"}
+    assert context.project(messages)[2]["content"] == "[deleted by user]"
+
+
 def test_resume_ignores_a_crash_tail_without_reusing_its_ids(tmp_path):
     # Regression caught: SQLite may ingest an in-flight exchange before the
     # SessionLog commits it. Resume must use the completed transcript, while new

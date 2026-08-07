@@ -54,7 +54,11 @@ def run_subagent(
     offered, so a restricted registry (a fork skill's allowed-tools) stays
     authoritative. A subagent never prompts (asker=None → ask-decisions become
     denials)."""
-    inner = {name: t for name, t in tools.items() if not t.spawns_subagents}
+    inner = {
+        name: t
+        for name, t in tools.items()
+        if not t.spawns_subagents and t.inheritable
+    }
     # a callable sees a COPY of the mapping: it is meant to choose a build from
     # what the sub will hold, not to add entries behind the checks below. (The
     # Tool objects inside are shared, as they are with the parent registry —
@@ -160,5 +164,6 @@ def agent_tool(
         # gated by the policy (with denial instead of prompting)
         read_only=True,
         spawns_subagents=True,
+        foldable_inputs=("task",),
     )
     return tool

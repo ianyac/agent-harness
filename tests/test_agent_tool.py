@@ -156,6 +156,11 @@ def test_delegation_itself_is_read_only():
     assert tool.read_only is True
 
 
+def test_delegation_declares_its_consumed_task_brief_as_foldable():
+    tool = agent_tool(FakeLLM([]), tools={}, policy=None)
+    assert tool.foldable_inputs == ("task",)
+
+
 def test_an_exhausted_subagent_is_an_error_not_an_answer():
     # a sub that hits max_iterations returns the harness abort marker;
     # the wrapper must convert it to an error string, never relay it as
@@ -243,6 +248,26 @@ def test_run_subagent_excludes_spawns_subagents_tools():
     names = [d["function"]["name"] for d in llm.turns[0]["tools"]]
     assert "noop" in names
     assert "agent" not in names
+
+
+def test_run_subagent_excludes_session_local_non_inheritable_tools():
+    # Regression caught: a child using the parent's fold tool would mutate IDs
+    # belonging to a transcript it cannot see.
+    llm = FakeLLM([{"type": "text", "content": "done"}])
+    tools = {
+        "local": Tool(
+            name="local",
+            description="parent-local control",
+            parameters={"type": "object", "properties": {}},
+            execute=lambda: "ok",
+            read_only=True,
+            inheritable=False,
+        ),
+        "noop": noop_tool(),
+    }
+    run_subagent("do it", llm, tools, policy=None)
+    names = [definition["function"]["name"] for definition in llm.turns[0]["tools"]]
+    assert names == ["noop"]
 
 
 def test_substitution_restores_a_filtered_tool_in_a_safe_build():

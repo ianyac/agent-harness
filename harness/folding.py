@@ -230,6 +230,7 @@ class FoldingContext:
         self._active_ids: list[str] = []
         self._snapshots: list[str] = []
         self._event_seq = 0
+        self._current_notices: list[str] = []
         row = self._db.execute(
             "SELECT COALESCE(MAX(created_turn), 0) AS turn FROM messages "
             "WHERE session_id = ?",
@@ -325,6 +326,7 @@ class FoldingContext:
             for call_index, call in enumerate(message.get("tool_calls") or []):
                 function = call["function"]
                 args_json = function["arguments"]
+                args: dict | None = None
                 try:
                     args = json.loads(args_json)
                     canonical_args = _canonical(args)
@@ -343,6 +345,25 @@ class FoldingContext:
                         key,
                     ),
                 )
+                tool = tools.get(function["name"])
+                if tool is not None and tool.foldable_inputs and isinstance(args, dict):
+                    field = tool.foldable_inputs[0]
+                    payload = args.get(field)
+                    if isinstance(payload, str):
+                        self._insert_entry(
+                            f"{message_id}.i{call_index}",
+                            message_id,
+                            "assistant",
+                            "tool_input",
+                            payload,
+                            {
+                                "call_id": call["id"],
+                                "tool_name": function["name"],
+                                "field": field,
+                                "args_json": args_json,
+                            },
+                        )
+                self._detect_refetch(key, call["id"])
 
     def _ingest_tool_result(
         self,
@@ -405,6 +426,7 @@ class FoldingContext:
                 "UPDATE tool_calls SET result_span = ? WHERE call_id = ?",
                 (span_id, call_id),
             )
+            self._apply_heuristics(span_id, call, tool)
 
     def _insert_entry(
         self,
@@ -460,6 +482,142 @@ class FoldingContext:
             # accepted it; replay remains authoritative.
             pass
 
+    def _detect_refetch(self, canonical_key: str, call_id: str) -> None:
+        rows = self._db.execute(
+            "SELECT result_span FROM tool_calls WHERE canonical_key = ? "
+            "AND call_id != ? AND result_span IS NOT NULL ORDER BY rowid DESC",
+            (canonical_key, call_id),
+        ).fetchall()
+        for row in rows:
+            span_id = row["result_span"]
+            if self.state(span_id) not in ("folded", "quarantined"):
+                continue
+            if self.reason(span_id) == "superseded":
+                continue
+            self._event("refetch_candidate", span=span_id)
+            return
+
+    @staticmethod
+    def _result_failed(content: str) -> bool:
+        lowered = content.lstrip().lower()
+        if lowered.startswith(("error:", "permission denied:", "blocked by hook:")):
+            return True
+        match = re.match(r"exit code:\s*(-?\d+)", lowered)
+        return bool(match and int(match.group(1)) != 0)
+
+    def _apply_heuristics(
+        self,
+        span_id: str,
+        call: sqlite3.Row,
+        tool: Tool | None,
+    ) -> None:
+        content = self.content(span_id) or ""
+        if self._result_failed(content):
+            return
+
+        # A successful write/delegation makes its registered payload redundant
+        # independently of what happens to the result itself.
+        payloads = self._db.execute(
+            "SELECT span_id, meta_json FROM entries WHERE session_id = ? "
+            "AND origin = 'tool_input' ORDER BY rowid DESC",
+            (self.session_id,),
+        ).fetchall()
+        result_meta = json.loads(self._entry(span_id)["meta_json"])
+        for payload in payloads:
+            meta = json.loads(payload["meta_json"])
+            if meta["call_id"] != result_meta.get("call_id"):
+                continue
+            if meta.get("tool_name") == "agent":
+                reason = "scaffolding"
+                note = f"subagent brief consumed; result returned in {span_id}"
+            else:
+                reason = "superseded"
+                try:
+                    args = json.loads(meta.get("args_json", "{}"))
+                except json.JSONDecodeError:
+                    args = {}
+                target = args.get("path")
+                pointer = f" at {target}" if isinstance(target, str) else ""
+                note = (
+                    f"payload applied successfully{pointer}; read the canonical "
+                    "destination for current content"
+                )
+            self._auto_fold(payload["span_id"], reason, note)
+            break
+
+        current = self._entry(span_id)
+        duplicates = self._db.execute(
+            "SELECT e.span_id FROM entries e JOIN span_state s USING(span_id) "
+            "WHERE e.session_id = ? AND e.origin = 'tool' AND e.parent_id IS NULL "
+            "AND e.content_sha = ? AND e.span_id != ? AND s.state = 'visible' "
+            "ORDER BY e.rowid",
+            (self.session_id, current["content_sha"], span_id),
+        ).fetchall()
+        if duplicates:
+            self._auto_fold(span_id, "duplicate", f"dup of {duplicates[0]['span_id']}")
+            return
+
+        # A successful retry closes only an earlier failure with the exact same
+        # canonical operation, never another call that happens to share a name.
+        retries = self._db.execute(
+            "SELECT result_span FROM tool_calls WHERE canonical_key = ? "
+            "AND result_span IS NOT NULL AND result_span != ? ORDER BY rowid DESC",
+            (call["canonical_key"], span_id),
+        ).fetchall()
+        for retry in retries:
+            prior = retry["result_span"]
+            if self.state(prior) == "visible" and self._result_failed(self.content(prior) or ""):
+                self._auto_fold(
+                    prior,
+                    "handled_failure",
+                    f"earlier operation failed; successful retry is {span_id}",
+                )
+                break
+
+        if call["tool_name"] != "read_file":
+            return
+        try:
+            current_args = json.loads(call["args_json"])
+        except json.JSONDecodeError:
+            return
+        path = current_args.get("path")
+        if not isinstance(path, str):
+            return
+        earlier_reads = self._db.execute(
+            "SELECT args_json, result_span FROM tool_calls WHERE tool_name = 'read_file' "
+            "AND result_span IS NOT NULL AND result_span != ? ORDER BY rowid DESC",
+            (span_id,),
+        ).fetchall()
+        for earlier in earlier_reads:
+            try:
+                earlier_args = json.loads(earlier["args_json"])
+            except json.JSONDecodeError:
+                continue
+            prior = earlier["result_span"]
+            if earlier_args.get("path") == path and self.state(prior) == "visible":
+                self._auto_fold(
+                    prior,
+                    "superseded",
+                    f"later read {span_id} replaced this snapshot; successor: {span_id}",
+                )
+                break
+
+    def _auto_fold(self, span_id: str, reason: str, note: str) -> bool:
+        entry = self._entry(span_id)
+        if entry["tokens_est"] < self.config.min_span_tokens:
+            return False
+        try:
+            self.fold(span_id, reason, note, decider="heuristic")
+        except FoldError:
+            return False
+        self._event("heuristic_fired", rule=f"{reason}_v1", span=span_id)
+        self._db.execute(
+            "INSERT INTO notices(kind, content, created_turn) VALUES ('auto', ?, ?)",
+            (f"[auto-folded {span_id} — {reason}: {note}]", self.turn),
+        )
+        self._db.commit()
+        return True
+
     def span_ids(self) -> list[str]:
         rows = self._db.execute(
             "SELECT span_id FROM entries WHERE session_id = ? "
@@ -503,6 +661,37 @@ class FoldingContext:
             {"reason": row["reason"], "unfolded_turn": row["unfolded_turn"]}
             for row in rows
         ]
+
+    def reason(self, span_id: str) -> str:
+        return str(self._latest_fold(span_id)["reason"])
+
+    def note(self, span_id: str) -> str:
+        return str(self._latest_fold(span_id)["note"])
+
+    def begin_turn(self, messages: list[dict], tools: dict[str, Tool] | None = None) -> None:
+        self.sync(messages, tools)
+        self.turn += 1
+        self._event_seq = 0
+        self.checkpoint(reason="turn boundary")
+        rows = self._db.execute(
+            "SELECT notice_id, content FROM notices WHERE emitted_turn IS NULL "
+            "AND created_turn < ? ORDER BY notice_id",
+            (self.turn,),
+        ).fetchall()
+        self._current_notices = [row["content"] for row in rows]
+        if rows:
+            ids = [row["notice_id"] for row in rows]
+            placeholders = ",".join("?" for _ in ids)
+            with self._db:
+                self._db.execute(
+                    f"UPDATE notices SET emitted_turn = ? WHERE notice_id IN ({placeholders})",
+                    [self.turn, *ids],
+                )
+            for notice_id in ids:
+                self._event("notice_emitted", kind="auto", ref=notice_id)
+
+    def turn_notice(self) -> str:
+        return "\n".join(self._current_notices)
 
     def shadow_messages(self) -> list[dict]:
         rows = self._db.execute(
@@ -738,6 +927,8 @@ class FoldingContext:
                 }
                 projected.append(message)
                 continue
+            if role == "assistant":
+                self._project_input_payloads(message, message_id)
             if role == "tool":
                 if message.get("tool_call_id") in removed_call_ids:
                     continue
@@ -764,6 +955,40 @@ class FoldingContext:
             )
         self._lint(projected)
         return projected
+
+    def _project_input_payloads(self, message: dict, message_id: str) -> None:
+        for call_index, call in enumerate(message.get("tool_calls") or []):
+            span_id = f"{message_id}.i{call_index}"
+            row = self._db.execute(
+                "SELECT 1 FROM entries WHERE span_id = ? AND session_id = ?",
+                (span_id, self.session_id),
+            ).fetchone()
+            if row is None:
+                continue
+            entry = self._entry(span_id)
+            meta = json.loads(entry["meta_json"])
+            try:
+                arguments = json.loads(call["function"]["arguments"])
+            except json.JSONDecodeError:
+                continue
+            state = self.state(span_id)
+            replacement: str | None = None
+            if state == "purged":
+                replacement = _REDACTION_MARKER
+            elif state == "quarantined":
+                replacement = self._marker(span_id, self._latest_fold(span_id))
+            elif self._is_tail_reinstated(span_id):
+                replacement = (
+                    f"[unfolded {span_id} → tail, turn "
+                    f"{self._latest_fold(span_id)['unfolded_turn']}]"
+                )
+            elif state == "folded":
+                fold = self._open_fold(span_id)
+                if fold is not None and fold["placement"] is not None:
+                    replacement = self._marker(span_id, fold)
+            if replacement is not None:
+                arguments[meta["field"]] = replacement
+                call["function"]["arguments"] = _canonical(arguments)
 
     def _render_result(self, span_id: str) -> str:
         entry = self._entry(span_id)
@@ -817,6 +1042,8 @@ class FoldingContext:
         note = fold["note"].replace('"', '\\"')
         if reason == "sensitive":
             return _REDACTION_MARKER
+        if reason == "duplicate" and note.startswith("dup of "):
+            return f"[{note}]"
         if reason == "poisoned":
             return f'[removed {span_id} — poisoned: "{note}"]'
         entry = self._entry(span_id)

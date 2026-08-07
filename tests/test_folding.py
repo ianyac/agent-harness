@@ -796,6 +796,36 @@ def test_user_delete_reconciles_inactive_crash_tail_chunks(tmp_path):
     assert all(child["active"] == 0 for child in children)
 
 
+def test_user_delete_reconciles_an_exact_duplicate_result_chunk(tmp_path):
+    payload = "XYZ12345"
+    messages = tool_exchange("first", {}, payload)
+    messages.extend(
+        tool_exchange(
+            "second",
+            {},
+            f"prefix\n{payload}\nsuffix\n",
+            call_id="call_1",
+        )
+    )
+    context = FoldingContext(
+        tmp_path / "folds.sqlite3",
+        "session",
+        config=FoldConfig(min_span_tokens=0, chunk_tokens=3),
+    )
+    context.sync(
+        messages,
+        {"first": noop_tool(name="first"), "second": noop_tool(name="second")},
+    )
+
+    context.delete("m2.r0")
+
+    children = context.child_ids("m5.r0")
+    child_copy = "".join(context.content(span_id) or "" for span_id in children)
+    assert child_copy == context.content("m5.r0")
+    assert all(context.state(span_id) != "purged" for span_id in children)
+    assert context.project(messages)[5]["content"].count("[deleted by user]") == 1
+
+
 def test_resume_ignores_a_crash_tail_without_reusing_its_ids(tmp_path):
     # Regression caught: SQLite may ingest an in-flight exchange before the
     # SessionLog commits it. Resume must use the completed transcript, while new

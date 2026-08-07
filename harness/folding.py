@@ -1079,7 +1079,8 @@ class FoldingContext:
 
     def _purge_entry_copies(self, erased: list[str], marker: str) -> None:
         rows = self._db.execute(
-            "SELECT span_id, content FROM entries WHERE content IS NOT NULL"
+            "SELECT span_id, parent_id, role, content FROM entries "
+            "WHERE content IS NOT NULL"
         ).fetchall()
         for row in rows:
             content = row["content"]
@@ -1088,7 +1089,18 @@ class FoldingContext:
                 continue
             span_id = row["span_id"]
             if content in erased:
-                self._mark_entry_purged(span_id)
+                if row["parent_id"] is not None and row["role"] == "tool_result":
+                    # A chunk is an index into its parent, not an independent
+                    # copy. Sanitizing it here lets reconciliation repartition
+                    # the cleaned parent coherently. If this is a target chunk,
+                    # its purged parent terminally purges it below.
+                    self._db.execute(
+                        "UPDATE entries SET content = ?, content_sha = ?, "
+                        "tokens_est = ? WHERE span_id = ?",
+                        (marker, _sha(marker), count_text_tokens(marker), span_id),
+                    )
+                else:
+                    self._mark_entry_purged(span_id)
             else:
                 self._db.execute(
                     "UPDATE entries SET content = ?, content_sha = ?, tokens_est = ? "

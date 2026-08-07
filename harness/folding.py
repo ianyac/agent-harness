@@ -710,7 +710,7 @@ class FoldingContext:
                 value = match.groupdict().get("secret") or match.group(0)
                 if value and value not in values:
                     values.append(value)
-        return tuple(values)
+        return tuple(sorted(values, key=len, reverse=True))
 
     def _event(self, event: str, **fields: object) -> None:
         if self.decision_log_path is None:
@@ -1911,8 +1911,29 @@ class FoldingContext:
     def _collect_identifier_values(cls, value: object, found: set[str]) -> None:
         if isinstance(value, dict):
             for key, item in value.items():
-                if key in _IDENTIFIER_VALUE_KEYS and isinstance(item, str):
-                    found.add(item)
+                if key == "role":
+                    continue
+                if key in _IDENTIFIER_VALUE_KEYS:
+                    if isinstance(item, str):
+                        found.add(item)
+                    continue
+                if key == "canonical_key" and isinstance(item, str):
+                    tool_name, separator, _arguments = item.partition(":")
+                    found.add(tool_name if separator else item)
+                    continue
+                if key in {
+                    "args",
+                    "arguments",
+                    "args_json",
+                    "content",
+                    "note",
+                    "output",
+                    "payload",
+                    "result",
+                    "summary_text",
+                    "text",
+                }:
+                    continue
                 cls._collect_identifier_values(item, found)
         elif isinstance(value, list):
             for item in value:
@@ -1945,6 +1966,21 @@ class FoldingContext:
                 self._collect_identifier_values(decoded, identifiers)
         if self._shadow_ref is not None:
             self._collect_identifier_values(self._shadow_ref, identifiers)
+        for path in self._purge_paths:
+            if not path.exists():
+                continue
+            try:
+                lines = path.read_text().splitlines()
+            except OSError:
+                # The purge pass retains responsibility for surfacing artifact
+                # failures; inventory collection must not change that behavior.
+                continue
+            for line in lines:
+                try:
+                    decoded = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                self._collect_identifier_values(decoded, identifiers)
 
         replacements: dict[str, str] = {}
         for secret in secrets:

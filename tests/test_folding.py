@@ -817,6 +817,74 @@ def test_user_delete_scrubs_short_tool_input_from_every_local_copy(tmp_path, pay
     assert payload.encode() not in database_path.read_bytes()
 
 
+def test_user_delete_of_tool_input_only_rewrites_its_selected_call_field(tmp_path):
+    messages = [
+        {"role": "user", "content": "do it"},
+        {
+            "role": "assistant",
+            "content": "the true status prose is unrelated",
+            "tool_calls": [
+                {
+                    "id": "call_0",
+                    "type": "function",
+                    "function": {
+                        "name": "write",
+                        "arguments": json.dumps(
+                            {"content": "true", "note": "keep true"}
+                        ),
+                    },
+                },
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "noop",
+                        "arguments": json.dumps({"value": "true"}),
+                    },
+                },
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_0", "content": "written"},
+        {"role": "tool", "tool_call_id": "call_1", "content": "unrelated"},
+    ]
+    write = Tool(
+        name="write",
+        description="consume content",
+        parameters={
+            "type": "object",
+            "properties": {"content": {"type": "string"}},
+            "required": ["content"],
+        },
+        execute=lambda content: "written",
+        foldable_inputs=("content",),
+    )
+    context = FoldingContext(
+        tmp_path / "folds.sqlite3", "session", config=FoldConfig(min_span_tokens=0)
+    )
+    context.sync(messages, {"write": write, "noop": noop_tool()})
+    assistant_before = deepcopy(messages[1])
+    unrelated_meta_before = context._entry("m3.r0")["meta_json"]
+
+    context.delete("m1.i0")
+
+    assert messages[1]["content"] == assistant_before["content"]
+    assert json.loads(messages[1]["tool_calls"][0]["function"]["arguments"]) == {
+        "content": "[deleted by user]",
+        "note": "keep true",
+    }
+    assert messages[1]["tool_calls"][1] == assistant_before["tool_calls"][1]
+    calls = context._db.execute(
+        "SELECT call_id, args_json, canonical_key FROM tool_calls ORDER BY tool_call_id"
+    ).fetchall()
+    assert json.loads(calls[0]["args_json"]) == {
+        "content": "[deleted by user]",
+        "note": "keep true",
+    }
+    assert calls[1]["args_json"] == assistant_before["tool_calls"][1]["function"]["arguments"]
+    assert calls[1]["canonical_key"] == 'noop:{"value":"true"}'
+    assert context._entry("m3.r0")["meta_json"] == unrelated_meta_before
+
+
 def test_user_delete_purges_duplicate_entry_and_live_shadow_copies(tmp_path):
     payload = "ERASE_DUPLICATE_77"
     messages = tool_exchange("first", {}, payload)
@@ -1010,6 +1078,25 @@ def test_user_delete_reconciles_an_exact_duplicate_result_chunk(tmp_path):
     assert child_copy == context.content("m5.r0")
     assert all(context.state(span_id) != "purged" for span_id in children)
     assert context.project(messages)[5]["content"].count("[deleted by user]") == 1
+    assert messages[5]["content"] == "prefix\n[deleted by user]\nsuffix\n"
+    assert payload.encode() not in (tmp_path / "folds.sqlite3").read_bytes()
+
+
+def test_user_delete_scrubs_only_matching_in_memory_notices(tmp_path):
+    context, _messages = context_with_result(tmp_path, "delete me permanently")
+    context._db.execute(
+        "INSERT INTO notices(span_id, kind, content, created_turn) VALUES (?, ?, ?, ?)",
+        ("m2.r0", "auto", "notice: delete me permanently", context.turn),
+    )
+    context._db.commit()
+    context._current_notices = [
+        "notice: delete me permanently",
+        "unrelated notice remains",
+    ]
+
+    context.delete("m2.r0")
+
+    assert context.turn_notice() == "notice: [deleted by user]\nunrelated notice remains"
 
 
 def test_resume_restores_only_provenance_targeted_messages_before_sync(tmp_path):

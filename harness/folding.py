@@ -1115,10 +1115,17 @@ class FoldingContext:
         payload = self._entry(target)["content"]
         if payload is None:
             raise self._unknown_span(target)
-        span_ids, owner_ids = self._user_delete_aliases(target)
+        span_ids, _owner_ids = self._user_delete_aliases(target)
         indexed_parents = self._user_delete_indexed_parents(payload) - span_ids
-        owner_ids.update(indexed_parents)
-        metadata_span_ids = span_ids | self._user_delete_linked_result_spans(span_ids)
+        indexed_span_ids = indexed_parents | self._user_delete_descendants(indexed_parents)
+        indexed_owner_ids = {span_id.split(".", 1)[0] for span_id in indexed_parents}
+        input_aliases = self._user_delete_input_aliases(span_ids)
+        metadata_span_ids = (
+            span_ids
+            | indexed_span_ids
+            | self._user_delete_linked_result_spans(input_aliases)
+        )
+        root_owner_ids = self._user_delete_root_owners(span_ids)
 
         # Mounted artifacts do not carry ledger provenance. Exact-value
         # replacement clears independent copies without rewriting unrelated
@@ -1126,9 +1133,13 @@ class FoldingContext:
         self._purge_session_log([payload], replace_substrings=False)
         with self._db:
             self._scrub_delete_entry_metadata(metadata_span_ids, [payload])
-            self._scrub_delete_tool_calls(span_ids, [payload])
-            self._scrub_delete_messages(owner_ids, [payload])
-            self._scrub_delete_folds_and_notices(metadata_span_ids, owner_ids, [payload])
+            self._scrub_delete_tool_calls(input_aliases, payload)
+            self._scrub_delete_messages(
+                root_owner_ids, indexed_owner_ids, input_aliases, payload
+            )
+            notice_updates = self._scrub_delete_folds_and_notices(
+                metadata_span_ids, [payload]
+            )
             for affected in span_ids:
                 self._mark_entry_purged(affected)
             for parent_id in indexed_parents:
@@ -1150,7 +1161,12 @@ class FoldingContext:
                     )
             self._replace_indexed_child_aliases(indexed_parents, payload)
             self._reconcile_child_copies(indexed_parents)
-            self._scrub_delete_live_shadow(owner_ids, [payload])
+            self._scrub_delete_live_shadow(
+                root_owner_ids, indexed_owner_ids, input_aliases, payload
+            )
+            self._current_notices = [
+                notice_updates.get(notice, notice) for notice in self._current_notices
+            ]
         # secure_delete overwrites changed cells; VACUUM also eliminates free
         # pages that could retain a pre-purge copy after variable-size updates.
         self._db.execute("VACUUM")
@@ -1201,24 +1217,60 @@ class FoldingContext:
         ).fetchall()
         return {str(row["parent_id"]) for row in rows}
 
-    def _user_delete_linked_result_spans(self, span_ids: set[str]) -> set[str]:
-        """Find metadata copies on results causally linked to deleted input."""
+    def _user_delete_input_aliases(self, span_ids: set[str]) -> list[dict[str, str]]:
         if not span_ids:
-            return set()
-        placeholders = ",".join("?" for _ in span_ids)
+            return []
         rows = self._db.execute(
-            "SELECT result_span FROM tool_calls WHERE message_id IN ("
-            "SELECT parent_id FROM entries WHERE span_id IN ("
-            + placeholders
-            + ") AND origin = 'tool_input' AND parent_id IS NOT NULL) "
-            "AND result_span IS NOT NULL",
+            "SELECT span_id, parent_id, meta_json FROM entries WHERE span_id IN ("
+            + ",".join("?" for _ in span_ids)
+            + ") AND origin = 'tool_input' AND parent_id IS NOT NULL",
             list(span_ids),
         ).fetchall()
-        result_ids: set[str] = set()
+        aliases: list[dict[str, str]] = []
         for row in rows:
+            meta = json.loads(row["meta_json"])
+            call_id = meta.get("call_id")
+            field = meta.get("field")
+            if isinstance(call_id, str) and isinstance(field, str):
+                aliases.append(
+                    {
+                        "span_id": str(row["span_id"]),
+                        "message_id": str(row["parent_id"]),
+                        "call_id": call_id,
+                        "field": field,
+                    }
+                )
+        return aliases
+
+    def _user_delete_root_owners(self, span_ids: set[str]) -> set[str]:
+        if not span_ids:
+            return set()
+        rows = self._db.execute(
+            "SELECT span_id FROM entries WHERE span_id IN ("
+            + ",".join("?" for _ in span_ids)
+            + ") AND parent_id IS NULL",
+            list(span_ids),
+        ).fetchall()
+        return {str(row["span_id"]).split(".", 1)[0] for row in rows}
+
+    def _user_delete_linked_result_spans(
+        self, input_aliases: list[dict[str, str]]
+    ) -> set[str]:
+        """Find metadata copies on results causally linked to deleted input."""
+        if not input_aliases:
+            return set()
+        result_ids: set[str] = set()
+        for alias in input_aliases:
+            row = self._db.execute(
+                "SELECT result_span FROM tool_calls WHERE message_id = ? "
+                "AND call_id = ? AND result_span IS NOT NULL",
+                (alias["message_id"], alias["call_id"]),
+            ).fetchone()
+            if row is None:
+                continue
             result_id = str(row["result_span"])
             result_ids.add(result_id)
-            result_ids.update(self.child_ids(result_id))
+            result_ids.update(self._user_delete_descendants({result_id}))
         return result_ids
 
     def _replace_indexed_child_aliases(
@@ -1264,57 +1316,93 @@ class FoldingContext:
                     (cleaned, row["span_id"]),
                 )
 
-    def _scrub_delete_tool_calls(self, span_ids: set[str], erased: list[str]) -> None:
-        input_owners = {
-            str(row["parent_id"])
-            for row in self._db.execute(
-                "SELECT parent_id FROM entries WHERE span_id IN ("
-                + ",".join("?" for _ in span_ids)
-                + ") AND origin = 'tool_input' AND parent_id IS NOT NULL",
-                list(span_ids),
-            ).fetchall()
-        }
-        if not input_owners:
-            return
-        placeholders = ",".join("?" for _ in input_owners)
-        rows = self._db.execute(
-            f"SELECT tool_call_id, args_json, canonical_key FROM tool_calls "
-            f"WHERE message_id IN ({placeholders})",
-            list(input_owners),
-        ).fetchall()
-        for row in rows:
-            args = self._scrub_text(
-                row["args_json"], erased, "[deleted by user]", mode="arguments",
-                replace_substrings=True,
+    def _scrub_delete_tool_calls(
+        self, input_aliases: list[dict[str, str]], payload: str
+    ) -> None:
+        for alias in input_aliases:
+            row = self._db.execute(
+                "SELECT tool_call_id, tool_name, args_json FROM tool_calls "
+                "WHERE message_id = ? AND call_id = ?",
+                (alias["message_id"], alias["call_id"]),
+            ).fetchone()
+            if row is None:
+                continue
+            try:
+                args = json.loads(row["args_json"])
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(args, dict) or args.get(alias["field"]) != payload:
+                continue
+            args[alias["field"]] = "[deleted by user]"
+            args_json = _canonical(args)
+            self._db.execute(
+                "UPDATE tool_calls SET args_json = ?, canonical_key = ? "
+                "WHERE tool_call_id = ?",
+                (args_json, f"{row['tool_name']}:{args_json}", row["tool_call_id"]),
             )
-            key = self._scrub_text(
-                row["canonical_key"], erased, "[deleted by user]", mode="canonical_key",
-                replace_substrings=True,
-            )
-            if args != row["args_json"] or key != row["canonical_key"]:
-                self._db.execute(
-                    "UPDATE tool_calls SET args_json = ?, canonical_key = ? "
-                    "WHERE tool_call_id = ?",
-                    (args, key, row["tool_call_id"]),
-                )
 
-    def _scrub_delete_messages(self, owner_ids: set[str], erased: list[str]) -> None:
+    @staticmethod
+    def _scrub_delete_message(
+        message: dict,
+        *,
+        root_owner: bool,
+        indexed_owner: bool,
+        input_aliases: list[dict[str, str]],
+        payload: str,
+    ) -> dict:
+        cleaned = deepcopy(message)
+        content = cleaned.get("content")
+        if root_owner and content == payload:
+            cleaned["content"] = "[deleted by user]"
+        elif indexed_owner and isinstance(content, str):
+            cleaned["content"] = content.replace(payload, "[deleted by user]")
+        for alias in input_aliases:
+            for call in cleaned.get("tool_calls") or []:
+                if call.get("id") != alias["call_id"]:
+                    continue
+                function = call.get("function") or {}
+                try:
+                    arguments = json.loads(function.get("arguments", ""))
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(arguments, dict) and arguments.get(alias["field"]) == payload:
+                    arguments[alias["field"]] = "[deleted by user]"
+                    function["arguments"] = _canonical(arguments)
+        return cleaned
+
+    def _scrub_delete_messages(
+        self,
+        root_owner_ids: set[str],
+        indexed_owner_ids: set[str],
+        input_aliases: list[dict[str, str]],
+        payload: str,
+    ) -> None:
+        owner_ids = root_owner_ids | indexed_owner_ids | {
+            alias["message_id"] for alias in input_aliases
+        }
         if not owner_ids:
             return
         placeholders = ",".join("?" for _ in owner_ids)
         rows = self._db.execute(
-            f"SELECT rowid, message_json FROM messages WHERE session_id = ? "
+            f"SELECT rowid, message_id, message_json FROM messages WHERE session_id = ? "
             f"AND message_id IN ({placeholders})",
             [self.session_id, *owner_ids],
         ).fetchall()
         for row in rows:
-            cleaned = self._scrub_text(
-                row["message_json"],
-                erased,
-                "[deleted by user]",
-                mode="structured",
-                replace_substrings=True,
+            message_id = str(row["message_id"])
+            message = json.loads(row["message_json"])
+            cleaned_message = self._scrub_delete_message(
+                message,
+                root_owner=message_id in root_owner_ids,
+                indexed_owner=message_id in indexed_owner_ids,
+                input_aliases=[
+                    alias
+                    for alias in input_aliases
+                    if alias["message_id"] == message_id
+                ],
+                payload=payload,
             )
+            cleaned = _canonical(cleaned_message)
             if cleaned != row["message_json"]:
                 self._db.execute(
                     "UPDATE messages SET message_json = ?, content_sha = ?, scrubbed = 1 "
@@ -1323,8 +1411,8 @@ class FoldingContext:
                 )
 
     def _scrub_delete_folds_and_notices(
-        self, span_ids: set[str], owner_ids: set[str], erased: list[str]
-    ) -> None:
+        self, span_ids: set[str], erased: list[str]
+    ) -> dict[str, str]:
         if span_ids:
             placeholders = ",".join("?" for _ in span_ids)
             rows = self._db.execute(
@@ -1341,43 +1429,53 @@ class FoldingContext:
                         "UPDATE folds SET note = ? WHERE fold_id = ?",
                         (cleaned, row["fold_id"]),
                     )
-        conditions: list[str] = []
-        parameters: list[object] = []
-        if span_ids:
-            conditions.append("span_id IN (" + ",".join("?" for _ in span_ids) + ")")
-            parameters.extend(span_ids)
-        if owner_ids:
-            conditions.append("message_id IN (" + ",".join("?" for _ in owner_ids) + ")")
-            parameters.extend(owner_ids)
-        if not conditions:
-            return
+        if not span_ids:
+            return {}
+        placeholders = ",".join("?" for _ in span_ids)
         rows = self._db.execute(
-            "SELECT notice_id, content FROM notices WHERE " + " OR ".join(conditions),
-            parameters,
+            f"SELECT notice_id, content FROM notices WHERE span_id IN ({placeholders})",
+            list(span_ids),
         ).fetchall()
+        updates: dict[str, str] = {}
         for row in rows:
             cleaned = self._scrub_text(
                 row["content"], erased, "[deleted by user]", mode="data",
                 replace_substrings=True,
             )
             if cleaned != row["content"]:
+                updates[str(row["content"])] = cleaned
                 self._db.execute(
                     "UPDATE notices SET content = ? WHERE notice_id = ?",
                     (cleaned, row["notice_id"]),
                 )
+        return updates
 
-    def _scrub_delete_live_shadow(self, owner_ids: set[str], erased: list[str]) -> None:
+    def _scrub_delete_live_shadow(
+        self,
+        root_owner_ids: set[str],
+        indexed_owner_ids: set[str],
+        input_aliases: list[dict[str, str]],
+        payload: str,
+    ) -> None:
         if self._shadow_ref is None:
             return
+        owner_ids = root_owner_ids | indexed_owner_ids | {
+            alias["message_id"] for alias in input_aliases
+        }
         for index, message_id in enumerate(self._active_ids):
             if message_id not in owner_ids or index >= len(self._shadow_ref):
                 continue
             message = self._shadow_ref[index]
-            cleaned = self._scrub_structured(
-                deepcopy(message),
-                erased,
-                "[deleted by user]",
-                replace_substrings=True,
+            cleaned = self._scrub_delete_message(
+                message,
+                root_owner=message_id in root_owner_ids,
+                indexed_owner=message_id in indexed_owner_ids,
+                input_aliases=[
+                    alias
+                    for alias in input_aliases
+                    if alias["message_id"] == message_id
+                ],
+                payload=payload,
             )
             if cleaned == message or not isinstance(cleaned, dict):
                 continue

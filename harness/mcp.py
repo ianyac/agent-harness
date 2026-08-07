@@ -345,6 +345,7 @@ def mcp_tools(server: MCPServer, output_limit: int = 8000) -> list[Tool]:
                 # literal True only: a sloppy truthy value ("false", 1)
                 # must not skip the permission gate
                 read_only=annotations.get("readOnlyHint") is True,
+                untrusted_output=True,
             )
         except (AttributeError, KeyError, TypeError, ValueError) as error:
             # a bad spec is the server's fault, not a harness crash: keep

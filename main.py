@@ -67,6 +67,26 @@ def folding_paths(session_path: Path) -> tuple[Path, Path]:
     )
 
 
+def context_mode_path(session_path: Path) -> Path:
+    """Durable owner of context management for this session."""
+    return session_path.with_suffix(".context-mode")
+
+
+def _session_used_compaction(session_path: Path) -> bool:
+    try:
+        lines = session_path.read_text().splitlines()
+    except FileNotFoundError:
+        return False
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") == "compact":
+            return True
+    return False
+
+
 def may_run_skill_commands(offered: dict, mode: str) -> bool:
     """Whether a subagent holding `offered` may run a skill's !`cmd`.
 
@@ -306,10 +326,50 @@ def main():
             parser.error(f"no such session: {session_path}")
     else:
         session_path = sessions_dir / f"{stamp}-{os.getpid()}.jsonl"
+
+    resuming = cli_args.continue_ or cli_args.resume is not None
+    mode_path = context_mode_path(session_path)
+    try:
+        stored_context_mode = mode_path.read_text().strip() if mode_path.exists() else None
+    except OSError as error:
+        parser.error(f"cannot read context mode for {session_path.name}: {error}")
+    if stored_context_mode not in (None, "folding", "compaction"):
+        parser.error(
+            f"invalid persisted context mode for {session_path.name}: "
+            f"{stored_context_mode!r}"
+        )
+    if stored_context_mode is None and folding_paths(session_path)[0].exists():
+        # Compatibility with folding sessions created before the sidecar was
+        # introduced: the stable ledger is authoritative evidence of the mode.
+        stored_context_mode = "folding"
+    if stored_context_mode == "folding":
+        if cli_args.compact_threshold is not None:
+            parser.error(
+                "session uses context folding; --compact-threshold is incompatible"
+            )
+        cli_args.fold_context = True
+    elif stored_context_mode == "compaction" and cli_args.fold_context:
+        parser.error("session uses compaction and cannot resume with --fold-context")
+    elif (
+        resuming
+        and stored_context_mode is None
+        and cli_args.fold_context
+        and _session_used_compaction(session_path)
+    ):
+        parser.error(
+            "session already contains compaction events and cannot resume with "
+            "--fold-context"
+        )
+    selected_context_mode = "folding" if cli_args.fold_context else "compaction"
     try:
         lock(session_path)
     except RuntimeError as error:
         parser.error(str(error))
+    try:
+        mode_path.write_text(selected_context_mode + "\n")
+    except OSError as error:
+        unlock(session_path)
+        parser.error(f"cannot persist context mode for {session_path.name}: {error}")
 
     folding = None
     if cli_args.fold_context:
@@ -318,6 +378,7 @@ def main():
             fold_db,
             session_id=session_path.stem,
             decision_log_path=decision_log,
+            session_log_path=session_path,
         )
         atexit.register(folding.close)
 

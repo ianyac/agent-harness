@@ -187,3 +187,93 @@ def test_refetch_of_a_folded_operation_is_logged_without_content_or_arguments(tm
     refetch = next(event for event in events if event["ev"] == "refetch_candidate")
     assert refetch["span"] == "m2.r0"
     assert not ({"content", "note", "path", "args"} & refetch.keys())
+
+
+def test_pressure_notice_surfaces_three_older_open_spans_once(tmp_path):
+    # Regression caught: without ambient candidates, long sessions rely on a
+    # standing prompt whose compliance decays; repeated identical notices are
+    # equally bad because they become background noise.
+    messages = tool_exchange("one", {}, "first")
+    append_exchange(messages, "two", {}, "second", "call_1")
+    append_exchange(messages, "three", {}, "third", "call_2")
+    context = folding_context(tmp_path)
+    tools = {
+        "one": noop_tool(name="one"),
+        "two": noop_tool(name="two"),
+        "three": noop_tool(name="three"),
+    }
+    context.sync(messages, tools)
+
+    context.begin_turn(messages, tools)
+    notice = context.turn_notice()
+    context.begin_turn(messages, tools)
+
+    assert notice.startswith("[workspace: 3 spans look closed")
+    assert all(span in notice for span in ("m2.r0", "m5.r0", "m8.r0"))
+    assert "spans look closed" not in context.turn_notice()
+
+
+def test_pressure_notice_is_bound_to_the_user_message_for_replay(tmp_path):
+    messages = tool_exchange("one", {}, "first")
+    append_exchange(messages, "two", {}, "second", "call_1")
+    append_exchange(messages, "three", {}, "third", "call_2")
+    context = folding_context(tmp_path)
+    context.sync(
+        messages,
+        {
+            "one": noop_tool(name="one"),
+            "two": noop_tool(name="two"),
+            "three": noop_tool(name="three"),
+        },
+    )
+    context.begin_turn(messages)
+    messages.append({"role": "user", "content": "continue"})
+
+    context.sync(messages)
+
+    assert context.reconstruct(turn=context.turn)[-1]["content"].startswith(
+        "[workspace: 3 spans look closed"
+    )
+
+
+def test_checkpoint_notice_reports_open_and_folded_workspace_shape(tmp_path):
+    messages = tool_exchange("read_file", {"path": "a.py"}, "evidence")
+    context = folding_context(tmp_path)
+    context.sync(messages, {"read_file": read_file_tool(tmp_path)})
+    context.fold(
+        "m2.r0",
+        "finished",
+        "Read completed: a.py defines only the validated implementation path.",
+    )
+
+    context.checkpoint(reason="phase boundary")
+
+    notice = context.turn_notice()
+    assert notice.startswith("[workspace after checkpoint:")
+    assert "1 folded" in notice
+
+
+def test_user_reference_to_folded_verdict_is_surfaced_and_replayable(tmp_path):
+    messages = tool_exchange("install", {}, "node-gyp failed") + [
+        {"role": "assistant", "content": "fixed"}
+    ]
+    context = folding_context(tmp_path)
+    context.sync(messages, {"install": noop_tool(name="install")})
+    context.fold(
+        "m2.r0",
+        "handled_failure",
+        "npm install error came from node-gyp; Python 3.11 resolved the failure.",
+    )
+    context.checkpoint()
+    context.begin_turn(messages)
+    messages.append(
+        {"role": "user", "content": "Was the earlier npm install error fully resolved?"}
+    )
+
+    context.sync(messages)
+
+    assert "user may be referring to folded m2.r0" in context.turn_notice()
+    historical = context.reconstruct(turn=context.turn)
+    assert historical[-1]["content"].startswith(
+        "[user may be referring to folded m2.r0"
+    )

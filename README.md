@@ -25,13 +25,16 @@ Tool results are labeled with stable handles such as `m17.r0` (and
 line of work closes, recording the conclusion that replaces the evidence, and
 call `unfold` to restore the full span at the context tail. Large batches apply
 at a checkpoint when their marked share reaches 15%; smaller batches apply at
-the next user-turn boundary. The full transcript remains the immutable shadow
-record throughout.
+the next user-turn boundary. Ordinary folds leave the full transcript as an
+immutable shadow record. The explicit carve-outs are credential scanning and
+user deletion: both purge the affected bytes instead of making them recoverable.
 
 Each session keeps its folding ledger and content-free decision log beside the
 transcript as `<session>.folds.sqlite3` and `<session>.fold-decisions.jsonl`.
 Resuming the session reuses those files, so its folded footprint and verdicts
-survive process restarts.
+survive process restarts. The context-management mode is persisted too; a
+folding session resumes with folding automatically and cannot silently fall
+back to compaction.
 
 `--fold-context` and `--compact-threshold` are intentionally mutually
 exclusive. Two context managers rewriting the same message array would make

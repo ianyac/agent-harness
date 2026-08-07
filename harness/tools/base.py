@@ -18,6 +18,9 @@ class Tool:
     # At most one large string field per call may be replaced after a
     # successful write-shaped operation, preserving the surrounding JSON.
     foldable_inputs: tuple[str, ...] = ()
+    # Verdict markers derived from third-party or otherwise untrusted output
+    # retain visible provenance after the source bytes are folded.
+    untrusted_output: bool = False
 
     def __post_init__(self):
         # fail at construction, not as a provider 400 mid-conversation

@@ -1081,6 +1081,15 @@ class FoldingContext:
                 )
             self._rewrite_message_for_purge(target, "[deleted by user]")
             self._scrub_sqlite(erased, "[deleted by user]")
+            self._current_notices = [
+                self._scrub_text(
+                    notice,
+                    erased,
+                    "[deleted by user]",
+                    encoded_json=False,
+                )
+                for notice in self._current_notices
+            ]
         # secure_delete overwrites changed cells; VACUUM also eliminates free
         # pages that could retain a pre-purge copy after variable-size updates.
         self._db.execute("VACUUM")
@@ -1091,13 +1100,17 @@ class FoldingContext:
     def _scrub_value(value: object, erased: list[str], marker: str) -> object:
         if isinstance(value, dict):
             return {
-                key: FoldingContext._scrub_value(item, erased, marker)
+                str(FoldingContext._scrub_value(key, erased, marker)): (
+                    FoldingContext._scrub_value(item, erased, marker)
+                )
                 for key, item in value.items()
             }
         if isinstance(value, list):
             return [FoldingContext._scrub_value(item, erased, marker) for item in value]
         if not isinstance(value, str):
             return value
+        if value in erased:
+            return marker
         stripped = value.strip()
         if stripped.startswith(("{", "[")):
             try:

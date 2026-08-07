@@ -614,7 +614,9 @@ def test_incompatible_legacy_schema_fails_with_an_explicit_version_error(tmp_pat
         FoldingContext(path, "session")
 
 
-@pytest.mark.parametrize("payload", ["SEKRET7", 'x"\ny'])
+@pytest.mark.parametrize(
+    "payload", ["SEKRET7", 'x"\ny', '{"api_key":"SEKRET7"}']
+)
 def test_user_delete_scrubs_short_tool_input_from_every_local_copy(tmp_path, payload):
     messages = tool_exchange("write", {"content": payload}, "ok")
     tool = Tool(

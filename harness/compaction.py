@@ -39,6 +39,16 @@ def _count(text: str) -> int:
     return len(_encoding().encode(text, disallowed_special=()))
 
 
+def count_text_tokens(text: str) -> int:
+    """Return the harness's deterministic token estimate for one text span.
+
+    Context folding and compaction must use the same estimator: otherwise a
+    span can cross one policy's threshold but not the other's solely because
+    two tokenizers disagreed.
+    """
+    return _count(text)
+
+
 def estimate_tokens(
     messages: list[dict],
     tools: list[dict] | None = None,

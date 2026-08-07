@@ -374,6 +374,18 @@ def test_secret_scanner_purges_tool_output_and_rebuilds_immediately(tmp_path):
     )
 
 
+def test_sensitive_reason_cannot_be_used_as_a_recoverable_fold(tmp_path):
+    context, _messages = context_with_result(tmp_path, "ordinary evidence")
+
+    with pytest.raises(FoldError, match="invalid fold reason"):
+        context.fold(
+            "m2.r0",
+            "sensitive",
+            "This must go through the scanner-owned irreversible purge path.",
+            decider="scanner",
+        )
+
+
 def test_secret_scanner_scrubs_a_raw_mounted_session_on_resume(tmp_path):
     secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
     session_path = tmp_path / "session.jsonl"

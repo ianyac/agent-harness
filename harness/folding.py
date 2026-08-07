@@ -1222,9 +1222,7 @@ class FoldingContext:
         ).fetchone()
         if pinned is not None:
             raise FoldError(f"{span_id} is pinned and cannot be folded")
-        if reason not in AGENT_REASONS and not (
-            decider in ("heuristic", "scanner", "user") and reason == "sensitive"
-        ):
+        if reason not in AGENT_REASONS:
             raise FoldError(f"invalid fold reason {reason!r}")
         if decider == "agent":
             self._validate_note(note)

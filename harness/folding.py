@@ -1088,29 +1088,79 @@ class FoldingContext:
                 continue
             span_id = row["span_id"]
             if content in erased:
-                state = self._db.execute(
-                    "SELECT state FROM span_state WHERE span_id = ?", (span_id,)
-                ).fetchone()
-                self._db.execute(
-                    "UPDATE entries SET content = NULL WHERE span_id = ?",
-                    (span_id,),
-                )
-                self._db.execute(
-                    "UPDATE span_state SET state = 'purged' WHERE span_id = ?",
-                    (span_id,),
-                )
-                if state is None or state["state"] != "purged":
-                    self._db.execute(
-                        "INSERT INTO folds(span_id, reason, note, decider, folded_turn, "
-                        "placement, applied_turn) VALUES (?, 'user_delete', "
-                        "'deleted by user', 'user', ?, 'in_place', ?)",
-                        (span_id, self.turn, self.turn),
-                    )
+                self._mark_entry_purged(span_id)
             else:
                 self._db.execute(
                     "UPDATE entries SET content = ?, content_sha = ?, tokens_est = ? "
                     "WHERE span_id = ?",
                     (cleaned, _sha(cleaned), count_text_tokens(cleaned), span_id),
+                )
+        self._reconcile_child_copies()
+
+    def _mark_entry_purged(self, span_id: str) -> None:
+        state = self._db.execute(
+            "SELECT state FROM span_state WHERE span_id = ?", (span_id,)
+        ).fetchone()
+        self._db.execute(
+            "UPDATE entries SET content = NULL WHERE span_id = ?",
+            (span_id,),
+        )
+        self._db.execute(
+            "UPDATE span_state SET state = 'purged' WHERE span_id = ?",
+            (span_id,),
+        )
+        if state is None or state["state"] != "purged":
+            self._db.execute(
+                "INSERT INTO folds(span_id, reason, note, decider, folded_turn, "
+                "placement, applied_turn) VALUES (?, 'user_delete', "
+                "'deleted by user', 'user', ?, 'in_place', ?)",
+                (span_id, self.turn, self.turn),
+            )
+
+    def _reconcile_child_copies(self) -> None:
+        """Keep chunk storage from retaining bytes removed from its parent."""
+        parents = self._db.execute(
+            "SELECT DISTINCT p.span_id, p.content, s.state FROM entries p "
+            "JOIN entries c ON c.parent_id = p.span_id AND c.active = 1 "
+            "JOIN span_state s ON s.span_id = p.span_id "
+            "WHERE p.session_id = ? AND p.active = 1 ORDER BY p.rowid",
+            (self.session_id,),
+        ).fetchall()
+        for parent in parents:
+            children = self._db.execute(
+                "SELECT e.span_id, e.content, s.state FROM entries e "
+                "JOIN span_state s USING(span_id) "
+                "WHERE e.parent_id = ? AND e.active = 1 ORDER BY e.rowid",
+                (parent["span_id"],),
+            ).fetchall()
+            if parent["state"] == "purged":
+                for child in children:
+                    self._mark_entry_purged(child["span_id"])
+                continue
+
+            content = parent["content"] or ""
+            if "".join(child["content"] or "" for child in children) == content:
+                continue
+            pieces = _split_span(content, self.config.chunk_tokens)
+            if len(pieces) > len(children):
+                pieces = [
+                    *pieces[: len(children) - 1],
+                    "".join(pieces[len(children) - 1 :]),
+                ]
+            else:
+                pieces.extend("" for _ in range(len(children) - len(pieces)))
+            for child, piece in zip(children, pieces):
+                if child["state"] == "purged":
+                    continue
+                self._db.execute(
+                    "UPDATE entries SET content = ?, content_sha = ?, tokens_est = ? "
+                    "WHERE span_id = ?",
+                    (
+                        piece,
+                        _sha(piece),
+                        count_text_tokens(piece),
+                        child["span_id"],
+                    ),
                 )
 
     def _scrub_live_shadow(self, erased: list[str], marker: str) -> None:

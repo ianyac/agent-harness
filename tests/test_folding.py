@@ -379,6 +379,51 @@ def test_secret_scanner_purges_tool_output_and_rebuilds_immediately(tmp_path):
     )
 
 
+def test_scanner_purges_a_matched_secret_from_every_local_alias(tmp_path):
+    secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
+    path = tmp_path / "folds.sqlite3"
+    session_path = tmp_path / "session.jsonl"
+    actions_path = tmp_path / "actions.jsonl"
+    session_path.write_text(
+        json.dumps({"type": "message", "message": {"role": "user", "content": secret}})
+        + "\n"
+    )
+    actions_path.write_text(
+        json.dumps({"name": "leak", "args": {"token": secret}}) + "\n"
+    )
+    messages = [
+        {"role": "user", "content": f"inspect {secret}"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": "call_0",
+                "type": "function",
+                "function": {
+                    "name": "leak",
+                    "arguments": json.dumps({"token": secret}),
+                },
+            }],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_0",
+            "content": f"diagnostic prefix {secret} diagnostic suffix",
+        },
+    ]
+    context = FoldingContext(path, "session", session_log_path=session_path)
+    context.register_purge_path(actions_path)
+    context.sync(messages, {"leak": noop_tool(name="leak")})
+
+    assert context.state("m2.r0") == "purged"
+    assert secret not in json.dumps(messages)
+    assert secret not in json.dumps(context.shadow_messages())
+    assert secret not in json.dumps(context.project(messages))
+    assert secret not in session_path.read_text()
+    assert secret not in actions_path.read_text()
+    assert secret.encode() not in path.read_bytes()
+
+
 def test_sensitive_reason_cannot_be_used_as_a_recoverable_fold(tmp_path):
     context, _messages = context_with_result(tmp_path, "ordinary evidence")
 

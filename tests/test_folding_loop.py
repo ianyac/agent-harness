@@ -4,7 +4,7 @@ from copy import deepcopy
 
 import pytest
 
-from harness.folding import FoldConfig, FoldingContext, ProjectionError
+from harness.folding import FoldConfig, FoldError, FoldingContext, ProjectionError
 from harness.loop import run_turn
 from harness.tools.base import Tool
 from harness.tools.folding import fold_tool
@@ -278,3 +278,192 @@ def test_scanner_redaction_reaches_the_model_and_shadow_immediately(tmp_path):
     assert secret not in json.dumps(llm.turns[1]["messages"])
     assert secret not in json.dumps(messages)
     assert messages[2]["content"] == "[redacted — credential detected in tool output]"
+
+
+def test_scanner_remaps_tool_definitions_and_resolves_the_alias_for_execution(tmp_path):
+    secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
+    alias = "redacted_db3qobsommarzjeek2fytgek5zgie47kkosagadvfuywhxw7mraa"
+    executions: list[str] = []
+
+    def leak() -> str:
+        executions.append("ran")
+        return f"diagnostic {secret}"
+
+    credential_tool = Tool(
+        name=secret,
+        description="returns a credential",
+        parameters={"type": "object", "properties": {}},
+        execute=leak,
+    )
+    ordinary_tool = noop_tool(name="ordinary")
+    tools = {secret: credential_tool, "ordinary": ordinary_tool}
+    llm = FakeLLM(
+        [
+            {"type": "tool_calls", "calls": [{"name": secret, "arguments": {}}]},
+            {"type": "tool_calls", "calls": [{"name": alias, "arguments": {}}]},
+            {"type": "text", "content": "handled"},
+        ]
+    )
+    context = context_for(tmp_path)
+    messages: list[dict] = []
+
+    run_turn(messages, "inspect", llm, tools=tools, context=context)
+
+    second_boundary = llm.turns[1]
+    offered_names = [item["function"]["name"] for item in second_boundary["tools"]]
+    historical_name = second_boundary["messages"][1]["tool_calls"][0]["function"][
+        "name"
+    ]
+    assert offered_names == [alias, "ordinary"]
+    assert historical_name == alias
+    assert secret not in json.dumps(second_boundary)
+    assert executions == ["ran", "ran"]
+    assert messages[3]["tool_calls"][0]["function"]["name"] == alias
+    assert messages[3]["tool_calls"][0]["id"] == messages[4]["tool_call_id"]
+    assert secret not in json.dumps(llm.turns[2])
+    assert all(
+        secret not in json.dumps(context.reconstruct_projection(row["projection_id"]))
+        for row in context.projection_chain()
+        if row["kind"] == "request"
+    )
+    assert list(tools) == [secret, "ordinary"]
+    assert tools[secret] is credential_tool
+    assert credential_tool.name == secret
+
+
+def test_scanner_avoids_aliases_occupied_by_registered_tools(tmp_path):
+    secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
+    occupied_alias = (
+        "redacted_db3qobsommarzjeek2fytgek5zgie47kkosagadvfuywhxw7mraa"
+    )
+    remapped_name = (
+        "redacted_q3c4jdidtkzxytqnv7vgwvilzalkuejx7djs7t6umey5q4kyvdrq"
+    )
+    executions: list[str] = []
+
+    def leak() -> str:
+        executions.append("credential")
+        return f"diagnostic {secret}"
+
+    def ordinary() -> str:
+        executions.append("ordinary")
+        return "ordinary result"
+
+    credential_tool = Tool(
+        name=secret,
+        description="returns a credential",
+        parameters={"type": "object", "properties": {}},
+        execute=leak,
+    )
+    ordinary_tool = Tool(
+        name=occupied_alias,
+        description="ordinary tool whose name happens to occupy an alias",
+        parameters={"type": "object", "properties": {}},
+        execute=ordinary,
+    )
+    tools = {secret: credential_tool, occupied_alias: ordinary_tool}
+    llm = FakeLLM(
+        [
+            {"type": "tool_calls", "calls": [{"name": secret, "arguments": {}}]},
+            {
+                "type": "tool_calls",
+                "calls": [{"name": remapped_name, "arguments": {}}],
+            },
+            {"type": "text", "content": "handled"},
+        ]
+    )
+
+    run_turn([], "inspect", llm, tools=tools, context=context_for(tmp_path))
+
+    offered_names = [
+        definition["function"]["name"] for definition in llm.turns[1]["tools"]
+    ]
+    assert offered_names == [remapped_name, occupied_alias]
+    assert len(set(offered_names)) == 2
+    assert executions == ["credential", "credential"]
+    assert secret not in json.dumps(llm.turns[1])
+
+
+def test_scanner_restores_tool_name_aliases_after_reopen(tmp_path):
+    secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
+    alias = "redacted_db3qobsommarzjeek2fytgek5zgie47kkosagadvfuywhxw7mraa"
+    tool = Tool(
+        name=secret,
+        description="returns a credential",
+        parameters={"type": "object", "properties": {}},
+        execute=lambda: f"diagnostic {secret}",
+    )
+    tools = {secret: tool}
+    messages: list[dict] = []
+    first = context_for(tmp_path)
+    first_llm = FakeLLM(
+        [
+            {"type": "tool_calls", "calls": [{"name": secret, "arguments": {}}]},
+            {"type": "text", "content": "first done"},
+        ]
+    )
+    run_turn(messages, "inspect", first_llm, tools=tools, context=first)
+    first.close()
+
+    resumed = context_for(tmp_path)
+    second_llm = FakeLLM([{"type": "text", "content": "second done"}])
+    run_turn(messages, "inspect again", second_llm, tools=tools, context=resumed)
+
+    boundary = second_llm.turns[0]
+    assert boundary["tools"][0]["function"]["name"] == alias
+    assert boundary["messages"][1]["tool_calls"][0]["function"]["name"] == alias
+    assert secret not in json.dumps(boundary)
+    assert all(
+        secret not in json.dumps(resumed.reconstruct_projection(row["projection_id"]))
+        for row in resumed.projection_chain()
+        if row["kind"] == "request"
+    )
+    assert list(tools) == [secret]
+    assert tool.name == secret
+
+
+def test_scanner_rejects_a_late_tool_that_occupies_a_persisted_alias(tmp_path):
+    secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
+    alias = "redacted_db3qobsommarzjeek2fytgek5zgie47kkosagadvfuywhxw7mraa"
+    credential_tool = Tool(
+        name=secret,
+        description="returns a credential",
+        parameters={"type": "object", "properties": {}},
+        execute=lambda: f"diagnostic {secret}",
+    )
+    messages: list[dict] = []
+    first = context_for(tmp_path)
+    run_turn(
+        messages,
+        "inspect",
+        FakeLLM(
+            [
+                {
+                    "type": "tool_calls",
+                    "calls": [{"name": secret, "arguments": {}}],
+                },
+                {"type": "text", "content": "done"},
+            ]
+        ),
+        tools={secret: credential_tool},
+        context=first,
+    )
+    first.close()
+    before = deepcopy(messages)
+    ordinary_tool = noop_tool(name=alias)
+    tools = {secret: credential_tool, alias: ordinary_tool}
+    resumed = context_for(tmp_path)
+
+    with pytest.raises(FoldError, match="scanner tool alias conflicts"):
+        run_turn(
+            messages,
+            "inspect again",
+            FakeLLM([{"type": "text", "content": "must not dispatch"}]),
+            tools=tools,
+            context=resumed,
+        )
+
+    assert messages == before
+    assert list(tools) == [secret, alias]
+    assert tools[secret] is credential_tool
+    assert tools[alias] is ordinary_tool

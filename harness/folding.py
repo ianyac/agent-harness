@@ -8,6 +8,7 @@ import json
 import os
 import re
 import sqlite3
+from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import dataclass
 from difflib import get_close_matches
@@ -194,6 +195,13 @@ CREATE TABLE IF NOT EXISTS notices (
     created_turn  INTEGER NOT NULL,
     emitted_turn  INTEGER
 );
+
+CREATE TABLE IF NOT EXISTS scanner_aliases (
+    session_id   TEXT NOT NULL,
+    secret_sha   TEXT NOT NULL,
+    replacement  TEXT NOT NULL,
+    PRIMARY KEY(session_id, secret_sha)
+);
 """
 
 
@@ -341,6 +349,7 @@ class FoldingContext:
         self._shadow_ref: list[dict] | None = None
         self._purge_paths: set[Path] = set()
         self._vacuum_pending = False
+        self._sync_in_progress = False
         if self.session_log_path is not None:
             self._purge_paths.add(self.session_log_path)
         if self.decision_log_path is not None:
@@ -350,6 +359,15 @@ class FoldingContext:
         self._current_notice_ids: list[int | None] = []
         self._turn_start_length = 0
         self._turn_user_id: str | None = None
+        self._scanner_identifier_replacements: dict[str, str] = {}
+        self._scanner_aliases = {
+            row["secret_sha"]: row["replacement"]
+            for row in self._db.execute(
+                "SELECT secret_sha, replacement FROM scanner_aliases "
+                "WHERE session_id = ?",
+                (self.session_id,),
+            ).fetchall()
+        }
         row = self._db.execute(
             "SELECT COALESCE(MAX(created_turn), 0) AS turn FROM messages "
             "WHERE session_id = ?",
@@ -372,6 +390,47 @@ class FoldingContext:
         self,
         messages: list[dict],
         tools: dict[str, Tool] | None = None,
+    ) -> None:
+        active_ids = self._active_ids.copy()
+        snapshots = self._snapshots.copy()
+        last_projection_sources = deepcopy(self._last_projection_sources)
+        shadow_ref = self._shadow_ref
+        vacuum_pending = self._vacuum_pending
+        turn_user_id = self._turn_user_id
+        current_notices = self._current_notices.copy()
+        current_notice_ids = self._current_notice_ids.copy()
+        event_seq = self._event_seq
+        scanner_identifier_replacements = self._scanner_identifier_replacements.copy()
+        scanner_aliases = self._scanner_aliases.copy()
+        sync_in_progress = self._sync_in_progress
+        self._sync_in_progress = True
+        try:
+            self._sync_pending(messages, tools)
+            self._db.commit()
+        except BaseException:
+            self._db.rollback()
+            self._active_ids = active_ids
+            self._snapshots = snapshots
+            self._last_projection_sources = last_projection_sources
+            self._shadow_ref = shadow_ref
+            self._vacuum_pending = vacuum_pending
+            self._turn_user_id = turn_user_id
+            self._current_notices = current_notices
+            self._current_notice_ids = current_notice_ids
+            self._event_seq = event_seq
+            self._scanner_identifier_replacements = scanner_identifier_replacements
+            self._scanner_aliases = scanner_aliases
+            self._sync_in_progress = sync_in_progress
+            raise
+        self._sync_in_progress = sync_in_progress
+        if self._vacuum_pending:
+            self._db.execute("VACUUM")
+            self._vacuum_pending = False
+
+    def _sync_pending(
+        self,
+        messages: list[dict],
+        tools: dict[str, Tool] | None,
     ) -> None:
         tools = tools or {}
         self._restore_purged_messages(messages)
@@ -439,30 +498,24 @@ class FoldingContext:
                 "AND message_id IS NULL",
                 (self._turn_user_id, self.turn),
             )
-        self._db.commit()
-        if self._vacuum_pending:
-            self._db.execute("VACUUM")
-            self._vacuum_pending = False
-
     def _deactivate_messages(self, message_ids: list[str]) -> None:
         if not message_ids:
             return
         placeholders = ",".join("?" for _ in message_ids)
-        with self._db:
-            self._db.execute(
-                f"UPDATE messages SET active = 0 WHERE message_id IN ({placeholders})",
-                message_ids,
-            )
-            self._db.execute(
-                f"UPDATE entries SET active = 0 WHERE "
-                f"substr(span_id, 1, instr(span_id || '.', '.') - 1) "
-                f"IN ({placeholders})",
-                message_ids,
-            )
-            self._db.execute(
-                f"UPDATE tool_calls SET active = 0 WHERE message_id IN ({placeholders})",
-                message_ids,
-            )
+        self._db.execute(
+            f"UPDATE messages SET active = 0 WHERE message_id IN ({placeholders})",
+            message_ids,
+        )
+        self._db.execute(
+            f"UPDATE entries SET active = 0 WHERE "
+            f"substr(span_id, 1, instr(span_id || '.', '.') - 1) "
+            f"IN ({placeholders})",
+            message_ids,
+        )
+        self._db.execute(
+            f"UPDATE tool_calls SET active = 0 WHERE message_id IN ({placeholders})",
+            message_ids,
+        )
 
     def _restore_purged_messages(self, messages: list[dict]) -> None:
         """Keep a raw SessionLog from resurrecting locally-erased bytes."""
@@ -574,7 +627,18 @@ class FoldingContext:
         }
         secrets = self._secret_values(content)
         if secrets:
-            identifier_replacements = self._sensitive_identifier_replacements(secrets)
+            identifier_replacements = self._sensitive_identifier_replacements(
+                secrets,
+                tuple(tool.name for tool in tools.values()),
+            )
+            self._scanner_identifier_replacements.update(identifier_replacements)
+            self._scanner_identifier_replacements = dict(
+                sorted(
+                    self._scanner_identifier_replacements.items(),
+                    key=lambda item: len(item[0]),
+                    reverse=True,
+                )
+            )
             self._purge_session_log(
                 secrets,
                 _REDACTION_MARKER,
@@ -582,6 +646,15 @@ class FoldingContext:
                 exhaustive=True,
                 identifier_replacements=identifier_replacements,
             )
+            for secret, replacement in identifier_replacements.items():
+                secret_sha = _sha(secret)
+                self._scanner_aliases[secret_sha] = replacement
+                self._db.execute(
+                    "INSERT INTO scanner_aliases(session_id, secret_sha, replacement) "
+                    "VALUES (?, ?, ?) ON CONFLICT(session_id, secret_sha) "
+                    "DO UPDATE SET replacement = excluded.replacement",
+                    (self.session_id, secret_sha, replacement),
+                )
             sanitized_meta = dict(
                 self._scrub_structured(
                     meta,
@@ -592,52 +665,49 @@ class FoldingContext:
                     identifier_replacements=identifier_replacements,
                 )
             )
-            with self._db:
-                self._scrub_sqlite(
-                    secrets,
-                    _REDACTION_MARKER,
-                    replace_substrings=True,
-                    exhaustive=True,
-                    identifier_replacements=identifier_replacements,
-                )
-                self._redact_sensitive_projections(
-                    secrets, identifier_replacements
-                )
-                self._scrub_live_shadow(
-                    secrets,
-                    _REDACTION_MARKER,
-                    replace_substrings=True,
-                    exhaustive=True,
-                    identifier_replacements=identifier_replacements,
-                )
-                self._current_notices = [
-                    str(
-                        self._scrub_data(
-                            notice,
-                            secrets,
-                            _REDACTION_MARKER,
-                            replace_substrings=True,
-                        )
+            self._scrub_sqlite(
+                secrets,
+                _REDACTION_MARKER,
+                replace_substrings=True,
+                exhaustive=True,
+                identifier_replacements=identifier_replacements,
+            )
+            self._redact_sensitive_projections(secrets, identifier_replacements)
+            self._scrub_live_shadow(
+                secrets,
+                _REDACTION_MARKER,
+                replace_substrings=True,
+                exhaustive=True,
+                identifier_replacements=identifier_replacements,
+            )
+            self._current_notices = [
+                str(
+                    self._scrub_data(
+                        notice,
+                        secrets,
+                        _REDACTION_MARKER,
+                        replace_substrings=True,
                     )
-                    for notice in self._current_notices
-                ]
-                self._insert_entry(
-                    span_id,
-                    None,
-                    "tool_result",
-                    "tool",
-                    None,
-                    sanitized_meta,
-                    content_sha=_sha(content),
-                    tokens_est=count_text_tokens(content),
-                    state="purged",
                 )
-                self._db.execute(
-                    "INSERT INTO folds(span_id, reason, note, decider, folded_turn, "
-                    "placement, applied_turn) VALUES (?, 'sensitive', ?, 'scanner', ?, "
-                    "'in_place', ?)",
-                    (span_id, "credential detected in tool output", self.turn, self.turn),
-                )
+                for notice in self._current_notices
+            ]
+            self._insert_entry(
+                span_id,
+                None,
+                "tool_result",
+                "tool",
+                None,
+                sanitized_meta,
+                content_sha=_sha(content),
+                tokens_est=count_text_tokens(content),
+                state="purged",
+            )
+            self._db.execute(
+                "INSERT INTO folds(span_id, reason, note, decider, folded_turn, "
+                "placement, applied_turn) VALUES (?, 'sensitive', ?, 'scanner', ?, "
+                "'in_place', ?)",
+                (span_id, "credential detected in tool output", self.turn, self.turn),
+            )
             message["content"] = _REDACTION_MARKER
             self._vacuum_pending = True
             self._event("scanner_hit", span=span_id)
@@ -864,7 +934,8 @@ class FoldingContext:
             "VALUES (?, 'auto', ?, ?)",
             (span_id, f"[auto-folded {span_id} — {reason}: {note}]", self.turn),
         )
-        self._db.commit()
+        if not self._sync_in_progress:
+            self._db.commit()
         return True
 
     def span_ids(self) -> list[str]:
@@ -1086,6 +1157,34 @@ class FoldingContext:
     def register_purge_path(self, path: Path) -> None:
         """Register a local JSONL artifact that may mirror foldable payloads."""
         self._purge_paths.add(Path(path))
+
+    def model_tool_names(self, tools: dict[str, Tool]) -> dict[str, str]:
+        """Return scanner-safe names for definitions offered to the model."""
+        aliases: dict[str, str] = {}
+        offered_names: set[str] = set()
+        for tool in tools.values():
+            replacements = dict(self._scanner_identifier_replacements)
+            for secret in self._secret_values(tool.name):
+                replacement = self._scanner_aliases.get(_sha(secret))
+                if replacement is not None:
+                    replacements[secret] = replacement
+            replacements = dict(
+                sorted(
+                    replacements.items(),
+                    key=lambda item: len(item[0]),
+                    reverse=True,
+                )
+            )
+            cleaned = self._replace_identifiers(tool.name, replacements)
+            if cleaned in offered_names:
+                raise FoldError(
+                    "scanner tool alias conflicts with another registered tool; "
+                    "start a new session with non-conflicting tool names"
+                )
+            offered_names.add(cleaned)
+            if cleaned != tool.name:
+                aliases[tool.name] = cleaned
+        return aliases
 
     def pin(self, span_id: str) -> str:
         entry = self._db.execute(
@@ -1980,15 +2079,18 @@ class FoldingContext:
                 cls._collect_identifier_values(item, found)
 
     def _sensitive_identifier_replacements(
-        self, secrets: tuple[str, ...]
+        self,
+        secrets: tuple[str, ...],
+        offered_tool_names: tuple[str, ...] = (),
     ) -> dict[str, str]:
-        identifiers = {
+        identifiers = set(offered_tool_names)
+        identifiers.update({
             str(value)
             for row in self._db.execute(
                 "SELECT call_id, tool_name FROM tool_calls"
             ).fetchall()
             for value in (row["call_id"], row["tool_name"])
-        }
+        })
         structured_columns = (
             ("entries", "meta_json"),
             ("messages", "message_json"),
@@ -2011,9 +2113,10 @@ class FoldingContext:
                 continue
             try:
                 lines = path.read_text().splitlines()
-            except OSError:
+            except (OSError, UnicodeDecodeError):
                 # The purge pass retains responsibility for surfacing artifact
-                # failures; inventory collection must not change that behavior.
+                # failures or using its scanner-only byte fallback; inventory
+                # collection must not change that behavior.
                 continue
             for line in lines:
                 try:
@@ -2465,13 +2568,38 @@ class FoldingContext:
             if not path.exists():
                 continue
             try:
-                lines = path.read_text().splitlines()
+                try:
+                    lines = path.read_text().splitlines()
+                except UnicodeDecodeError:
+                    if not exhaustive:
+                        raise
+                    raw = path.read_bytes()
+                    cleaned = raw
+                    marker_bytes = marker.encode()
+                    for content in erased:
+                        if content:
+                            cleaned = cleaned.replace(content.encode(), marker_bytes)
+                    temporary = path.with_suffix(path.suffix + ".purge.tmp")
+                    temporary.write_bytes(cleaned)
+                    os.replace(temporary, path)
+                    continue
                 rendered: list[str] = []
                 for line in lines:
                     try:
                         event = json.loads(line)
                     except json.JSONDecodeError:
-                        rendered.append(line)
+                        rendered.append(
+                            str(
+                                self._scrub_data(
+                                    line,
+                                    erased,
+                                    marker,
+                                    replace_substrings=True,
+                                )
+                            )
+                            if exhaustive
+                            else line
+                        )
                         continue
                     rendered.append(json.dumps(scrub(event), ensure_ascii=False))
                 temporary = path.with_suffix(path.suffix + ".purge.tmp")
@@ -2522,7 +2650,8 @@ class FoldingContext:
             if terminal and entry["origin"] == "assistant"
             else []
         )
-        with self._db:
+        transaction = nullcontext() if self._sync_in_progress else self._db
+        with transaction:
             cursor = self._db.execute(
                 "INSERT INTO folds(span_id, reason, note, decider, folded_turn, "
                 "placement, applied_turn) VALUES (?, ?, ?, ?, ?, ?, ?)",

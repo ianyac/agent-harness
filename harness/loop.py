@@ -12,6 +12,23 @@ from harness.tools.base import Tool, definitions
 ABORTED_PREFIX = "[turn aborted by harness"
 
 
+def _model_tools(
+    tools: dict[str, Tool], context: FoldingContext | None
+) -> tuple[list[dict] | None, dict[str, Tool]]:
+    if context is None:
+        return definitions(tools) or None, tools
+    aliases = context.model_tool_names(tools)
+    rendered: list[dict] = []
+    executable: dict[str, Tool] = {}
+    for tool in tools.values():
+        offered_name = aliases.get(tool.name, tool.name)
+        definition = tool.definition()
+        definition["function"]["name"] = offered_name
+        rendered.append(definition)
+        executable[offered_name] = tool
+    return rendered or None, executable
+
+
 def _permitted(
     tool: Tool,
     args: dict,
@@ -49,9 +66,9 @@ def run_turn(
     if context is not None and compact_threshold is not None:
         raise ValueError("context folding and compaction are mutually exclusive")
     tools = tools or {}
-    defs = definitions(tools) or None
+    defs, executable_tools = _model_tools(tools, context)
     if context is not None:
-        context.begin_turn(messages, tools)
+        context.begin_turn(messages, executable_tools)
     messages.append({"role": "user", "content": user_input})
     for _ in range(max_iterations):
         # re-evaluated every iteration: a callable system prompt can change
@@ -59,7 +76,8 @@ def run_turn(
         # so the plan-mode section must drop for the remaining iterations)
         sys_prompt = system() if callable(system) else system
         if context is not None:
-            context.sync(messages, tools)
+            context.sync(messages, executable_tools)
+            defs, executable_tools = _model_tools(tools, context)
             if context.should_checkpoint(estimate_tokens(messages, defs, sys_prompt)):
                 context.checkpoint(reason="marked token threshold")
         # re-checked every iteration: tool results can balloon the context
@@ -101,17 +119,19 @@ def run_turn(
         )
         messages.append(reply)
         if context is not None:
-            context.sync(messages, tools)
+            context.sync(messages, executable_tools)
         calls = reply.get("tool_calls")
         if not calls:
             return reply
         for call in calls:
-            result = _run_one_call(call, tools, policy, asker, on_tool_call)
+            result = _run_one_call(
+                call, executable_tools, policy, asker, on_tool_call
+            )
             messages.append(
                 {"role": "tool", "tool_call_id": call["id"], "content": result}
             )
             if context is not None:
-                context.sync(messages, tools)
+                context.sync(messages, executable_tools)
     # cap hit: close the transcript gracefully — the law is that every turn
     # ends with a plain assistant message, even an unsuccessful one
     reply = {
@@ -121,7 +141,7 @@ def run_turn(
     }
     messages.append(reply)
     if context is not None:
-        context.sync(messages, tools)
+        context.sync(messages, executable_tools)
     return reply
 
 

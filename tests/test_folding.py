@@ -513,6 +513,166 @@ def test_scanner_scrubs_every_non_role_jsonl_value_in_exhaustive_mode(tmp_path):
     assert secret not in actions_path.read_text()
 
 
+def test_scanner_scrubs_confirmed_secrets_from_torn_jsonl_lines(tmp_path):
+    secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
+    path = tmp_path / "folds.sqlite3"
+    actions_path = tmp_path / "actions.jsonl"
+    actions_path.write_text(
+        f'{{"event":"torn write","payload":"prefix {secret} suffix"\n'
+    )
+    messages = tool_exchange("leak", {"token": secret}, "queued")
+    context = FoldingContext(path, "session")
+    context.register_purge_path(actions_path)
+    context.sync(messages, {"leak": noop_tool(name="leak")})
+    context.record_request(context.project(messages))
+    projection_id = context.projection_chain()[0]["projection_id"]
+    messages[2]["content"] = f"diagnostic {secret}"
+
+    context.sync(messages, {"leak": noop_tool(name="leak")})
+
+    assert secret.encode() not in actions_path.read_bytes()
+    assert secret not in json.dumps(messages)
+    assert secret not in json.dumps(context.shadow_messages())
+    assert secret not in json.dumps(context.project(messages))
+    assert secret not in json.dumps(context.reconstruct_projection(projection_id))
+    assert secret.encode() not in path.read_bytes()
+
+
+def test_scanner_scrubs_confirmed_secrets_from_invalid_utf8_artifacts(tmp_path):
+    secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
+    actions_path = tmp_path / "actions.jsonl"
+    actions_path.write_bytes(
+        b"\xff\xfe{\"payload\":\"prefix " + secret.encode() + b" suffix\"}\n"
+    )
+    messages = tool_exchange("leak", {}, f"diagnostic {secret}")
+    context = FoldingContext(tmp_path / "folds.sqlite3", "session")
+    context.register_purge_path(actions_path)
+
+    context.sync(messages, {"leak": noop_tool(name="leak")})
+
+    artifact = actions_path.read_bytes()
+    assert artifact.startswith(b"\xff\xfe")
+    assert secret.encode() not in artifact
+    assert "[redacted — credential detected in tool output]".encode() in artifact
+    assert secret not in json.dumps(messages)
+    assert secret not in json.dumps(context.shadow_messages())
+    assert secret.encode() not in context.path.read_bytes()
+
+
+def test_failed_scanner_artifact_purge_rolls_back_sync_state(tmp_path):
+    secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
+    path = tmp_path / "folds.sqlite3"
+    unreadable_artifact = tmp_path / "artifact-directory"
+    unreadable_artifact.mkdir()
+    messages = tool_exchange("leak", {}, f"diagnostic {secret}")
+    context = FoldingContext(path, "session")
+    context.register_purge_path(unreadable_artifact)
+
+    with pytest.raises(FoldError, match="could not purge external artifact"):
+        context.sync(messages, {"leak": noop_tool(name="leak")})
+
+    context.record_request([])
+    row_counts = {
+        table: context._db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in ("messages", "entries", "span_state", "tool_calls", "folds")
+    }
+    assert row_counts == {
+        "messages": 0,
+        "entries": 0,
+        "span_state": 0,
+        "tool_calls": 0,
+        "folds": 0,
+    }
+    assert context._active_ids == []
+    assert context._snapshots == []
+    assert context._shadow_ref is None
+    assert context._vacuum_pending is False
+    assert context.shadow_messages() == []
+    assert secret.encode() not in path.read_bytes()
+    request_id = context.projection_chain()[0]["projection_id"]
+    assert context.reconstruct_projection(request_id) == []
+    context.close()
+
+    resumed = FoldingContext(path, "session")
+    assert resumed.shadow_messages() == []
+    assert resumed.span_ids() == []
+    assert secret.encode() not in path.read_bytes()
+
+
+def test_post_scanner_failure_rolls_back_the_whole_sync_transaction(tmp_path):
+    secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
+    path = tmp_path / "folds.sqlite3"
+
+    class FailingAfterScannerContext(FoldingContext):
+        def _event(self, event: str, **fields: object) -> None:
+            if event == "scanner_hit":
+                raise RuntimeError("forced post-scanner failure")
+            super()._event(event, **fields)
+
+    context = FailingAfterScannerContext(path, "session")
+    messages = tool_exchange("leak", {}, f"diagnostic {secret}")
+
+    with pytest.raises(RuntimeError, match="forced post-scanner failure"):
+        context.sync(messages, {"leak": noop_tool(name="leak")})
+
+    context.record_request([])
+    row_counts = {
+        table: context._db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in (
+            "messages",
+            "entries",
+            "span_state",
+            "tool_calls",
+            "folds",
+            "scanner_aliases",
+        )
+    }
+    assert set(row_counts.values()) == {0}
+    assert context._active_ids == []
+    assert context._snapshots == []
+    assert context._shadow_ref is None
+    assert context._vacuum_pending is False
+    assert secret.encode() not in path.read_bytes()
+    context.close()
+
+    resumed = FoldingContext(path, "session")
+    assert resumed.shadow_messages() == []
+    assert resumed.span_ids() == []
+    assert secret.encode() not in path.read_bytes()
+
+
+def test_failed_scanner_sync_rolls_back_prior_heuristic_mutations(tmp_path):
+    secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
+    unreadable_artifact = tmp_path / "artifact-directory"
+    unreadable_artifact.mkdir()
+    messages = [
+        *tool_exchange("first", {}, "duplicate", call_id="call_0"),
+        *tool_exchange("second", {}, "duplicate", call_id="call_1"),
+        *tool_exchange("leak", {}, f"diagnostic {secret}", call_id="call_2"),
+    ]
+    tools = {
+        "first": noop_tool(name="first"),
+        "second": noop_tool(name="second"),
+        "leak": noop_tool(name="leak"),
+    }
+    context = FoldingContext(
+        tmp_path / "folds.sqlite3",
+        "session",
+        config=FoldConfig(min_span_tokens=0),
+    )
+    context.register_purge_path(unreadable_artifact)
+
+    with pytest.raises(FoldError, match="could not purge external artifact"):
+        context.sync(messages, tools)
+
+    context.record_request([])
+    assert context._db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 0
+    assert context._db.execute("SELECT COUNT(*) FROM folds").fetchone()[0] == 0
+    assert context._db.execute("SELECT COUNT(*) FROM notices").fetchone()[0] == 0
+    assert context._active_ids == []
+    assert context._snapshots == []
+
+
 def test_scanner_purges_a_complete_multiline_private_key_from_every_copy(tmp_path):
     private_key = (
         "-----BEGIN RSA PRIVATE KEY-----\n"

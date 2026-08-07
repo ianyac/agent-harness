@@ -512,6 +512,171 @@ def test_scanner_scrubs_every_non_role_jsonl_value_in_exhaustive_mode(tmp_path):
     assert secret not in actions_path.read_text()
 
 
+def test_scanner_purges_a_complete_multiline_private_key_from_every_copy(tmp_path):
+    private_key = (
+        "-----BEGIN RSA PRIVATE KEY-----\n"
+        "MIIEowIBAAKCAQEAu7QxYzN4R0VhNlVmd0J2N1FZSkVnNVhV\n"
+        "Q29udGV4dEZvbGRpbmdEaXN0aW5jdGl2ZUJvZHlGcmFnbWVudA==\n"
+        "-----END RSA PRIVATE KEY-----"
+    )
+    body_fragment = "EaXN0aW5jdGl2ZUJvZHlGcmFnbWVudA"
+    path = tmp_path / "folds.sqlite3"
+    session_path = tmp_path / "session.jsonl"
+    actions_path = tmp_path / "actions.jsonl"
+    session_path.write_text(
+        json.dumps({"type": "message", "message": {"role": "user", "content": private_key}})
+        + "\n"
+    )
+    actions_path.write_text(
+        json.dumps({"name": "inspect_key", "args": {"private_key": private_key}})
+        + "\n"
+    )
+    messages = tool_exchange(
+        "inspect_key",
+        {"private_key": private_key},
+        "key queued for inspection",
+    )
+    messages[0]["content"] = f"inspect this key\n{private_key}"
+    tools = {
+        "inspect_key": noop_tool(name="inspect_key"),
+        "leak": noop_tool(name="leak"),
+    }
+    context = FoldingContext(path, "session", session_log_path=session_path)
+    context.register_purge_path(actions_path)
+    context.sync(messages, tools)
+    context.record_request(context.project(messages))
+    projection_id = context.projection_chain()[0]["projection_id"]
+    messages.extend(
+        [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "leak",
+                        "arguments": json.dumps({"private_key": private_key}),
+                    },
+                }],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": f"diagnostic output\n{private_key}",
+            },
+        ]
+    )
+
+    context.sync(messages, tools)
+
+    fragments = (
+        "-----BEGIN RSA PRIVATE KEY-----",
+        body_fragment,
+        "-----END RSA PRIVATE KEY-----",
+    )
+    text_copies = (
+        json.dumps(messages),
+        json.dumps(context.shadow_messages()),
+        json.dumps(context.project(messages)),
+        json.dumps(context.reconstruct_projection(projection_id)),
+        session_path.read_text(),
+        actions_path.read_text(),
+    )
+    assert context.state("m4.r0") == "purged"
+    assert all(fragment not in copy for fragment in fragments for copy in text_copies)
+    database_bytes = path.read_bytes()
+    assert all(fragment.encode() not in database_bytes for fragment in fragments)
+
+
+def test_scanner_remaps_identifiers_without_colliding_with_an_existing_alias(tmp_path):
+    secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
+    existing_alias = (
+        "redacted_db3qobsommarzjeek2fytgek5zgie47kkosagadvfuywhxw7mraa"
+    )
+    path = tmp_path / "folds.sqlite3"
+    messages = [
+        {"role": "user", "content": "inspect"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": secret,
+                    "type": "function",
+                    "function": {"name": "secret_tool", "arguments": "{}"},
+                },
+                {
+                    "id": existing_alias,
+                    "type": "function",
+                    "function": {"name": "alias_tool", "arguments": "{}"},
+                },
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": existing_alias,
+            "content": "existing alias result",
+        },
+    ]
+    triggering_result = {
+        "role": "tool",
+        "tool_call_id": secret,
+        "content": f"diagnostic {secret}",
+    }
+    tools = {
+        "secret_tool": noop_tool(name="secret_tool"),
+        "alias_tool": noop_tool(name="alias_tool"),
+    }
+    context = FoldingContext(path, "session")
+    context.sync(messages, tools)
+    context.record_request(deepcopy([*messages, triggering_result]))
+    projection_id = context.projection_chain()[0]["projection_id"]
+    messages.append(triggering_result)
+
+    context.sync(messages, tools)
+
+    live_calls = messages[1]["tool_calls"]
+    remapped_id = live_calls[0]["id"]
+    assert remapped_id not in {secret, existing_alias}
+    assert live_calls[1]["id"] == existing_alias
+    assert messages[2]["tool_call_id"] == existing_alias
+    assert messages[3]["tool_call_id"] == remapped_id
+    assert len({call["id"] for call in live_calls}) == 2
+
+    stored_calls = context._db.execute(
+        "SELECT call_id, tool_name FROM tool_calls ORDER BY call_index"
+    ).fetchall()
+    assert [(row["call_id"], row["tool_name"]) for row in stored_calls] == [
+        (remapped_id, "secret_tool"),
+        (existing_alias, "alias_tool"),
+    ]
+    result_meta = {
+        row["span_id"]: json.loads(row["meta_json"])
+        for row in context._db.execute(
+            "SELECT span_id, meta_json FROM entries "
+            "WHERE span_id IN ('m2.r0', 'm3.r0')"
+        ).fetchall()
+    }
+    assert result_meta["m2.r0"]["call_id"] == existing_alias
+    assert result_meta["m3.r0"]["call_id"] == remapped_id
+
+    for copy in (
+        context.shadow_messages(),
+        context.project(messages),
+        context.reconstruct_projection(projection_id),
+    ):
+        calls = copy[1]["tool_calls"]
+        assert calls[0]["id"] == remapped_id
+        assert calls[1]["id"] == existing_alias
+        assert copy[2]["tool_call_id"] == existing_alias
+        assert copy[3]["tool_call_id"] == remapped_id
+        assert secret not in json.dumps(copy)
+    assert context.state("m3.r0") == "purged"
+    assert secret not in json.dumps(messages)
+    assert secret.encode() not in path.read_bytes()
+
+
 def test_sensitive_reason_cannot_be_used_as_a_recoverable_fold(tmp_path):
     context, _messages = context_with_result(tmp_path, "ordinary evidence")
 

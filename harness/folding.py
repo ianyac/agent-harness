@@ -57,17 +57,30 @@ _IMPERATIVE_NOTE = re.compile(
     r"[\[\]]|<\|(?:system|assistant|user|tool)",
     re.IGNORECASE | re.MULTILINE,
 )
+_PRIVATE_KEY_PATTERN = re.compile(
+    r"(?P<secret>"
+    r"-----BEGIN (?P<private_key_label>"
+    r"(?:(?:RSA|EC|DSA|OPENSSH|ENCRYPTED) )?PRIVATE KEY"
+    r")-----"
+    r".*?"
+    r"-----END (?P=private_key_label)-----"
+    r")",
+    re.DOTALL,
+)
 _SECRET_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9_-]{24,}\b"),
     re.compile(r"\bgh[pousr]_[A-Za-z0-9]{30,}\b"),
     re.compile(r"\bAKIA[A-Z0-9]{16}\b"),
-    re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
+    _PRIVATE_KEY_PATTERN,
     re.compile(
         r"(?i)\b(?:api[_-]?key|access[_-]?token|password|secret)\s*[:=]\s*"
         r"[\"']?(?P<secret>[A-Za-z0-9_./+=-]{20,})"
     ),
 )
 _REDACTION_MARKER = "[redacted — credential detected in tool output]"
+_IDENTIFIER_VALUE_KEYS = frozenset(
+    {"call_id", "id", "name", "tool_call_id", "tool_name"}
+)
 _SCHEMA_VERSION = 3
 
 
@@ -561,11 +574,13 @@ class FoldingContext:
         }
         secrets = self._secret_values(content)
         if secrets:
+            identifier_replacements = self._sensitive_identifier_replacements(secrets)
             self._purge_session_log(
                 secrets,
                 _REDACTION_MARKER,
                 replace_substrings=True,
                 exhaustive=True,
+                identifier_replacements=identifier_replacements,
             )
             sanitized_meta = dict(
                 self._scrub_structured(
@@ -574,6 +589,7 @@ class FoldingContext:
                     _REDACTION_MARKER,
                     replace_substrings=True,
                     exhaustive=True,
+                    identifier_replacements=identifier_replacements,
                 )
             )
             with self._db:
@@ -582,13 +598,17 @@ class FoldingContext:
                     _REDACTION_MARKER,
                     replace_substrings=True,
                     exhaustive=True,
+                    identifier_replacements=identifier_replacements,
                 )
-                self._redact_sensitive_projections(secrets)
+                self._redact_sensitive_projections(
+                    secrets, identifier_replacements
+                )
                 self._scrub_live_shadow(
                     secrets,
                     _REDACTION_MARKER,
                     replace_substrings=True,
                     exhaustive=True,
+                    identifier_replacements=identifier_replacements,
                 )
                 self._current_notices = [
                     str(
@@ -1731,6 +1751,7 @@ class FoldingContext:
         *,
         replace_substrings: bool,
         exhaustive: bool = False,
+        identifier_replacements: dict[str, str] | None = None,
     ) -> None:
         if self._shadow_ref is None:
             return
@@ -1741,6 +1762,7 @@ class FoldingContext:
                 marker,
                 replace_substrings=replace_substrings,
                 exhaustive=exhaustive,
+                identifier_replacements=identifier_replacements,
             )
             if cleaned == message or not isinstance(cleaned, dict):
                 continue
@@ -1758,6 +1780,7 @@ class FoldingContext:
         *,
         replace_substrings: bool,
         exhaustive: bool = False,
+        identifier_replacements: dict[str, str] | None = None,
     ) -> object:
         """Scrub user data without changing the surrounding protocol shape."""
         if isinstance(value, dict):
@@ -1767,14 +1790,10 @@ class FoldingContext:
                 # can make an otherwise valid transcript impossible to replay.
                 if key == "role":
                     cleaned[key] = item
-                elif exhaustive and key in {
-                    "call_id",
-                    "id",
-                    "name",
-                    "tool_call_id",
-                    "tool_name",
-                }:
-                    cleaned[key] = cls._scrub_identifier(item, erased)
+                elif exhaustive and key in _IDENTIFIER_VALUE_KEYS:
+                    cleaned[key] = cls._scrub_identifier(
+                        item, erased, identifier_replacements
+                    )
                 elif key in {"args", "arguments", "args_json"}:
                     cleaned[key] = cls._scrub_arguments(
                         item, erased, marker, replace_substrings=replace_substrings
@@ -1786,6 +1805,7 @@ class FoldingContext:
                         marker,
                         replace_substrings=replace_substrings,
                         exhaustive=exhaustive,
+                        identifier_replacements=identifier_replacements,
                     )
                 elif key in {
                     "content",
@@ -1830,6 +1850,7 @@ class FoldingContext:
                         marker,
                         replace_substrings=replace_substrings,
                         exhaustive=exhaustive,
+                        identifier_replacements=identifier_replacements,
                     )
             return cleaned
         if isinstance(value, list):
@@ -1840,6 +1861,7 @@ class FoldingContext:
                     marker,
                     replace_substrings=replace_substrings,
                     exhaustive=exhaustive,
+                    identifier_replacements=identifier_replacements,
                 )
                 for item in value
             ]
@@ -1854,18 +1876,99 @@ class FoldingContext:
         return marker if value in erased else value
 
     @staticmethod
+    def _identifier_alias(secret: str, nonce: int = 0) -> str:
+        source = secret.encode()
+        if nonce:
+            source += b"\0" + str(nonce).encode()
+        digest = hashlib.sha256(source).digest()
+        replacement = base64.b32encode(digest).decode().lower().rstrip("=")
+        return f"redacted_{replacement}"
+
+    @staticmethod
+    def _replace_identifiers(value: str, replacements: dict[str, str]) -> str:
+        cleaned = value
+        for secret, replacement in replacements.items():
+            if secret:
+                cleaned = cleaned.replace(secret, replacement)
+        return cleaned
+
+    @classmethod
     def _scrub_identifier(
-        value: object, erased: tuple[str, ...] | list[str]
+        cls,
+        value: object,
+        erased: tuple[str, ...] | list[str],
+        replacements: dict[str, str] | None = None,
     ) -> object:
         if not isinstance(value, str):
             return value
-        cleaned = value
-        for secret in erased:
-            if secret:
-                digest = hashlib.sha256(secret.encode()).digest()
-                replacement = base64.b32encode(digest).decode().lower().rstrip("=")
-                cleaned = cleaned.replace(secret, f"redacted_{replacement}")
-        return cleaned
+        if replacements is None:
+            replacements = {
+                secret: cls._identifier_alias(secret) for secret in erased if secret
+            }
+        return cls._replace_identifiers(value, replacements)
+
+    @classmethod
+    def _collect_identifier_values(cls, value: object, found: set[str]) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key in _IDENTIFIER_VALUE_KEYS and isinstance(item, str):
+                    found.add(item)
+                cls._collect_identifier_values(item, found)
+        elif isinstance(value, list):
+            for item in value:
+                cls._collect_identifier_values(item, found)
+
+    def _sensitive_identifier_replacements(
+        self, secrets: tuple[str, ...]
+    ) -> dict[str, str]:
+        identifiers = {
+            str(value)
+            for row in self._db.execute(
+                "SELECT call_id, tool_name FROM tool_calls"
+            ).fetchall()
+            for value in (row["call_id"], row["tool_name"])
+        }
+        structured_columns = (
+            ("entries", "meta_json"),
+            ("messages", "message_json"),
+            ("projections", "projection_json"),
+        )
+        for table, column in structured_columns:
+            rows = self._db.execute(
+                f"SELECT {column} AS value FROM {table} WHERE {column} IS NOT NULL"
+            ).fetchall()
+            for row in rows:
+                try:
+                    decoded = json.loads(row["value"])
+                except json.JSONDecodeError:
+                    continue
+                self._collect_identifier_values(decoded, identifiers)
+        if self._shadow_ref is not None:
+            self._collect_identifier_values(self._shadow_ref, identifiers)
+
+        replacements: dict[str, str] = {}
+        for secret in secrets:
+            nonce = 0
+            while True:
+                candidate = self._identifier_alias(secret, nonce)
+                trial = {**replacements, secret: candidate}
+                transformed: dict[str, str] = {}
+                collision = False
+                for original in identifiers:
+                    cleaned = self._replace_identifiers(original, trial)
+                    if cleaned != original and cleaned in identifiers:
+                        collision = True
+                        break
+                    prior = transformed.get(cleaned)
+                    if prior is not None and prior != original:
+                        collision = True
+                        break
+                    transformed[cleaned] = original
+                if not collision:
+                    replacements[secret] = candidate
+                    break
+                nonce += 1
+        return replacements
 
     @classmethod
     def _scrub_data(
@@ -1941,6 +2044,7 @@ class FoldingContext:
         *,
         replace_substrings: bool,
         exhaustive: bool = False,
+        identifier_replacements: dict[str, str] | None = None,
     ) -> object:
         if not isinstance(value, str):
             return value
@@ -1948,12 +2052,18 @@ class FoldingContext:
             return marker
         tool_name, separator, arguments = value.partition(":")
         if not separator:
-            return cls._scrub_identifier(value, erased) if exhaustive else value
+            return (
+                cls._scrub_identifier(value, erased, identifier_replacements)
+                if exhaustive
+                else value
+            )
         cleaned = cls._scrub_arguments(
             arguments, erased, marker, replace_substrings=replace_substrings
         )
         cleaned_name = (
-            cls._scrub_identifier(tool_name, erased) if exhaustive else tool_name
+            cls._scrub_identifier(tool_name, erased, identifier_replacements)
+            if exhaustive
+            else tool_name
         )
         return (
             value
@@ -1971,6 +2081,7 @@ class FoldingContext:
         mode: str,
         replace_substrings: bool,
         exhaustive: bool = False,
+        identifier_replacements: dict[str, str] | None = None,
     ) -> str:
         if mode in {"arguments", "structured"}:
             try:
@@ -1988,6 +2099,7 @@ class FoldingContext:
                     marker,
                     replace_substrings=replace_substrings,
                     exhaustive=exhaustive,
+                    identifier_replacements=identifier_replacements,
                 )
             return value if cleaned_decoded == decoded else _canonical(cleaned_decoded)
         if mode == "canonical_key":
@@ -1998,10 +2110,15 @@ class FoldingContext:
                     marker,
                     replace_substrings=replace_substrings,
                     exhaustive=exhaustive,
+                    identifier_replacements=identifier_replacements,
                 )
             )
         if mode == "identifier":
-            return str(cls._scrub_identifier(value, erased)) if exhaustive else value
+            return (
+                str(cls._scrub_identifier(value, erased, identifier_replacements))
+                if exhaustive
+                else value
+            )
         return str(
             cls._scrub_data(
                 value, erased, marker, replace_substrings=replace_substrings
@@ -2015,6 +2132,7 @@ class FoldingContext:
         *,
         replace_substrings: bool,
         exhaustive: bool = False,
+        identifier_replacements: dict[str, str] | None = None,
     ) -> None:
         columns = (
             ("entries", "content", "data"),
@@ -2040,6 +2158,7 @@ class FoldingContext:
                     mode=mode,
                     replace_substrings=replace_substrings,
                     exhaustive=exhaustive,
+                    identifier_replacements=identifier_replacements,
                 )
                 if cleaned != row["value"]:
                     self._db.execute(
@@ -2053,7 +2172,9 @@ class FoldingContext:
                             (_sha(cleaned), row["scrub_rowid"]),
                         )
 
-    def _redact_sensitive_projections(self, secrets: tuple[str, ...]) -> None:
+    def _redact_sensitive_projections(
+        self, secrets: tuple[str, ...], identifier_replacements: dict[str, str]
+    ) -> None:
         rows = self._db.execute(
             "SELECT projection_id, projection_json FROM projections"
         ).fetchall()
@@ -2070,6 +2191,7 @@ class FoldingContext:
                 _REDACTION_MARKER,
                 replace_substrings=True,
                 exhaustive=True,
+                identifier_replacements=identifier_replacements,
             )
             if cleaned != decoded:
                 self._db.execute(
@@ -2171,6 +2293,7 @@ class FoldingContext:
         *,
         replace_substrings: bool,
         exhaustive: bool = False,
+        identifier_replacements: dict[str, str] | None = None,
     ) -> None:
         if not erased:
             return
@@ -2182,6 +2305,7 @@ class FoldingContext:
                 marker,
                 replace_substrings=replace_substrings,
                 exhaustive=exhaustive,
+                identifier_replacements=identifier_replacements,
             )
 
         for path in self._purge_paths:

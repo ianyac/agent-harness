@@ -1249,6 +1249,72 @@ def test_user_delete_metadata_scopes_reused_call_ids_to_their_owner_message(tmp_
     }
 
 
+def test_user_delete_redacts_all_selected_inputs_in_one_stored_message(tmp_path):
+    # Regression caught: provenance is message-local, but one source message
+    # may own multiple independently registered input spans with equal values.
+    payload = "ERASE_DUPLICATE_77"
+    messages = [
+        {"role": "user", "content": "write both"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_0",
+                    "type": "function",
+                    "function": {
+                        "name": "write",
+                        "arguments": json.dumps(
+                            {"content": payload, "note": "keep first"}
+                        ),
+                    },
+                },
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "write",
+                        "arguments": json.dumps(
+                            {"content": payload, "note": "keep second"}
+                        ),
+                    },
+                },
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_0", "content": "written first"},
+        {"role": "tool", "tool_call_id": "call_1", "content": "written second"},
+    ]
+    write = Tool(
+        name="write",
+        description="consume content",
+        parameters={
+            "type": "object",
+            "properties": {"content": {"type": "string"}},
+            "required": ["content"],
+        },
+        execute=lambda content: "written",
+        foldable_inputs=("content",),
+    )
+    context = FoldingContext(
+        tmp_path / "folds.sqlite3", "session", config=FoldConfig(min_span_tokens=0)
+    )
+    context.sync(messages, {"write": write})
+    context.record_request(context.project(messages))
+    projection_id = context.projection_chain()[-1]["projection_id"]
+
+    context.delete("m1.i0")
+
+    historical = context.reconstruct_projection(projection_id)
+    calls = historical[1]["tool_calls"]
+    assert [
+        json.loads(call["function"]["arguments"])["content"] for call in calls
+    ] == ["[deleted by user]", "[deleted by user]"]
+    assert [
+        json.loads(call["function"]["arguments"])["note"] for call in calls
+    ] == ["keep first", "keep second"]
+    assert context.projection_chain()[-1]["redacted"] is True
+
+
 def test_user_delete_purges_duplicate_entry_and_live_shadow_copies(tmp_path):
     payload = "ERASE_DUPLICATE_77"
     messages = tool_exchange("first", {}, payload)
@@ -1446,6 +1512,45 @@ def test_user_delete_reconciles_an_exact_duplicate_result_chunk(tmp_path):
     assert payload.encode() not in (tmp_path / "folds.sqlite3").read_bytes()
 
 
+def test_user_delete_rewrites_only_selected_chunk_in_stored_projection(tmp_path):
+    # Regression caught: an indexed child aliases only part of its owning
+    # message, so stored history must preserve the surrounding result prose.
+    payload = "XYZ12345"
+    messages = tool_exchange("first", {}, payload)
+    messages.extend(
+        tool_exchange(
+            "second",
+            {},
+            f"prefix\n{payload}\nsuffix\n",
+            call_id="call_1",
+        )
+    )
+    context = FoldingContext(
+        tmp_path / "folds.sqlite3",
+        "session",
+        config=FoldConfig(min_span_tokens=0, chunk_tokens=3),
+    )
+    context.sync(
+        messages,
+        {"first": noop_tool(name="first"), "second": noop_tool(name="second")},
+    )
+    context.record_request(context.project(messages))
+    before = context.projection_chain()[-1]
+
+    context.delete("m2.r0")
+
+    after = context.projection_chain()[-1]
+    historical = context.reconstruct_projection(after["projection_id"])
+    content = historical[5]["content"]
+    assert "prefix" in content
+    assert "suffix" in content
+    assert payload not in content
+    assert content.count("[deleted by user]") == 1
+    assert after["projection_hash"] == before["projection_hash"]
+    assert after["parent_hash"] == before["parent_hash"]
+    assert after["redacted"] is True
+
+
 def test_user_delete_scrubs_only_matching_in_memory_notices(tmp_path):
     context, _messages = context_with_result(tmp_path, "delete me permanently")
     notice = context._db.execute(
@@ -1492,6 +1597,39 @@ def test_user_delete_keeps_identical_unrelated_live_notice_unchanged(tmp_path):
         "notice: [deleted by user]",
         "notice: delete me permanently",
     ]
+
+
+def test_user_delete_redacts_embedded_stored_notice_without_user_prose(tmp_path):
+    # Regression caught: a notice is embedded into a user message at projection
+    # time, but its deletion provenance remains the originating span.
+    payload = "delete me permanently"
+    messages = tool_exchange("noop", {}, payload) + [
+        {"role": "user", "content": f"user prose keeps {payload}"}
+    ]
+    context = FoldingContext(
+        tmp_path / "folds.sqlite3", "session", config=FoldConfig(min_span_tokens=0)
+    )
+    context.sync(messages, {"noop": noop_tool()})
+    context._db.execute(
+        "INSERT INTO notices(span_id, message_id, kind, content, created_turn, "
+        "emitted_turn) VALUES (?, ?, ?, ?, ?, ?)",
+        ("m2.r0", "m3", "auto", f"notice: {payload}", context.turn, context.turn),
+    )
+    context._db.commit()
+    context.record_request(context.project(messages, turn=context.turn))
+    before = context.projection_chain()[-1]
+
+    context.delete("m2.r0")
+
+    after = context.projection_chain()[-1]
+    historical = context.reconstruct_projection(after["projection_id"])
+    assert historical[3]["content"] == (
+        f"notice: [deleted by user]\n\nuser prose keeps {payload}"
+    )
+    assert messages[3]["content"] == f"user prose keeps {payload}"
+    assert after["projection_hash"] == before["projection_hash"]
+    assert after["parent_hash"] == before["parent_hash"]
+    assert after["redacted"] is True
 
 
 def test_resume_restores_only_provenance_targeted_messages_before_sync(tmp_path):

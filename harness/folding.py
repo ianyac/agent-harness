@@ -1148,11 +1148,17 @@ class FoldingContext:
             self._scrub_delete_messages(
                 root_owner_ids, indexed_owner_ids, input_aliases, payload
             )
-            self._redact_user_projections(
-                self._user_projection_operations(
-                    span_ids, root_owner_ids, indexed_owner_ids, input_aliases
-                )
+            projection_operations = self._user_projection_operations(
+                span_ids,
+                root_owner_ids,
+                indexed_owner_ids,
+                input_aliases,
+                payload,
             )
+            self._add_user_projection_notice_operations(
+                projection_operations, metadata_span_ids, [payload]
+            )
+            self._redact_user_projections(projection_operations)
             notice_updates = self._scrub_delete_folds_and_notices(
                 metadata_span_ids, [payload]
             )
@@ -1201,22 +1207,71 @@ class FoldingContext:
         root_owner_ids: set[str],
         indexed_owner_ids: set[str],
         input_aliases: list[dict[str, str]],
-    ) -> dict[str, dict[str, object]]:
+        payload: str,
+    ) -> dict[str, list[dict[str, object]]]:
         marker = "[deleted by user]"
-        operations: dict[str, dict[str, object]] = {
-            owner_id: {"kind": "content", "marker": marker}
-            for owner_id in root_owner_ids | indexed_owner_ids
-        }
+        operations: dict[str, list[dict[str, object]]] = {}
+
+        def add(source_id: str, operation: dict[str, object]) -> None:
+            operations.setdefault(source_id, []).append(operation)
+
+        for owner_id in root_owner_ids:
+            add(owner_id, {"kind": "content", "marker": marker})
+        for owner_id in indexed_owner_ids:
+            add(
+                owner_id,
+                {
+                    "kind": "indexed_content",
+                    "marker": marker,
+                    "payload": payload,
+                },
+            )
         for span_id in span_ids:
-            operations[span_id] = {"kind": "result", "marker": marker}
+            add(span_id, {"kind": "result", "marker": marker})
         for alias in input_aliases:
-            operations[alias["message_id"]] = {
-                "kind": "tool_input",
-                "call_id": alias["call_id"],
-                "field": alias["field"],
-                "marker": marker,
-            }
+            add(
+                alias["message_id"],
+                {
+                    "kind": "tool_input",
+                    "call_id": alias["call_id"],
+                    "field": alias["field"],
+                    "marker": marker,
+                },
+            )
         return operations
+
+    def _add_user_projection_notice_operations(
+        self,
+        operations: dict[str, list[dict[str, object]]],
+        span_ids: set[str],
+        erased: list[str],
+    ) -> None:
+        if not span_ids:
+            return
+        placeholders = ",".join("?" for _ in span_ids)
+        rows = self._db.execute(
+            f"SELECT message_id, content FROM notices WHERE message_id IS NOT NULL "
+            f"AND span_id IN ({placeholders}) ORDER BY notice_id",
+            list(span_ids),
+        ).fetchall()
+        for row in rows:
+            cleaned = self._scrub_text(
+                row["content"],
+                erased,
+                "[deleted by user]",
+                mode="data",
+                replace_substrings=True,
+            )
+            if cleaned == row["content"]:
+                continue
+            operations.setdefault(str(row["message_id"]), []).append(
+                {
+                    "kind": "notice",
+                    "marker": "[deleted by user]",
+                    "content": row["content"],
+                    "replacement": cleaned,
+                }
+            )
 
     def _user_delete_aliases(self, target: str) -> tuple[set[str], set[str]]:
         root = self._entry(target)
@@ -2024,7 +2079,7 @@ class FoldingContext:
                 )
 
     def _redact_user_projections(
-        self, operations: dict[str, dict[str, object]]
+        self, operations: dict[str, list[dict[str, object]]]
     ) -> None:
         if not operations:
             return
@@ -2046,32 +2101,62 @@ class FoldingContext:
                 if not isinstance(message, dict) or not isinstance(source, str):
                     continue
                 source_id = source.split(":", 1)[1] if ":" in source else source
-                operation = operations.get(source_id)
-                if operation is None:
+                source_operations = operations.get(source_id)
+                if source_operations is None:
                     continue
-                marker = str(operation["marker"])
-                if operation["kind"] in {"content", "result"}:
-                    if message.get("content") != marker:
-                        message["content"] = marker
+                for operation in source_operations:
+                    marker = str(operation["marker"])
+                    if operation["kind"] == "notice":
+                        content = message.get("content")
+                        if not isinstance(content, str):
+                            continue
+                        notice_block, separator, prose = content.partition("\n\n")
+                        old_notice = str(operation["content"])
+                        if not separator or old_notice not in notice_block:
+                            continue
+                        cleaned_block = notice_block.replace(
+                            old_notice, str(operation["replacement"]), 1
+                        )
+                        message["content"] = f"{cleaned_block}{separator}{prose}"
                         changed = True
-                    continue
-                call_id = operation["call_id"]
-                field = str(operation["field"])
-                for call in message.get("tool_calls") or []:
-                    if not isinstance(call, dict) or call.get("id") != call_id:
                         continue
-                    function = call.get("function")
-                    if not isinstance(function, dict):
+                    if operation["kind"] == "indexed_content":
+                        content = message.get("content")
+                        cleaned = self._scrub_data(
+                            content,
+                            [str(operation["payload"])],
+                            marker,
+                            replace_substrings=True,
+                        )
+                        if cleaned != content:
+                            message["content"] = cleaned
+                            changed = True
                         continue
-                    try:
-                        arguments = json.loads(function.get("arguments", ""))
-                    except json.JSONDecodeError:
+                    if operation["kind"] in {"content", "result"}:
+                        if message.get("content") != marker:
+                            message["content"] = marker
+                            changed = True
                         continue
-                    if not isinstance(arguments, dict) or arguments.get(field) == marker:
-                        continue
-                    arguments[field] = marker
-                    function["arguments"] = _canonical(arguments)
-                    changed = True
+                    call_id = operation["call_id"]
+                    field = str(operation["field"])
+                    for call in message.get("tool_calls") or []:
+                        if not isinstance(call, dict) or call.get("id") != call_id:
+                            continue
+                        function = call.get("function")
+                        if not isinstance(function, dict):
+                            continue
+                        try:
+                            arguments = json.loads(function.get("arguments", ""))
+                        except json.JSONDecodeError:
+                            continue
+                        if (
+                            not isinstance(arguments, dict)
+                            or arguments.get(field) == marker
+                        ):
+                            continue
+                        arguments[field] = marker
+                        function["arguments"] = _canonical(arguments)
+                        changed = True
             if changed:
                 self._db.execute(
                     "UPDATE projections SET projection_json = ?, redacted = 1 "

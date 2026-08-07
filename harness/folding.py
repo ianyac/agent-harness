@@ -1064,23 +1064,9 @@ class FoldingContext:
         ]
         self._purge_session_log(erased)
         with self._db:
-            for candidate in targets:
-                self._db.execute(
-                    "UPDATE entries SET content = NULL WHERE span_id = ?",
-                    (candidate,),
-                )
-                self._db.execute(
-                    "UPDATE span_state SET state = 'purged' WHERE span_id = ?",
-                    (candidate,),
-                )
-                self._db.execute(
-                    "INSERT INTO folds(span_id, reason, note, decider, folded_turn, "
-                    "placement, applied_turn) VALUES (?, 'user_delete', "
-                    "'deleted by user', 'user', ?, 'in_place', ?)",
-                    (candidate, self.turn, self.turn),
-                )
-            self._rewrite_message_for_purge(target, "[deleted by user]")
+            self._purge_entry_copies(erased, "[deleted by user]")
             self._scrub_sqlite(erased, "[deleted by user]")
+            self._scrub_live_shadow(erased, "[deleted by user]")
             self._current_notices = [
                 self._scrub_text(
                     notice,
@@ -1095,6 +1081,54 @@ class FoldingContext:
         self._db.execute("VACUUM")
         self._event("user_delete", span=target, decider="user")
         return f"deleted {target}; content is no longer recoverable"
+
+    def _purge_entry_copies(self, erased: list[str], marker: str) -> None:
+        rows = self._db.execute(
+            "SELECT span_id, content FROM entries WHERE content IS NOT NULL"
+        ).fetchall()
+        for row in rows:
+            content = row["content"]
+            cleaned = str(self._scrub_value(content, erased, marker))
+            if cleaned == content:
+                continue
+            span_id = row["span_id"]
+            if content in erased:
+                state = self._db.execute(
+                    "SELECT state FROM span_state WHERE span_id = ?", (span_id,)
+                ).fetchone()
+                self._db.execute(
+                    "UPDATE entries SET content = NULL WHERE span_id = ?",
+                    (span_id,),
+                )
+                self._db.execute(
+                    "UPDATE span_state SET state = 'purged' WHERE span_id = ?",
+                    (span_id,),
+                )
+                if state is None or state["state"] != "purged":
+                    self._db.execute(
+                        "INSERT INTO folds(span_id, reason, note, decider, folded_turn, "
+                        "placement, applied_turn) VALUES (?, 'user_delete', "
+                        "'deleted by user', 'user', ?, 'in_place', ?)",
+                        (span_id, self.turn, self.turn),
+                    )
+            else:
+                self._db.execute(
+                    "UPDATE entries SET content = ?, content_sha = ?, tokens_est = ? "
+                    "WHERE span_id = ?",
+                    (cleaned, _sha(cleaned), count_text_tokens(cleaned), span_id),
+                )
+
+    def _scrub_live_shadow(self, erased: list[str], marker: str) -> None:
+        if self._shadow_ref is None:
+            return
+        for index, message in enumerate(self._shadow_ref):
+            cleaned = self._scrub_value(deepcopy(message), erased, marker)
+            if cleaned == message or not isinstance(cleaned, dict):
+                continue
+            message.clear()
+            message.update(cleaned)
+            if index < len(self._snapshots):
+                self._snapshots[index] = _canonical(message)
 
     @staticmethod
     def _scrub_value(value: object, erased: list[str], marker: str) -> object:
@@ -1169,6 +1203,11 @@ class FoldingContext:
                         f"UPDATE {table} SET {column} = ? WHERE rowid = ?",
                         (cleaned, row["scrub_rowid"]),
                     )
+                    if table == "messages" and column == "message_json":
+                        self._db.execute(
+                            "UPDATE messages SET content_sha = ? WHERE rowid = ?",
+                            (_sha(cleaned), row["scrub_rowid"]),
+                        )
 
     def _purge_session_log(
         self, erased: list[str], marker: str = "[deleted by user]"
@@ -1197,42 +1236,6 @@ class FoldingContext:
                 os.replace(temporary, path)
             except OSError as error:
                 raise FoldError(f"could not purge external artifact {path}: {error}") from error
-
-    def _rewrite_message_for_purge(self, span_id: str, marker: str) -> None:
-        message_id = span_id.split(".", 1)[0]
-        row = self._db.execute(
-            "SELECT message_json FROM messages WHERE message_id = ? AND active = 1",
-            (message_id,),
-        ).fetchone()
-        if row is None:
-            return
-        message = json.loads(row["message_json"])
-        entry = self._entry(span_id)
-        if entry["origin"] == "tool_input":
-            meta = json.loads(entry["meta_json"])
-            for call in message.get("tool_calls") or []:
-                if call.get("id") != meta.get("call_id"):
-                    continue
-                try:
-                    arguments = json.loads(call["function"]["arguments"])
-                except json.JSONDecodeError:
-                    break
-                arguments[meta["field"]] = marker
-                call["function"]["arguments"] = _canonical(arguments)
-                break
-        else:
-            message["content"] = marker
-        raw = _canonical(message)
-        self._db.execute(
-            "UPDATE messages SET message_json = ?, content_sha = ? WHERE message_id = ?",
-            (raw, _sha(raw), message_id),
-        )
-        if message_id in self._active_ids:
-            index = self._active_ids.index(message_id)
-            self._snapshots[index] = raw
-            if self._shadow_ref is not None and index < len(self._shadow_ref):
-                self._shadow_ref[index].clear()
-                self._shadow_ref[index].update(deepcopy(message))
 
     def fold(
         self,

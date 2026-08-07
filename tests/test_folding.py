@@ -657,6 +657,29 @@ def test_user_delete_scrubs_short_tool_input_from_every_local_copy(tmp_path, pay
     assert payload.encode() not in database_path.read_bytes()
 
 
+def test_user_delete_purges_duplicate_entry_and_live_shadow_copies(tmp_path):
+    payload = "ERASE_DUPLICATE_77"
+    messages = tool_exchange("first", {}, payload)
+    messages.extend(tool_exchange("second", {}, payload, call_id="call_1"))
+    database_path = tmp_path / "folds.sqlite3"
+    context = FoldingContext(
+        database_path,
+        "session",
+        config=FoldConfig(min_span_tokens=0),
+    )
+    context.sync(
+        messages,
+        {"first": noop_tool(name="first"), "second": noop_tool(name="second")},
+    )
+
+    context.delete("m2.r0")
+
+    assert context.state("m5.r0") == "purged"
+    assert payload not in json.dumps(messages)
+    assert payload not in json.dumps(context.project(messages))
+    assert payload.encode() not in database_path.read_bytes()
+
+
 def test_resume_ignores_a_crash_tail_without_reusing_its_ids(tmp_path):
     # Regression caught: SQLite may ingest an in-flight exchange before the
     # SessionLog commits it. Resume must use the completed transcript, while new

@@ -1,5 +1,6 @@
-import json
 import hashlib
+import json
+from copy import deepcopy
 
 import pytest
 
@@ -62,6 +63,34 @@ def test_each_model_dispatch_records_the_exact_projection_hash(tmp_path):
     assert record["projection_hash"] == hashlib.sha256(exact.encode()).hexdigest()
     assert llm.turns[0]["projection_hash"] == record["projection_hash"]
     assert "workspace after checkpoint" in exact
+
+
+def test_each_model_request_can_be_reconstructed_after_reopen(tmp_path):
+    # Regression caught: inferring a request from created_turn loses distinct
+    # model boundaries when a tool turn makes more than one request.
+    path = tmp_path / "folds.sqlite3"
+    context = FoldingContext(path, "session", config=FoldConfig(min_span_tokens=0))
+    tool = noop_tool(name="noop")
+    llm = FakeLLM(
+        [
+            {"type": "tool_calls", "calls": [{"name": "noop", "arguments": {}}]},
+            {"type": "text", "content": "done"},
+        ]
+    )
+    messages: list[dict] = []
+
+    run_turn(messages, "inspect", llm, tools={"noop": tool}, context=context)
+
+    expected = deepcopy([turn["messages"] for turn in llm.turns])
+    request_ids = [
+        row["projection_id"]
+        for row in context.projection_chain()
+        if row["kind"] == "request"
+    ]
+    context.close()
+
+    resumed = FoldingContext(path, "session", config=FoldConfig(min_span_tokens=0))
+    assert [resumed.reconstruct_projection(row_id) for row_id in request_ids] == expected
 
 
 def test_loop_applies_pending_folds_at_the_next_turn_boundary(tmp_path):

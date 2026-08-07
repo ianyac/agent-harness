@@ -1,3 +1,4 @@
+import hashlib
 import json
 import sqlite3
 from copy import deepcopy
@@ -586,6 +587,119 @@ def test_each_checkpoint_extends_a_persisted_projection_hash_chain(tmp_path):
     assert chain[1]["turn"] == 2
 
 
+def test_projection_record_persists_canonical_snapshot_and_aligned_sources(tmp_path):
+    # Regression caught: a hash alone cannot reproduce the model boundary, and
+    # source IDs must stay index-aligned if an erasure later targets it.
+    context, messages = context_with_result(tmp_path, "historical evidence")
+    outgoing = context.project(messages)
+
+    context.record_request(outgoing)
+
+    row = context._db.execute(
+        "SELECT projection_json, source_ids_json FROM projections"
+    ).fetchone()
+    assert row["projection_json"] == json.dumps(
+        outgoing, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    sources = json.loads(row["source_ids_json"])
+    assert sources == ["message:m0", "message:m1", "message:m2"]
+    assert len(sources) == len(outgoing)
+
+
+def test_projection_without_matching_capture_uses_aligned_unknown_sources(tmp_path):
+    # Regression caught: a process-local capture from a prior projection must
+    # never be reused just because a caller supplies matching bytes later.
+    path = tmp_path / "folds.sqlite3"
+    first = FoldingContext(path, "session", config=FoldConfig(min_span_tokens=0))
+    messages = [{"role": "user", "content": "inspect"}]
+    first.sync(messages)
+    outgoing = first.project(messages)
+    first.close()
+    resumed = FoldingContext(path, "session", config=FoldConfig(min_span_tokens=0))
+
+    resumed.record_request(outgoing)
+
+    row = resumed._db.execute("SELECT source_ids_json FROM projections").fetchone()
+    assert json.loads(row["source_ids_json"]) == ["unknown"]
+
+
+def test_projection_with_misaligned_capture_uses_unknown_sources(tmp_path):
+    # Regression caught: a matching hash is insufficient when the associated
+    # provenance list cannot index every outgoing message exactly once.
+    context = FoldingContext(
+        tmp_path / "folds.sqlite3", "session", config=FoldConfig(min_span_tokens=0)
+    )
+    messages = [{"role": "user", "content": "inspect"}]
+    context.sync(messages)
+    outgoing = context.project(messages)
+    context._last_projection_sources = (
+        context.projection_hash(messages),
+        ["message:m0", "message:m1"],
+    )
+
+    context.record_request(outgoing)
+
+    row = context._db.execute("SELECT source_ids_json FROM projections").fetchone()
+    assert json.loads(row["source_ids_json"]) == ["unknown"]
+
+
+def test_tail_projection_snapshot_records_the_unfolded_span_source(tmp_path):
+    # Regression caught: synthetic tail messages have no ledger message row,
+    # so their source must be the reinstated span rather than a stale message.
+    context, _messages = context_with_result(tmp_path, "historical evidence")
+    context.fold("m2.r0", "finished", rich_note())
+    context.checkpoint()
+    context.unfold("m2.r0")
+    outgoing = context.reconstruct()
+
+    context.record_request(outgoing)
+
+    row = context._db.execute(
+        "SELECT source_ids_json FROM projections ORDER BY projection_id DESC LIMIT 1"
+    ).fetchone()
+    assert json.loads(row["source_ids_json"])[-1] == "span:m2.r0"
+
+
+def test_reconstruct_projection_rejects_unknown_malformed_and_corrupt_rows(tmp_path):
+    # Regression caught: historical bytes must never be presented as audited
+    # model input when their row is absent, malformed, or hash-corrupt.
+    context = FoldingContext(
+        tmp_path / "folds.sqlite3", "session", config=FoldConfig(min_span_tokens=0)
+    )
+    messages = [{"role": "user", "content": "inspect"}]
+    context.sync(messages)
+    context.record_request(context.project(messages))
+    projection_id = context.projection_chain()[0]["projection_id"]
+
+    with pytest.raises(ProjectionError, match="unknown projection"):
+        context.reconstruct_projection(projection_id + 1)
+    context._db.execute(
+        "UPDATE projections SET projection_json = ? WHERE projection_id = ?",
+        ('{"not":"an array"}', projection_id),
+    )
+    with pytest.raises(ProjectionError, match="malformed"):
+        context.reconstruct_projection(projection_id)
+    context._db.execute(
+        "UPDATE projections SET projection_json = ? WHERE projection_id = ?",
+        (json.dumps([{"role": "user", "content": "tampered"}]), projection_id),
+    )
+    with pytest.raises(ProjectionError, match="hash mismatch"):
+        context.reconstruct_projection(projection_id)
+
+
+def test_schema_version_two_is_rejected_explicitly(tmp_path):
+    # Regression caught: opening an unreleased v2 ledger without its immutable
+    # request snapshots would make reconstruction silently incomplete.
+    path = tmp_path / "folds.sqlite3"
+    context = FoldingContext(path, "session")
+    context._db.execute("UPDATE schema_meta SET version = 2")
+    context._db.commit()
+    context.close()
+
+    with pytest.raises(FoldError, match="schema version is incompatible"):
+        FoldingContext(path, "session")
+
+
 def test_failed_checkpoint_rolls_back_visibility_and_hash_together(tmp_path, monkeypatch):
     # Regression caught: committing placement before projection/hash creation
     # leaves a crash-replayed ledger claiming a rebuild that never completed.
@@ -674,6 +788,118 @@ def test_user_delete_purges_content_and_projects_a_nonrecoverable_marker(tmp_pat
     assert "delete me permanently" not in json.dumps(context.shadow_messages())
     with pytest.raises(FoldError, match="purged"):
         context.unfold("m2.r0")
+
+
+def test_user_delete_redacts_only_affected_stored_projection_sources(tmp_path):
+    # Regression caught: snapshots are an additional persisted copy, but a
+    # deletion must still respect message/span provenance instead of prose.
+    messages = tool_exchange("noop", {}, "true")
+    messages[0]["content"] = "keep the true branch intact"
+    context = FoldingContext(
+        tmp_path / "folds.sqlite3",
+        "session",
+        config=FoldConfig(min_span_tokens=0),
+    )
+    context.sync(messages, {"noop": noop_tool()})
+    outgoing = context.project(messages)
+    context.record_request(outgoing)
+    before = context.projection_chain()[-1]
+
+    context.delete("m2.r0")
+
+    after = context.projection_chain()[-1]
+    historical = context.reconstruct_projection(after["projection_id"])
+    assert after["projection_hash"] == before["projection_hash"]
+    assert after["parent_hash"] == before["parent_hash"]
+    assert after["redacted"] is True
+    assert historical[2]["content"] == "[deleted by user]"
+    assert historical[0] == {"role": "user", "content": "keep the true branch intact"}
+
+
+def test_sensitive_scan_redacts_stored_requests_without_changing_hash_chain(tmp_path):
+    # Regression caught: scanner purging a new tool result must scrub every
+    # older model-boundary snapshot that carried the same credential.
+    secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
+    messages = [{"role": "user", "content": f"inspect {secret}"}]
+    context = FoldingContext(
+        tmp_path / "folds.sqlite3",
+        "session",
+        config=FoldConfig(min_span_tokens=0),
+    )
+    context.sync(messages)
+    context.record_request(context.project(messages))
+    before = context.projection_chain()[0]
+    projection_id = before["projection_id"]
+    messages.extend(
+        [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_0",
+                        "type": "function",
+                        "function": {
+                            "name": "leak",
+                            "arguments": json.dumps({"token": secret}),
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_0",
+                "content": f"observed {secret} in output",
+            },
+        ]
+    )
+
+    context.sync(messages, {"leak": noop_tool(name="leak")})
+
+    after = context.projection_chain()[0]
+    assert secret not in json.dumps(context.reconstruct_projection(projection_id))
+    assert after["redacted"] is True
+    assert after["projection_hash"] == before["projection_hash"]
+    assert after["parent_hash"] == before["parent_hash"]
+
+
+def test_sensitive_scan_exhaustively_scrubs_stored_snapshot_data(tmp_path):
+    # Regression caught: every snapshot value is a persisted credential copy,
+    # while protocol keys and roles must remain usable after scanner cleanup.
+    secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
+    call_id = f"call-{secret}"
+    tool_name = f"leak-{secret}"
+    snapshot = [
+        {"role": "user", "content": f"inspect {secret}", "opaque": secret},
+        {
+            "role": "assistant",
+            "content": f"thinking about {secret}",
+            "tool_calls": [
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "arguments": json.dumps({"token": secret, "copy": secret}),
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": call_id, "content": f"saw {secret}"},
+    ]
+    context = FoldingContext(
+        tmp_path / "folds.sqlite3", "session", config=FoldConfig(min_span_tokens=0)
+    )
+    context.record_request(snapshot)
+    projection_id = context.projection_chain()[0]["projection_id"]
+
+    context.sync(deepcopy(snapshot), {tool_name: noop_tool(name=tool_name)})
+
+    historical = context.reconstruct_projection(projection_id)
+    assert secret not in json.dumps(historical)
+    assert historical[0]["role"] == "user"
+    assert "opaque" in historical[0]
+    assert historical[1]["tool_calls"][0]["id"] == historical[2]["tool_call_id"]
 
 
 def test_user_delete_remains_purged_when_the_raw_session_log_is_resumed(tmp_path):
@@ -954,6 +1180,29 @@ def test_user_delete_metadata_scopes_reused_call_ids_to_their_owner_message(tmp_
     context.sync(messages, {"write_content": content_tool, "write_body": body_tool})
     first_before = deepcopy(messages[1])
     second_before = deepcopy(messages[4])
+    first_request = deepcopy(messages[:3])
+    first_hash = hashlib.sha256(
+        json.dumps(
+            first_request, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode()
+    ).hexdigest()
+    context._last_projection_sources = (
+        first_hash,
+        ["message:m0", "message:m1", "message:m2"],
+    )
+    context.record_request(first_request)
+    second_request = deepcopy(messages[3:])
+    second_hash = hashlib.sha256(
+        json.dumps(
+            second_request, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode()
+    ).hexdigest()
+    context._last_projection_sources = (
+        second_hash,
+        ["message:m3", "message:m4", "message:m5"],
+    )
+    context.record_request(second_request)
+    before = context.projection_chain()
 
     context.delete("m1.i0")
 
@@ -983,6 +1232,21 @@ def test_user_delete_metadata_scopes_reused_call_ids_to_their_owner_message(tmp_
         ("m1", "m2.r0"),
         ("m4", "m5.r0"),
     ]
+    after = context.projection_chain()
+    first_historical = context.reconstruct_projection(after[0]["projection_id"])
+    second_historical = context.reconstruct_projection(after[1]["projection_id"])
+    assert after[0]["projection_hash"] == before[0]["projection_hash"]
+    assert after[1]["projection_hash"] == before[1]["projection_hash"]
+    assert after[0]["redacted"] is True
+    assert after[1]["redacted"] is True
+    assert json.loads(first_historical[1]["tool_calls"][0]["function"]["arguments"]) == {
+        "content": "[deleted by user]",
+        "note": "first true note",
+    }
+    assert json.loads(second_historical[1]["tool_calls"][0]["function"]["arguments"]) == {
+        "body": "[deleted by user]",
+        "note": "second true note",
+    }
 
 
 def test_user_delete_purges_duplicate_entry_and_live_shadow_copies(tmp_path):

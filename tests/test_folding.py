@@ -2049,6 +2049,60 @@ def test_user_delete_reconciles_an_exact_duplicate_result_chunk(tmp_path):
     assert payload.encode() not in (tmp_path / "folds.sqlite3").read_bytes()
 
 
+def test_user_delete_preserves_non_alias_indexed_siblings_with_common_payload(tmp_path):
+    payload = "turn"
+    marker = "[deleted by user]"
+    messages = tool_exchange("first", {}, payload)
+    messages.extend(
+        tool_exchange(
+            "second",
+            {},
+            "prefix turn stays\nturn\nturn",
+            call_id="call_1",
+        )
+    )
+    context = FoldingContext(
+        tmp_path / "folds.sqlite3",
+        "session",
+        config=FoldConfig(min_span_tokens=0, chunk_tokens=1),
+    )
+    context.sync(
+        messages,
+        {"first": noop_tool(name="first"), "second": noop_tool(name="second")},
+    )
+    child_ids = context.child_ids("m5.r0")
+    before_children = {span_id: context.content(span_id) for span_id in child_ids}
+    assert [span_id for span_id, content in before_children.items() if content == payload] == [
+        "m5.r0.c4",
+        "m5.r0.c6",
+    ]
+    live_before = deepcopy(messages[5])
+    stored_before = context._db.execute(
+        "SELECT message_json FROM messages WHERE message_id = 'm5'"
+    ).fetchone()["message_json"]
+
+    context.delete("m2.r0")
+
+    expected = "prefix turn stays\n[deleted by user]\n[deleted by user]"
+    assert context.state("m2.r0") == "purged"
+    assert context.content("m2.r0") is None
+    assert context.child_ids("m5.r0") == child_ids
+    assert context.content("m5.r0") == expected
+    assert "".join(context.content(span_id) or "" for span_id in child_ids) == expected
+    for span_id, before in before_children.items():
+        expected_child = marker if before == payload else before
+        assert context.content(span_id) == expected_child
+    assert messages[5] == {**live_before, "content": expected}
+    stored_after = context._db.execute(
+        "SELECT message_json FROM messages WHERE message_id = 'm5'"
+    ).fetchone()["message_json"]
+    assert json.loads(stored_after) == {**json.loads(stored_before), "content": expected}
+    projected = context.project(messages)[5]["content"]
+    assert "[m5.r0.c1 · ~1 tok]\n turn" in projected
+    assert "[m5.r0.c2 · ~1 tok]\n stays" in projected
+    assert projected.count(marker) == 2
+
+
 def test_user_delete_rewrites_only_selected_chunk_in_stored_projection(tmp_path):
     # Regression caught: an indexed child aliases only part of its owning
     # message, so stored history must preserve the surrounding result prose.

@@ -1546,9 +1546,6 @@ class FoldingContext:
                 metadata_span_ids, input_aliases, payload
             )
             self._scrub_delete_tool_calls(input_aliases, payload)
-            self._scrub_delete_messages(
-                root_owner_ids, indexed_owner_ids, input_aliases, payload
-            )
             projection_operations = self._user_projection_operations(
                 span_ids,
                 root_owner_ids,
@@ -1567,27 +1564,15 @@ class FoldingContext:
             )
             for affected in span_ids:
                 self._mark_entry_purged(affected)
-            for parent_id in indexed_parents:
-                parent = self._entry(parent_id)
-                content = str(parent["content"] or "")
-                cleaned = str(
-                    self._scrub_data(
-                        content,
-                        [payload],
-                        "[deleted by user]",
-                        replace_substrings=True,
-                    )
-                )
-                if cleaned != content:
-                    self._db.execute(
-                        "UPDATE entries SET content = ?, content_sha = ?, tokens_est = ? "
-                        "WHERE span_id = ?",
-                        (cleaned, _sha(cleaned), count_text_tokens(cleaned), parent_id),
-                    )
             self._replace_indexed_child_aliases(indexed_parents, payload)
-            self._reconcile_child_copies(indexed_parents)
+            indexed_owner_contents = self._reconcile_indexed_parent_contents(
+                indexed_parents
+            )
+            self._scrub_delete_messages(
+                root_owner_ids, indexed_owner_contents, input_aliases, payload
+            )
             self._scrub_delete_live_shadow(
-                root_owner_ids, indexed_owner_ids, input_aliases, payload
+                root_owner_ids, indexed_owner_contents, input_aliases, payload
             )
             self._current_notices = [
                 notice_updates.get(
@@ -1830,6 +1815,26 @@ class FoldingContext:
                 (marker, _sha(marker), count_text_tokens(marker), row["span_id"]),
             )
 
+    def _reconcile_indexed_parent_contents(
+        self, parent_ids: set[str]
+    ) -> dict[str, str]:
+        """Rebuild only affected result parents from their stable child rows."""
+        owner_contents: dict[str, str] = {}
+        for parent_id in parent_ids:
+            children = self._db.execute(
+                "SELECT content FROM entries WHERE parent_id = ? AND session_id = ? "
+                "AND role = 'tool_result' ORDER BY rowid",
+                (parent_id, self.session_id),
+            ).fetchall()
+            content = "".join(str(child["content"] or "") for child in children)
+            self._db.execute(
+                "UPDATE entries SET content = ?, content_sha = ?, tokens_est = ? "
+                "WHERE span_id = ?",
+                (content, _sha(content), count_text_tokens(content), parent_id),
+            )
+            owner_contents[parent_id.split(".", 1)[0]] = content
+        return owner_contents
+
     def _scrub_delete_entry_metadata(
         self,
         span_ids: set[str],
@@ -1912,7 +1917,7 @@ class FoldingContext:
         message: dict,
         *,
         root_owner: bool,
-        indexed_owner: bool,
+        indexed_content: str | None,
         input_aliases: list[dict[str, str]],
         payload: str,
     ) -> dict:
@@ -1920,8 +1925,8 @@ class FoldingContext:
         content = cleaned.get("content")
         if root_owner and content == payload:
             cleaned["content"] = "[deleted by user]"
-        elif indexed_owner and isinstance(content, str):
-            cleaned["content"] = content.replace(payload, "[deleted by user]")
+        elif indexed_content is not None:
+            cleaned["content"] = indexed_content
         for alias in input_aliases:
             for call in cleaned.get("tool_calls") or []:
                 if call.get("id") != alias["call_id"]:
@@ -1939,11 +1944,11 @@ class FoldingContext:
     def _scrub_delete_messages(
         self,
         root_owner_ids: set[str],
-        indexed_owner_ids: set[str],
+        indexed_owner_contents: dict[str, str],
         input_aliases: list[dict[str, str]],
         payload: str,
     ) -> None:
-        owner_ids = root_owner_ids | indexed_owner_ids | {
+        owner_ids = set(root_owner_ids) | set(indexed_owner_contents) | {
             alias["message_id"] for alias in input_aliases
         }
         if not owner_ids:
@@ -1960,7 +1965,7 @@ class FoldingContext:
             cleaned_message = self._scrub_delete_message(
                 message,
                 root_owner=message_id in root_owner_ids,
-                indexed_owner=message_id in indexed_owner_ids,
+                indexed_content=indexed_owner_contents.get(message_id),
                 input_aliases=[
                     alias
                     for alias in input_aliases
@@ -2019,13 +2024,13 @@ class FoldingContext:
     def _scrub_delete_live_shadow(
         self,
         root_owner_ids: set[str],
-        indexed_owner_ids: set[str],
+        indexed_owner_contents: dict[str, str],
         input_aliases: list[dict[str, str]],
         payload: str,
     ) -> None:
         if self._shadow_ref is None:
             return
-        owner_ids = root_owner_ids | indexed_owner_ids | {
+        owner_ids = set(root_owner_ids) | set(indexed_owner_contents) | {
             alias["message_id"] for alias in input_aliases
         }
         for index, message_id in enumerate(self._active_ids):
@@ -2035,7 +2040,7 @@ class FoldingContext:
             cleaned = self._scrub_delete_message(
                 message,
                 root_owner=message_id in root_owner_ids,
-                indexed_owner=message_id in indexed_owner_ids,
+                indexed_content=indexed_owner_contents.get(message_id),
                 input_aliases=[
                     alias
                     for alias in input_aliases

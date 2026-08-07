@@ -12,6 +12,9 @@ class Tool:
     # True = must never appear in a subagent's registry (the recursion
     # guard); a field so the exclusion survives renaming and hook-wrapping
     spawns_subagents: bool = False
+    # Session-local control tools (for example fold/unfold) must not be handed
+    # to a child whose transcript and ledger are different from the parent's.
+    inheritable: bool = True
 
     def __post_init__(self):
         # fail at construction, not as a provider 400 mid-conversation

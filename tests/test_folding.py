@@ -762,6 +762,40 @@ def test_user_delete_does_not_reconcile_tool_inputs_as_result_chunks(tmp_path):
     assert retained in context._entry("m1.i0")["meta_json"]
 
 
+def test_user_delete_reconciles_inactive_crash_tail_chunks(tmp_path):
+    payload = "XYZ12345"
+    completed = tool_exchange("first", {}, payload) + [
+        {"role": "assistant", "content": "done"}
+    ]
+    crashed = completed + tool_exchange(
+        "second",
+        {},
+        f"prefix {payload} suffix",
+        call_id="call_1",
+    )
+    context = FoldingContext(
+        tmp_path / "folds.sqlite3",
+        "session",
+        config=FoldConfig(min_span_tokens=0, chunk_tokens=3),
+    )
+    context.sync(
+        crashed,
+        {"first": noop_tool(name="first"), "second": noop_tool(name="second")},
+    )
+    context.sync(completed, {"first": noop_tool(name="first")})
+
+    context.delete("m2.r0")
+
+    children = context._db.execute(
+        "SELECT content, active FROM entries WHERE parent_id = 'm6.r0' ORDER BY rowid"
+    ).fetchall()
+    child_copy = "".join(child["content"] or "" for child in children)
+    assert context.content("m6.r0") == "prefix [deleted by user] suffix"
+    assert child_copy == context.content("m6.r0")
+    assert payload not in child_copy
+    assert all(child["active"] == 0 for child in children)
+
+
 def test_resume_ignores_a_crash_tail_without_reusing_its_ids(tmp_path):
     # Regression caught: SQLite may ingest an in-flight exchange before the
     # SessionLog commits it. Resume must use the completed transcript, while new

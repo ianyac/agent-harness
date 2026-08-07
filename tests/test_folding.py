@@ -487,6 +487,30 @@ def test_scanner_scrubs_embedded_unknown_jsonl_values_without_rewriting_keys(tmp
     assert secret not in actions_path.read_text()
 
 
+def test_scanner_scrubs_every_non_role_jsonl_value_in_exhaustive_mode(tmp_path):
+    secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
+    actions_path = tmp_path / "actions.jsonl"
+    original = {
+        "event": f"event-{secret}",
+        "message_id": f"message-{secret}",
+        "session_id": f"session-{secret}",
+        "span_id": f"span-{secret}",
+        "type": f"type-{secret}",
+        "role": "audit",
+    }
+    actions_path.write_text(json.dumps(original) + "\n")
+    messages = tool_exchange("leak", {}, f"diagnostic {secret}")
+    context = FoldingContext(tmp_path / "folds.sqlite3", "session")
+    context.register_purge_path(actions_path)
+    context.sync(messages, {"leak": noop_tool(name="leak")})
+
+    artifact = json.loads(actions_path.read_text())
+    assert artifact.keys() == original.keys()
+    assert artifact["role"] == "audit"
+    assert all(secret not in artifact[key] for key in original if key != "role")
+    assert secret not in actions_path.read_text()
+
+
 def test_sensitive_reason_cannot_be_used_as_a_recoverable_fold(tmp_path):
     context, _messages = context_with_result(tmp_path, "ordinary evidence")
 

@@ -1330,7 +1330,7 @@ class FoldingContext:
                     cleaned[key] = cls._scrub_data(
                         item, erased, marker, replace_substrings=replace_substrings
                     )
-                elif key in {
+                elif not exhaustive and key in {
                     "actor",
                     "call_id",
                     "decider",

@@ -1938,6 +1938,77 @@ def test_user_delete_redacts_indexed_alias_in_stored_unfolded_tail(tmp_path):
     assert after["redacted"] is True
 
 
+def test_user_delete_redacts_indexed_child_alias_in_stored_unfolded_tail(tmp_path):
+    # Regression caught: an unfolded child tail is sourced by the exact child
+    # span, so parent-only projection provenance leaves that historical copy.
+    payload = "XYZ12345"
+    marker = "[deleted by user]"
+    path = tmp_path / "folds.sqlite3"
+    messages = tool_exchange("first", {}, payload)
+    messages.extend(
+        tool_exchange(
+            "second",
+            {},
+            f"prefix\n{payload}\nsuffix\n",
+            call_id="call_1",
+        )
+    )
+    messages[3]["content"] = "keep unrelated source prose"
+    config = FoldConfig(min_span_tokens=0, chunk_tokens=3)
+    context = FoldingContext(path, "session", config=config)
+    context.sync(
+        messages,
+        {"first": noop_tool(name="first"), "second": noop_tool(name="second")},
+    )
+    child_id = "m5.r0.c1"
+    assert context.content(child_id) == payload
+    context.fold(child_id, "finished", rich_note())
+    context.checkpoint()
+    context.unfold(child_id)
+    context.record_request(context.project(messages))
+    before = context.projection_chain()[-1]
+    stored = context._db.execute(
+        "SELECT projection_json, source_ids_json FROM projections "
+        "WHERE projection_id = ?",
+        (before["projection_id"],),
+    ).fetchone()
+    sources = json.loads(stored["source_ids_json"])
+    tail_index = sources.index(f"span:{child_id}")
+    before_messages = json.loads(stored["projection_json"])
+    before_tail = before_messages[tail_index]["content"]
+    assert payload in before_tail
+
+    context.delete("m2.r0")
+
+    after = context.projection_chain()[-1]
+    historical = context.reconstruct_projection(after["projection_id"])
+    assert historical[tail_index]["content"] == before_tail.replace(payload, marker)
+    assert "prefix" in historical[5]["content"]
+    assert "suffix" in historical[5]["content"]
+    assert historical[3] == {
+        "role": "user",
+        "content": "keep unrelated source prose",
+    }
+    assert messages[5]["content"] == f"prefix\n{marker}\nsuffix\n"
+    assert context.content("m5.r0") == f"prefix\n{marker}\nsuffix\n"
+    assert context.state("m2.r0") == "purged"
+    projection_json = context._db.execute(
+        "SELECT projection_json FROM projections WHERE projection_id = ?",
+        (after["projection_id"],),
+    ).fetchone()["projection_json"]
+    assert payload not in projection_json
+    assert payload.encode() not in path.read_bytes()
+    assert after["projection_hash"] == before["projection_hash"]
+    assert after["parent_hash"] == before["parent_hash"]
+    assert after["redacted"] is True
+    projection_id = after["projection_id"]
+    context.close()
+
+    resumed = FoldingContext(path, "session", config=config)
+    assert resumed.reconstruct_projection(projection_id) == historical
+    assert payload not in json.dumps(resumed.reconstruct_projection(projection_id))
+
+
 def test_user_delete_scrubs_only_matching_in_memory_notices(tmp_path):
     context, _messages = context_with_result(tmp_path, "delete me permanently")
     notice = context._db.execute(

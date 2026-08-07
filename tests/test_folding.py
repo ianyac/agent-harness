@@ -733,6 +733,35 @@ def test_user_delete_scrubs_payload_split_across_duplicate_chunks(tmp_path):
     assert payload not in child_copy
 
 
+def test_user_delete_does_not_reconcile_tool_inputs_as_result_chunks(tmp_path):
+    retained = "KEEP_ME_INPUT"
+    removed = "REMOVE_THIS_RESULT"
+    messages = tool_exchange("write", {"content": retained}, "ok")
+    messages.extend(tool_exchange("noop", {}, removed, call_id="call_1"))
+    write = Tool(
+        name="write",
+        description="consume content",
+        parameters={
+            "type": "object",
+            "properties": {"content": {"type": "string"}},
+            "required": ["content"],
+        },
+        execute=lambda content: "ok",
+        foldable_inputs=("content",),
+    )
+    context = FoldingContext(
+        tmp_path / "folds.sqlite3",
+        "session",
+        config=FoldConfig(min_span_tokens=0, chunk_tokens=3),
+    )
+    context.sync(messages, {"write": write, "noop": noop_tool()})
+
+    context.delete("m5.r0")
+
+    assert context.content("m1.i0") == retained
+    assert retained in context._entry("m1.i0")["meta_json"]
+
+
 def test_resume_ignores_a_crash_tail_without_reusing_its_ids(tmp_path):
     # Regression caught: SQLite may ingest an in-flight exchange before the
     # SessionLog commits it. Resume must use the completed transcript, while new

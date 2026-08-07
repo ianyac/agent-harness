@@ -1123,15 +1123,18 @@ class FoldingContext:
             "SELECT DISTINCT p.span_id, p.content, s.state FROM entries p "
             "JOIN entries c ON c.parent_id = p.span_id AND c.active = 1 "
             "JOIN span_state s ON s.span_id = p.span_id "
-            "WHERE p.session_id = ? AND p.active = 1 ORDER BY p.rowid",
+            "WHERE p.session_id = ? AND p.active = 1 "
+            "AND p.role = 'tool_result' AND c.role = 'tool_result' "
+            "ORDER BY p.rowid",
             (self.session_id,),
         ).fetchall()
         for parent in parents:
             children = self._db.execute(
                 "SELECT e.span_id, e.content, s.state FROM entries e "
                 "JOIN span_state s USING(span_id) "
-                "WHERE e.parent_id = ? AND e.active = 1 ORDER BY e.rowid",
-                (parent["span_id"],),
+                "WHERE e.parent_id = ? AND e.session_id = ? AND e.active = 1 "
+                "AND e.role = 'tool_result' ORDER BY e.rowid",
+                (parent["span_id"], self.session_id),
             ).fetchall()
             if parent["state"] == "purged":
                 for child in children:

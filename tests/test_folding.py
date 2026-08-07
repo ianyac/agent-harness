@@ -424,6 +424,69 @@ def test_scanner_purges_a_matched_secret_from_every_local_alias(tmp_path):
     assert secret.encode() not in path.read_bytes()
 
 
+def test_scanner_remaps_credential_identifiers_without_orphaning_the_result(tmp_path):
+    secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
+    path = tmp_path / "folds.sqlite3"
+    messages = [
+        {"role": "user", "content": "inspect"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": secret,
+                "type": "function",
+                "function": {"name": secret, "arguments": "{}"},
+            }],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": secret,
+            "content": f"diagnostic prefix {secret} diagnostic suffix",
+        },
+    ]
+    context = FoldingContext(path, "session")
+    context.sync(messages, {secret: noop_tool(name=secret)})
+
+    call = messages[1]["tool_calls"][0]
+    stored = context._db.execute(
+        "SELECT call_id, tool_name FROM tool_calls"
+    ).fetchone()
+    assert context.state("m2.r0") == "purged"
+    assert call["id"] == messages[2]["tool_call_id"]
+    assert call["id"] == stored["call_id"]
+    assert call["function"]["name"] == stored["tool_name"]
+    assert call["id"] != secret
+    assert call["function"]["name"] != secret
+    assert secret not in json.dumps(messages)
+    assert secret not in json.dumps(context.shadow_messages())
+    assert secret not in json.dumps(context.project(messages))
+    assert secret.encode() not in path.read_bytes()
+
+
+def test_scanner_scrubs_embedded_unknown_jsonl_values_without_rewriting_keys(tmp_path):
+    secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
+    actions_path = tmp_path / "actions.jsonl"
+    actions_path.write_text(
+        json.dumps(
+            {
+                "unknown_payload": f"prefix {secret} suffix",
+                "role": "audit",
+            }
+        )
+        + "\n"
+    )
+    messages = tool_exchange("leak", {}, f"diagnostic {secret}")
+    context = FoldingContext(tmp_path / "folds.sqlite3", "session")
+    context.register_purge_path(actions_path)
+    context.sync(messages, {"leak": noop_tool(name="leak")})
+
+    artifact = json.loads(actions_path.read_text())
+    assert "unknown_payload" in artifact
+    assert artifact["role"] == "audit"
+    assert secret not in artifact["unknown_payload"]
+    assert secret not in actions_path.read_text()
+
+
 def test_sensitive_reason_cannot_be_used_as_a_recoverable_fold(tmp_path):
     context, _messages = context_with_result(tmp_path, "ordinary evidence")
 

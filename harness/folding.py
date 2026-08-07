@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -556,7 +557,10 @@ class FoldingContext:
         secrets = self._secret_values(content)
         if secrets:
             self._purge_session_log(
-                secrets, _REDACTION_MARKER, replace_substrings=True
+                secrets,
+                _REDACTION_MARKER,
+                replace_substrings=True,
+                exhaustive=True,
             )
             sanitized_meta = dict(
                 self._scrub_structured(
@@ -564,14 +568,21 @@ class FoldingContext:
                     secrets,
                     _REDACTION_MARKER,
                     replace_substrings=True,
+                    exhaustive=True,
                 )
             )
             with self._db:
                 self._scrub_sqlite(
-                    secrets, _REDACTION_MARKER, replace_substrings=True
+                    secrets,
+                    _REDACTION_MARKER,
+                    replace_substrings=True,
+                    exhaustive=True,
                 )
                 self._scrub_live_shadow(
-                    secrets, _REDACTION_MARKER, replace_substrings=True
+                    secrets,
+                    _REDACTION_MARKER,
+                    replace_substrings=True,
+                    exhaustive=True,
                 )
                 self._current_notices = [
                     str(
@@ -1245,7 +1256,12 @@ class FoldingContext:
                 )
 
     def _scrub_live_shadow(
-        self, erased: tuple[str, ...] | list[str], marker: str, *, replace_substrings: bool
+        self,
+        erased: tuple[str, ...] | list[str],
+        marker: str,
+        *,
+        replace_substrings: bool,
+        exhaustive: bool = False,
     ) -> None:
         if self._shadow_ref is None:
             return
@@ -1255,6 +1271,7 @@ class FoldingContext:
                 erased,
                 marker,
                 replace_substrings=replace_substrings,
+                exhaustive=exhaustive,
             )
             if cleaned == message or not isinstance(cleaned, dict):
                 continue
@@ -1271,6 +1288,7 @@ class FoldingContext:
         marker: str,
         *,
         replace_substrings: bool,
+        exhaustive: bool = False,
     ) -> object:
         """Scrub user data without changing the surrounding protocol shape."""
         if isinstance(value, dict):
@@ -1278,13 +1296,27 @@ class FoldingContext:
             for key, item in value.items():
                 # Keys define message, event, and tool schemas. Rewriting one
                 # can make an otherwise valid transcript impossible to replay.
-                if key in {"args", "arguments", "args_json"}:
+                if key == "role":
+                    cleaned[key] = item
+                elif exhaustive and key in {
+                    "call_id",
+                    "id",
+                    "name",
+                    "tool_call_id",
+                    "tool_name",
+                }:
+                    cleaned[key] = cls._scrub_identifier(item, erased)
+                elif key in {"args", "arguments", "args_json"}:
                     cleaned[key] = cls._scrub_arguments(
                         item, erased, marker, replace_substrings=replace_substrings
                     )
                 elif key == "canonical_key":
                     cleaned[key] = cls._scrub_canonical_key(
-                        item, erased, marker, replace_substrings=replace_substrings
+                        item,
+                        erased,
+                        marker,
+                        replace_substrings=replace_substrings,
+                        exhaustive=exhaustive,
                     )
                 elif key in {
                     "content",
@@ -1324,21 +1356,47 @@ class FoldingContext:
                     cleaned[key] = item
                 else:
                     cleaned[key] = cls._scrub_structured(
-                        item, erased, marker, replace_substrings=replace_substrings
+                        item,
+                        erased,
+                        marker,
+                        replace_substrings=replace_substrings,
+                        exhaustive=exhaustive,
                     )
             return cleaned
         if isinstance(value, list):
             return [
                 cls._scrub_structured(
-                    item, erased, marker, replace_substrings=replace_substrings
+                    item,
+                    erased,
+                    marker,
+                    replace_substrings=replace_substrings,
+                    exhaustive=exhaustive,
                 )
                 for item in value
             ]
         if not isinstance(value, str):
             return value
+        if exhaustive:
+            return cls._scrub_data(
+                value, erased, marker, replace_substrings=replace_substrings
+            )
         # Unknown scalar fields may be copies of the payload, but partial
         # replacement is unsafe: they may also be protocol identifiers.
         return marker if value in erased else value
+
+    @staticmethod
+    def _scrub_identifier(
+        value: object, erased: tuple[str, ...] | list[str]
+    ) -> object:
+        if not isinstance(value, str):
+            return value
+        cleaned = value
+        for secret in erased:
+            if secret:
+                digest = hashlib.sha256(secret.encode()).digest()
+                replacement = base64.b32encode(digest).decode().lower().rstrip("=")
+                cleaned = cleaned.replace(secret, f"redacted_{replacement}")
+        return cleaned
 
     @classmethod
     def _scrub_data(
@@ -1413,6 +1471,7 @@ class FoldingContext:
         marker: str,
         *,
         replace_substrings: bool,
+        exhaustive: bool = False,
     ) -> object:
         if not isinstance(value, str):
             return value
@@ -1420,11 +1479,18 @@ class FoldingContext:
             return marker
         tool_name, separator, arguments = value.partition(":")
         if not separator:
-            return value
+            return cls._scrub_identifier(value, erased) if exhaustive else value
         cleaned = cls._scrub_arguments(
             arguments, erased, marker, replace_substrings=replace_substrings
         )
-        return value if cleaned == arguments else f"{tool_name}:{cleaned}"
+        cleaned_name = (
+            cls._scrub_identifier(tool_name, erased) if exhaustive else tool_name
+        )
+        return (
+            value
+            if cleaned == arguments and cleaned_name == tool_name
+            else f"{cleaned_name}:{cleaned}"
+        )
 
     @classmethod
     def _scrub_text(
@@ -1435,6 +1501,7 @@ class FoldingContext:
         *,
         mode: str,
         replace_substrings: bool,
+        exhaustive: bool = False,
     ) -> str:
         if mode in {"arguments", "structured"}:
             try:
@@ -1447,15 +1514,25 @@ class FoldingContext:
                 )
             else:
                 cleaned_decoded = cls._scrub_structured(
-                    decoded, erased, marker, replace_substrings=replace_substrings
+                    decoded,
+                    erased,
+                    marker,
+                    replace_substrings=replace_substrings,
+                    exhaustive=exhaustive,
                 )
             return value if cleaned_decoded == decoded else _canonical(cleaned_decoded)
         if mode == "canonical_key":
             return str(
                 cls._scrub_canonical_key(
-                    value, erased, marker, replace_substrings=replace_substrings
+                    value,
+                    erased,
+                    marker,
+                    replace_substrings=replace_substrings,
+                    exhaustive=exhaustive,
                 )
             )
+        if mode == "identifier":
+            return str(cls._scrub_identifier(value, erased)) if exhaustive else value
         return str(
             cls._scrub_data(
                 value, erased, marker, replace_substrings=replace_substrings
@@ -1468,12 +1545,15 @@ class FoldingContext:
         marker: str,
         *,
         replace_substrings: bool,
+        exhaustive: bool = False,
     ) -> None:
         columns = (
             ("entries", "content", "data"),
             ("entries", "meta_json", "structured"),
             ("folds", "note", "data"),
             ("messages", "message_json", "structured"),
+            ("tool_calls", "call_id", "identifier"),
+            ("tool_calls", "tool_name", "identifier"),
             ("tool_calls", "args_json", "arguments"),
             ("tool_calls", "canonical_key", "canonical_key"),
             ("notices", "content", "data"),
@@ -1490,6 +1570,7 @@ class FoldingContext:
                     marker,
                     mode=mode,
                     replace_substrings=replace_substrings,
+                    exhaustive=exhaustive,
                 )
                 if cleaned != row["value"]:
                     self._db.execute(
@@ -1509,13 +1590,18 @@ class FoldingContext:
         marker: str = "[deleted by user]",
         *,
         replace_substrings: bool,
+        exhaustive: bool = False,
     ) -> None:
         if not erased:
             return
 
         def scrub(value: object) -> object:
             return self._scrub_structured(
-                value, erased, marker, replace_substrings=replace_substrings
+                value,
+                erased,
+                marker,
+                replace_substrings=replace_substrings,
+                exhaustive=exhaustive,
             )
 
         for path in self._purge_paths:

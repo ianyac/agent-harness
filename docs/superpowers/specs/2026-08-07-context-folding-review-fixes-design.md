@@ -25,8 +25,10 @@ boolean. High-confidence secret values are replaced wherever they occur in a
 data-bearing field: ledger entry content and metadata, message snapshots, tool
 arguments and canonical keys, fold notes, notices, stored request projections,
 registered JSONL artifacts, the live shadow, and current notices. Protocol
-keys, roles, tool names, call IDs, and other structural identifiers are never
-rewritten.
+keys and roles are never rewritten. If a scanner-confirmed credential is itself
+used as a call ID or tool name, every copy of that identifier is remapped to a
+deterministic non-secret value so call/result pairing remains valid. This
+scanner-only exception does not apply to user deletion.
 
 The current tool-result span is then inserted directly in terminal `purged`
 state with only its hash/token audit metadata, and its message content becomes
@@ -104,8 +106,9 @@ marked `redacted` without changing its original hash or parent hash.
   gate; there is no silent in-place migration for an unreleased lesson branch.
 - Unknown or malformed stored projection JSON raises `ProjectionError` rather
   than returning unaudited bytes.
-- Erasure never changes roles, dictionary keys, call IDs, tool names, or source
-  mappings.
+- Erasure never changes roles, dictionary keys, or source mappings. Scanner
+  erasure alone may deterministically remap credential-bearing call IDs and
+  tool names everywhere; user deletion never changes those identifiers.
 - A redacted historical request is intentionally not hash-verifiable. This is
   the hard-erasure exception approved for both user deletion and sensitive
   purging.

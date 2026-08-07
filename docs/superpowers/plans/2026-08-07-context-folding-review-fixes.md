@@ -4,13 +4,14 @@
 
 **Goal:** Make sensitive purging comprehensive, make every outbound request independently reconstructable, and make user deletion provenance-safe.
 
-**Architecture:** Keep `FoldingContext` as the ledger coordinator, but separate the two erasure policies at the method boundary: sensitive values are high-confidence substrings scrubbed from every data field, while user deletion operates on discovered span/message aliases and exact values only. Persist the exact outbound projection plus aligned source identifiers so request reconstruction is independent of coarse user-turn numbers; erasure rewrites affected snapshots and marks them redacted without changing their original hash chain.
+**Architecture:** Keep `FoldingContext` as the ledger coordinator, but separate the two erasure policies at the method boundary: sensitive values are high-confidence substrings scrubbed from every data field, with scanner-confirmed credential-bearing call IDs and tool names deterministically remapped everywhere to preserve pairing; user deletion operates on discovered span/message aliases and exact values only and never rewrites identifiers. Persist the exact outbound projection plus aligned source identifiers so request reconstruction is independent of coarse user-turn numbers; erasure rewrites affected snapshots and marks them redacted without changing their original hash chain.
 
 **Tech Stack:** Python 3.12, SQLite, pytest, existing `harness.folding` ledger/projection code, existing `FakeLLM` integration harness.
 
 ## Global Constraints
 
 - A sensitive value must not remain in SQLite bytes, mounted JSONL artifacts, live shadow messages, or projected model input after the scanner fires.
+- Scanner-confirmed credentials used as call IDs or tool names must be remapped consistently to deterministic non-secret values; dictionary keys and roles remain unchanged.
 - User deletion must never change roles, dictionary keys, call IDs, tool names, or unrelated prose.
 - User deletion is provenance-first: selected spans, chunk indexes, exact duplicate entries, registered tool-input fields, associated folds/notices, and aligned stored projections only.
 - Existing schema versions are rejected explicitly; schema version 3 is not silently migrated.

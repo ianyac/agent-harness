@@ -16,6 +16,7 @@ from harness.hooks import (
     run_stop,
     with_hooks,
 )
+from harness.folding import FoldingContext
 from harness.llm import make_llm
 from harness.loop import run_turn
 from harness.mcp import MCPError, MCPServer, load_config, mcp_tools
@@ -24,6 +25,7 @@ from harness.prompts import (
     Environment,
     PLAN_MODE,
     PLAN_MODE_SUBAGENT,
+    WORKSPACE_HYGIENE,
     build_system_prompt,
 )
 from harness.sandbox import LinuxSandbox, NoSandbox, SandboxPolicy, default_sandbox
@@ -40,6 +42,7 @@ from harness.skills import (
 )
 from harness.tools.agent import agent_tool, run_subagent
 from harness.tools.bash import bash_tool, run_sandboxed
+from harness.tools.folding import fold_tool, unfold_tool
 from harness.tools.list_dir import list_dir_tool
 from harness.tools.plan import exit_plan_mode_tool
 from harness.tools.read_file import read_file_tool
@@ -54,6 +57,14 @@ COMPACT_FRACTION = 0.8
 # whether a subagent may also run a skill's !`cmd`; a shell reached under any
 # other name is not recognised, so the decision fails closed.
 SHELL_TOOLS = ("bash",)
+
+
+def folding_paths(session_path: Path) -> tuple[Path, Path]:
+    """Stable session-derived artifacts reused by --resume/--continue."""
+    return (
+        session_path.with_suffix(".folds.sqlite3"),
+        session_path.with_suffix(".fold-decisions.jsonl"),
+    )
 
 
 def may_run_skill_commands(offered: dict, mode: str) -> bool:
@@ -250,9 +261,16 @@ def main():
         action="store_true",
         help="resume the most recent session in this workspace",
     )
+    parser.add_argument(
+        "--fold-context",
+        action="store_true",
+        help="enable recoverable context folding instead of compaction",
+    )
     cli_args = parser.parse_args()
     if cli_args.resume is not None and cli_args.continue_:
         parser.error("--resume and --continue are mutually exclusive")
+    if cli_args.fold_context and cli_args.compact_threshold is not None:
+        parser.error("--fold-context cannot be combined with --compact-threshold")
 
     workspace = cli_args.workspace.resolve()
     if not workspace.is_dir():
@@ -269,7 +287,11 @@ def main():
 
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     if cli_args.continue_:
-        candidates = list(sessions_dir.glob("*.jsonl"))
+        candidates = [
+            path
+            for path in sessions_dir.glob("*.jsonl")
+            if not path.name.endswith(".fold-decisions.jsonl")
+        ]
         if not candidates:
             parser.error(f"no sessions to continue in {sessions_dir}")
         # most recently used, not most recently created: a resumed old
@@ -288,6 +310,16 @@ def main():
         lock(session_path)
     except RuntimeError as error:
         parser.error(str(error))
+
+    folding = None
+    if cli_args.fold_context:
+        fold_db, decision_log = folding_paths(session_path)
+        folding = FoldingContext(
+            fold_db,
+            session_id=session_path.stem,
+            decision_log_path=decision_log,
+        )
+        atexit.register(folding.close)
 
     # the action journal is keyed to the session and appended across
     # resumes, so compaction breadcrumbs written in an earlier process
@@ -373,6 +405,9 @@ def main():
             skills = [s for s in skills if not has_cmd_blocks(s.body)]
     section = skills_section(skills)
     context_sections = hook_sections + ([section] if section else [])
+    main_context_sections = context_sections + (
+        [WORKSPACE_HYGIENE] if folding is not None else []
+    )
     # NOTE: context_sections is the MAIN LOOP's. A subagent's sections are built
     # separately by subagent_prompt_for, from what that sub actually holds — a
     # new section added here does NOT reach subagents unless added there too.
@@ -451,6 +486,10 @@ def main():
         tools[name] = tool
 
     policy = PermissionPolicy(cli_args.mode)
+
+    if folding is not None:
+        register_builtin("fold", fold_tool(folding))
+        register_builtin("unfold", unfold_tool(folding))
 
     def subagent_prompt_for(offered: dict):
         """The sub's system prompt, built from what THIS sub will actually hold.
@@ -564,7 +603,11 @@ def main():
         # plus `skill` — which never survives the comprehension (the parent's
         # build is fork-capable, so spawns_subagents excludes it) and instead
         # arrives by substitution. Listing it in allowed-tools is legitimate.
-        sub_capable = {n for n, t in tools.items() if not t.spawns_subagents}
+        sub_capable = {
+            n
+            for n, t in tools.items()
+            if not t.spawns_subagents and t.inheritable
+        }
         sub_capable.add("skill")
         for s in skills:
             unknown = [t for t in (s.allowed_tools or []) if t not in sub_capable]
@@ -616,6 +659,8 @@ def main():
     print(f"(session: {session_path.name})")
     if messages:
         print(f"(resumed {len(messages)} messages)")
+    if folding is not None:
+        print("(recoverable context folding enabled; compaction disabled)")
     if skills:
         print(f"({len(skills)} skills — /name to run one, / to list)")
 
@@ -710,13 +755,15 @@ def main():
                 # drops for the rest of the turn
                 system=lambda: current_system_prompt(
                     workspace,
-                    context_sections + ([PLAN_MODE] if policy.mode == "plan" else []),
+                    main_context_sections
+                    + ([PLAN_MODE] if policy.mode == "plan" else []),
                 ),
-                compact_threshold=compact_threshold,
+                compact_threshold=None if folding is not None else compact_threshold,
                 keep_recent=KEEP_RECENT,
                 on_compact=on_compact,
                 breadcrumbs=breadcrumb_note,
                 on_text_delta=stream.write,
+                context=folding,
             )
             streamed_text = stream.close()
             if streamed_text != reply["content"]:

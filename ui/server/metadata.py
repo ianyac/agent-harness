@@ -95,7 +95,7 @@ class MetadataStore:
         self._connection.execute("BEGIN IMMEDIATE")
         try:
             yield self._connection
-        except Exception:
+        except BaseException:
             self._connection.rollback()
             raise
         else:

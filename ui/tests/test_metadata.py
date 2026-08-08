@@ -8,6 +8,10 @@ import server.metadata as metadata
 from server.metadata import MetadataStore, NewSession
 
 
+class RecordConstructionInterrupted(BaseException):
+    pass
+
+
 def test_session_rows_round_trip_without_message_content(tmp_path: Path):
     with MetadataStore(tmp_path / "ui.sqlite3") as store:
         created = store.create_session(
@@ -206,46 +210,67 @@ def test_session_creation_rejects_modes_outside_public_contract(
             )
 
 
-def test_create_session_record_construction_failure_rolls_back_insert(
+def test_create_session_record_construction_interruption_rolls_back_insert(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
     with MetadataStore(tmp_path / "ui.sqlite3") as store:
+        interruption = RecordConstructionInterrupted(
+            "record construction interrupted"
+        )
+
         def fail_record(_row):
-            raise sqlite3.OperationalError("record construction failed")
+            raise interruption
 
         monkeypatch.setattr(store, "_session_record", fail_record)
 
-        with pytest.raises(sqlite3.OperationalError, match="record construction"):
+        with pytest.raises(RecordConstructionInterrupted) as raised:
             store.create_session(NewSession.defaults("ghost", tmp_path))
 
+        assert raised.value is interruption
         assert (
             store._connection.execute(
                 "SELECT COUNT(*) FROM sessions WHERE session_id = 'ghost'"
             ).fetchone()[0]
             == 0
         )
+        assert not store._connection.in_transaction
+        monkeypatch.undo()
+        assert store.create_session(
+            NewSession.defaults("recovered", tmp_path)
+        ).session_id == "recovered"
 
 
 @pytest.mark.parametrize(
     "operation",
-    ["rename_session", "touch_session", "archive_session", "upsert_discovered_session"],
+    [
+        "rename_session",
+        "set_session_mode",
+        "touch_session",
+        "archive_session",
+        "upsert_discovered_session",
+    ],
 )
-def test_mutation_return_construction_failure_is_transaction_atomic(
+def test_session_mutation_record_construction_interruption_is_transaction_atomic(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     operation: str,
 ):
     with MetadataStore(tmp_path / "ui.sqlite3") as store:
         original = store.create_session(NewSession.defaults("s1", tmp_path / "one"))
+        interruption = RecordConstructionInterrupted(
+            "record construction interrupted"
+        )
 
         def fail_record(_row):
-            raise sqlite3.OperationalError("record construction failed")
+            raise interruption
 
         monkeypatch.setattr(store, "_session_record", fail_record)
-        with pytest.raises(sqlite3.OperationalError, match="record construction"):
+        with pytest.raises(RecordConstructionInterrupted) as raised:
             if operation == "rename_session":
                 store.rename_session("s1", "Changed")
+            elif operation == "set_session_mode":
+                store.set_session_mode("s1", "readOnly")
             elif operation == "touch_session":
                 store.touch_session("s1")
             elif operation == "archive_session":
@@ -261,5 +286,34 @@ def test_mutation_return_construction_failure_is_transaction_atomic(
                     )
                 )
 
+        assert raised.value is interruption
+        assert not store._connection.in_transaction
         monkeypatch.undo()
         assert store.get_session("s1") == original
+        assert store.rename_session("s1", "Recovered").title == "Recovered"
+
+
+def test_preference_record_construction_interruption_is_transaction_atomic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    with MetadataStore(tmp_path / "ui.sqlite3") as store:
+        original = store.set_preference("theme", {"name": "light"})
+        interruption = RecordConstructionInterrupted(
+            "record construction interrupted"
+        )
+
+        def fail_record(**_fields):
+            raise interruption
+
+        monkeypatch.setattr(metadata, "PreferenceRecord", fail_record)
+        with pytest.raises(RecordConstructionInterrupted) as raised:
+            store.set_preference("theme", {"name": "dark"})
+
+        assert raised.value is interruption
+        assert not store._connection.in_transaction
+        monkeypatch.undo()
+        assert store.get_preference("theme") == original
+        assert store.set_preference("theme", {"name": "recovered"}).value == {
+            "name": "recovered"
+        }

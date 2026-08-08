@@ -170,6 +170,12 @@ contains:
 - Send while idle and Stop while active; and
 - a queued-state affordance when one follow-up is waiting.
 
+When an agent in plan mode calls `exit_plan_mode`, its proposed plan appears as
+an inline review card with Approve plan and Revise actions. Approval restores
+the session's base permission mode and lets the same harness turn continue.
+Revision returns optional feedback to the tool and keeps the rest of that turn
+read-only.
+
 `Command+Enter` sends. `Escape` first closes transient UI, then focuses Stop
 when a turn is active. Destructive or permission-granting shortcuts work only
 while their target control visibly holds focus.
@@ -354,6 +360,8 @@ discards events from superseded connections or older sequence numbers.
 - `queue_message {text, mode}` — store one follow-up behind the active turn.
 - `cancel_turn {turn_id}` — request cancellation at the next safe boundary.
 - `answer_permission {request_id, answer}` — `yes`, `no`, or `always`.
+- `answer_plan {request_id, approved, feedback}` — approve the plan or return
+  revision feedback.
 - `set_session_mode {mode}` — change the constructible base permission mode.
 - `clear_queued_message` — return the queued follow-up text to the editable draft.
 
@@ -365,6 +373,8 @@ discards events from superseded connections or older sequence numbers.
 - `stream_reset` — discard stale deltas when a provider retry starts.
 - `activity_started` / `activity_completed` — tool or subagent lifecycle.
 - `permission_requested` / `permission_resolved` — blocking gate round-trip.
+- `plan_approval_requested` / `plan_approval_resolved` — blocking plan-mode
+  review round-trip.
 - `context_updated` — compaction, folding, or token-usage change.
 - `turn_stopping` — cancellation accepted but waiting for a safe boundary.
 - `turn_completed` — authoritative messages and final assistant content.
@@ -388,10 +398,10 @@ discards events from superseded connections or older sequence numbers.
 ## Interaction state machine
 
 ```text
-ready → streaming ↔ acting → waiting_permission → acting → complete → ready
-  │         │          │              │
-  │         └──────────┴──── cancel_requested ──▶ stopping ──▶ ready
-  └───────────────────────── failure/reconnect ──────────────▶ ready
+ready → streaming ↔ acting → waiting_permission ──┐
+  │         │          └──▶ waiting_plan_review ──┴──▶ acting → complete → ready
+  │         └────────────── cancel_requested ──▶ stopping ───────────────▶ ready
+  └──────────────────────── failure/reconnect ──────────────────────────▶ ready
 ```
 
 - The composer remains editable in all states.
@@ -429,6 +439,9 @@ the draft, and offer Retry. Persist only the rolled-back valid transcript.
 
 If no current WebSocket owns the session, deny the permission request. A stale
 or mismatched `request_id` cannot unblock another request.
+
+Plan approval follows the same ownership rule: without a current client, reject
+the proposal with empty feedback and leave the turn read-only.
 
 ### Browser disconnect
 
@@ -576,14 +589,16 @@ The v1 design is complete when all of the following are true:
    and complete result remains available in the inspector.
 5. Permission requests never depend on terminal input and clearly explain the
    action, scope, and reason.
-6. The user can keep typing, queue one follow-up, stop safely, and retry without
+6. Plan approval and revision happen inline without a terminal prompt; approval
+   can restore the base mode within the same turn.
+7. The user can keep typing, queue one follow-up, stop safely, and retry without
    losing the draft.
-7. Browser reconnect and one sidecar restart recover from authoritative session
+8. Browser reconnect and one sidecar restart recover from authoritative session
    files without duplicating a turn.
-8. Permission, sandbox, network-egress, and context-management state are honest
+9. Permission, sandbox, network-egress, and context-management state are honest
    and traceable.
-9. Keyboard-only and reduced-motion workflows can complete the full core turn.
-10. The root harness test suite remains green and the UI test suites pass
+10. Keyboard-only and reduced-motion workflows can complete the full core turn.
+11. The root harness test suite remains green and the UI test suites pass
     offline with fake model responses.
 
 ## Design artifacts

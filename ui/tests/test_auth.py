@@ -1,5 +1,4 @@
 from concurrent.futures import ThreadPoolExecutor
-from http.cookies import SimpleCookie
 import threading
 
 import pytest
@@ -121,21 +120,14 @@ def test_tokens_are_compared_with_compare_digest(monkeypatch: pytest.MonkeyPatch
     assert seen == [("secret", "candidate")]
 
 
-def test_bootstrap_response_redirects_with_an_exact_session_cookie(auth: LaunchAuth):
+def test_bootstrap_response_redirects_without_a_credential_cookie(auth: LaunchAuth):
     response = auth.bootstrap_response(SECRET)
-    cookie_header = response.headers["set-cookie"]
-    cookie = SimpleCookie()
-    cookie.load(cookie_header)
 
     assert response.status_code == 303
-    assert response.headers["location"] == "/"
-    assert set(cookie) == {"harness_ui_session"}
-    assert cookie["harness_ui_session"].value == SECRET
-    assert cookie["harness_ui_session"]["httponly"] is True
-    assert cookie["harness_ui_session"]["samesite"].lower() == "strict"
-    assert cookie["harness_ui_session"]["path"] == "/"
-    assert cookie["harness_ui_session"]["expires"] == ""
-    assert cookie["harness_ui_session"]["max-age"] == ""
+    assert response.headers["location"].startswith("/_app/")
+    assert "#token=" in response.headers["location"]
+    assert "set-cookie" not in response.headers
+    assert response.headers["referrer-policy"] == "no-referrer"
 
 
 @pytest.mark.parametrize("token", ["wrong", SECRET])
@@ -156,17 +148,18 @@ def test_bootstrap_response_rejects_invalid_or_reused_tokens_without_disclosure(
 
 
 @pytest.mark.parametrize("method", ["GET", "HEAD", "OPTIONS"])
-@pytest.mark.parametrize(
-    "headers",
-    [
-        [("Authorization", f"Bearer {SECRET}")],
-        [("Cookie", f"harness_ui_session={SECRET}")],
-    ],
-)
-def test_http_accepts_bearer_or_session_cookie_without_origin_for_safe_methods(
-    auth: LaunchAuth, headers: list[tuple[str, str]], method: str
+def test_http_accepts_bearer_without_origin_for_safe_methods(
+    auth: LaunchAuth, method: str
 ):
-    assert auth.require_http(request(method, headers=headers)) is None
+    assert (
+        auth.require_http(
+            request(
+                method,
+                headers=[("Authorization", f"Bearer {SECRET}")],
+            )
+        )
+        is None
+    )
 
 
 @pytest.mark.parametrize(
@@ -306,17 +299,18 @@ def test_unsafe_http_requires_one_exact_allowed_origin(
     assert SECRET not in repr(raised.value)
 
 
-def test_websocket_accepts_browser_cookie_from_allowed_origin(auth: LaunchAuth):
-    selected = auth.require_websocket(
-        websocket(
-            headers=[
-                ("Origin", LOOPBACK_ORIGIN),
-                ("Cookie", f"harness_ui_session={SECRET}"),
-            ]
+def test_websocket_rejects_browser_cookie_credentials(auth: LaunchAuth):
+    with pytest.raises(WebSocketException) as raised:
+        auth.require_websocket(
+            websocket(
+                headers=[
+                    ("Origin", LOOPBACK_ORIGIN),
+                    ("Cookie", f"harness_ui_session={SECRET}"),
+                ]
+            )
         )
-    )
 
-    assert selected is None
+    assert raised.value.code == 1008
 
 
 def test_websocket_accepts_tauri_secret_only_after_public_protocol(auth: LaunchAuth):

@@ -34,10 +34,21 @@ uv run python -m server --workspace /absolute/path/to/workspace --port 0
 ```
 
 The command prints one complete `http://127.0.0.1:<port>/bootstrap?token=...`
-URL. Open it once to exchange the per-launch secret for an HttpOnly,
-SameSite-strict session cookie. The token cannot be reused. API routes and
-WebSocket upgrades remain authenticated, and the service never binds a
-non-loopback interface.
+URL. Open it once to exchange the per-launch secret for two independent,
+32-byte capabilities. The redirect uses an unguessable `/_app/<token>/` path
+for the frontend and puts the API token only in the URL fragment as
+`#token=...`; fragments are not sent in HTTP requests. No credential cookie is
+created. The bootstrap and frontend responses set
+`Referrer-Policy: no-referrer`, and the original launch secret is retired as
+soon as the browser exchange succeeds.
+
+The browser keeps the fragment token in memory and sends it as
+`Authorization: Bearer <token>` for API requests and as the second WebSocket
+subprotocol after `harness-ui`. Static assets and SPA routes must stay under
+the capability path (the frontend build therefore uses relative asset URLs).
+The token cannot be exchanged twice. API routes, WebSocket upgrades, and
+static files remain authenticated, and the service never binds a non-loopback
+interface.
 
 Use `--metadata-db /absolute/path/to/metadata.sqlite3` to override the default
 platform user-data database.
@@ -58,5 +69,8 @@ is rejected before the server binds.
 
 After the loopback socket is serving, stdout contains exactly one readiness
 record with the OS-assigned port. The launch secret is never written to sidecar
-stdout. Send SIGTERM and wait for the process so the graceful application
-lifespan can close session locks and metadata.
+stdout. The Tauri webview uses that launch secret directly as the API bearer
+and WebSocket subprotocol credential; exact `tauri://localhost` CORS and
+preflight responses are enabled without cookies. Send SIGTERM and wait for the
+process so the graceful application lifespan can close session locks and
+metadata.

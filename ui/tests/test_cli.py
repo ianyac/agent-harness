@@ -202,6 +202,21 @@ def _write_dist(root: Path) -> None:
     (root / "assets" / "app.js").write_text("window.HARNESS_UI = true;")
 
 
+def _browser_credentials(response) -> tuple[str, str, str]:
+    location = urlsplit(response.headers["location"])
+    segments = location.path.strip("/").split("/")
+    assert segments[:1] == ["_app"]
+    assert len(segments) == 2
+    assert location.path.endswith("/")
+    fragment = parse_qs(location.fragment, strict_parsing=True)
+    assert set(fragment) == {"token"}
+    return location.path.rstrip("/"), segments[1], fragment["token"][0]
+
+
+def _decode_urlsafe(value: str) -> bytes:
+    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+
+
 def _run_invalid_sidecar(
     workspace: Path,
     stdin_text: str,
@@ -477,10 +492,25 @@ def test_browser_mode_prints_complete_one_time_loopback_url(tmp_path: Path):
 
         with httpx.Client(follow_redirects=False, timeout=3) as client:
             first = client.get(url)
+            static_base, static_token, api_token = _browser_credentials(first)
+            api = client.get(
+                f"{parsed.scheme}://{parsed.netloc}/api/health",
+                headers={"Authorization": f"Bearer {api_token}"},
+            )
+            stale_launch = client.get(
+                f"{parsed.scheme}://{parsed.netloc}/api/health",
+                headers={"Authorization": f"Bearer {token}"},
+            )
             second = client.get(url)
         assert first.status_code == 303
-        assert first.headers["location"] == "/"
-        assert "httponly" in first.headers["set-cookie"].lower()
+        assert static_base.startswith("/_app/")
+        assert len(_decode_urlsafe(static_token)) == 32
+        assert len(_decode_urlsafe(api_token)) == 32
+        assert len({token, static_token, api_token}) == 3
+        assert "set-cookie" not in first.headers
+        assert first.headers["referrer-policy"] == "no-referrer"
+        assert api.status_code == 200
+        assert stale_launch.status_code == 401
         assert second.status_code == 401
     finally:
         stdout, stderr = running.finish()
@@ -489,7 +519,7 @@ def test_browser_mode_prints_complete_one_time_loopback_url(tmp_path: Path):
     assert stdout == url + "\n"
 
 
-def test_static_bootstrap_cookie_serves_spa_routes_and_assets(tmp_path: Path):
+def test_static_bootstrap_path_serves_spa_routes_and_assets(tmp_path: Path):
     dist = tmp_path / "dist"
     _write_dist(dist)
     app = _static_app(tmp_path, dist)
@@ -500,8 +530,9 @@ def test_static_bootstrap_cookie_serves_spa_routes_and_assets(tmp_path: Path):
             params={"token": "static-test-secret"},
             follow_redirects=False,
         )
-        route = client.get("/sessions/active/transcript-view")
-        asset = client.get("/assets/app.js")
+        static_base, _static_token, _api_token = _browser_credentials(bootstrap)
+        route = client.get(f"{static_base}/sessions/active/transcript-view")
+        asset = client.get(f"{static_base}/assets/app.js")
         second = client.get(
             "/bootstrap",
             params={"token": "static-test-secret"},
@@ -509,8 +540,8 @@ def test_static_bootstrap_cookie_serves_spa_routes_and_assets(tmp_path: Path):
         )
 
     assert bootstrap.status_code == 303
-    assert bootstrap.headers["location"] == "/"
-    assert "httponly" in bootstrap.headers["set-cookie"].lower()
+    assert "set-cookie" not in bootstrap.headers
+    assert bootstrap.headers["referrer-policy"] == "no-referrer"
     assert route.status_code == 200
     assert "frontend shell" in route.text
     assert route.headers["content-type"].startswith("text/html")
@@ -539,12 +570,19 @@ def test_static_serving_rejects_missing_assets_and_traversal(tmp_path: Path):
     outside.write_text("must-not-be-served")
     (dist / "assets" / "linked.js").symlink_to(outside)
     app = _static_app(tmp_path, dist)
-    headers = {"Authorization": "Bearer static-test-secret"}
 
-    with TestClient(app, base_url="http://testserver", headers=headers) as client:
-        missing = client.get("/assets/missing.js")
-        traversal = client.get("/assets/%2e%2e/%2e%2e/outside-secret.txt")
-        linked = client.get("/assets/linked.js")
+    with TestClient(app, base_url="http://testserver") as client:
+        bootstrap = client.get(
+            "/bootstrap",
+            params={"token": "static-test-secret"},
+            follow_redirects=False,
+        )
+        static_base, _static_token, _api_token = _browser_credentials(bootstrap)
+        missing = client.get(f"{static_base}/assets/missing.js")
+        traversal = client.get(
+            f"{static_base}/assets/%2e%2e/%2e%2e/outside-secret.txt"
+        )
+        linked = client.get(f"{static_base}/assets/linked.js")
 
     assert missing.status_code == 404
     assert traversal.status_code == 404
@@ -557,12 +595,14 @@ def test_missing_development_dist_returns_actionable_response(tmp_path: Path):
     missing = tmp_path / "frontend" / "dist"
     app = _static_app(tmp_path, missing)
 
-    with TestClient(
-        app,
-        base_url="http://testserver",
-        headers={"Authorization": "Bearer static-test-secret"},
-    ) as client:
-        response = client.get("/")
+    with TestClient(app, base_url="http://testserver") as client:
+        bootstrap = client.get(
+            "/bootstrap",
+            params={"token": "static-test-secret"},
+            follow_redirects=False,
+        )
+        static_base, _static_token, _api_token = _browser_credentials(bootstrap)
+        response = client.get(f"{static_base}/")
 
     assert response.status_code == 503
     assert "frontend build" in response.text.lower()

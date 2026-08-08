@@ -212,8 +212,10 @@ def test_bootstrap_is_the_only_auth_exemption_and_consumes_token_once(app):
         )
 
     assert first.status_code == 303
-    assert first.headers["location"] == "/"
-    assert "httponly" in first.headers["set-cookie"].lower()
+    assert first.headers["location"].startswith("/_app/")
+    assert "#token=" in first.headers["location"]
+    assert "set-cookie" not in first.headers
+    assert first.headers["referrer-policy"] == "no-referrer"
     assert SECRET not in first.headers["location"]
     assert second.status_code == 401
     assert SECRET not in second.text
@@ -224,7 +226,8 @@ def test_framework_documentation_does_not_add_unauthenticated_routes(app, path: 
     with TestClient(app, base_url=ORIGIN) as anonymous:
         response = anonymous.get(path)
 
-    assert response.status_code == 404
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Unauthorized"}
 
 
 @pytest.mark.parametrize("path", ["/api/not-a-route", "/ws/not-a-route"])
@@ -266,7 +269,7 @@ def test_static_fallback_authenticates_unknown_unsafe_http_methods(
 @pytest.mark.parametrize(
     ("path", "status_code", "allow"),
     [
-        ("/unknown-frontend-route", 405, "GET, HEAD"),
+        ("/unknown-frontend-route", 404, None),
         ("/api/not-a-route", 404, None),
         ("/ws/not-a-route", 404, None),
     ],
@@ -341,8 +344,8 @@ def test_credentialed_arbitrary_unsafe_methods_still_require_allowed_origin(
 @pytest.mark.parametrize(
     ("method", "path", "status_code", "allow"),
     [
-        ("TRACE", "/unknown", 405, "GET, HEAD"),
-        ("X-GET-HEAD", "/unknown", 405, "GET, HEAD"),
+        ("TRACE", "/unknown", 404, None),
+        ("X-GET-HEAD", "/unknown", 404, None),
         ("PROPFIND", "/api/not-a-route", 404, None),
         ("MKCOL", "/ws/not-a-route", 404, None),
     ],

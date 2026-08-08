@@ -8,14 +8,14 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable, Literal
 
-from fastapi import APIRouter, Depends, FastAPI, Request, WebSocket
+from fastapi import APIRouter, FastAPI, Request, WebSocket
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from starlette.websockets import WebSocketDisconnect
 
 from harness.llm import LLMClient
 from harness.permissions import STARTUP_MODES
-from server.auth import LaunchAuth
+from server.auth import AuthBoundary, LaunchAuth
 from server.context_mode import CONTEXT_MODES
 from server.metadata import MetadataStore, SessionRecord
 from server.protocol import dump_server_event, parse_client_event
@@ -232,7 +232,7 @@ def create_app(
     async def bootstrap(token: str | None = None):
         return auth.bootstrap_response(token)
 
-    router = APIRouter(prefix="/api", dependencies=[Depends(auth.require_http)])
+    router = APIRouter(prefix="/api")
 
     def manager(request: Request) -> SessionManager:
         return request.app.state.session_manager
@@ -291,7 +291,9 @@ def create_app(
 
     @app.websocket("/ws/sessions/{session_id}")
     async def session_websocket(websocket: WebSocket, session_id: str) -> None:
-        selected_protocol = auth.require_websocket(websocket)
+        selected_protocol = websocket.scope["state"][
+            "auth_websocket_subprotocol"
+        ]
         await websocket.accept(subprotocol=selected_protocol)
         connection = None
         try:
@@ -320,10 +322,17 @@ def create_app(
 
     @app.websocket("/{path:path}")
     async def unknown_websocket(websocket: WebSocket, _path: str) -> None:
-        selected_protocol = auth.require_websocket(websocket)
+        selected_protocol = websocket.scope["state"][
+            "auth_websocket_subprotocol"
+        ]
         await websocket.accept(subprotocol=selected_protocol)
         await websocket.close(code=1008, reason="Unknown WebSocket route")
 
     if static_root is not None:
-        install_static_routes(app, static_root, auth)
+        install_static_routes(app, static_root)
+    app.add_middleware(
+        AuthBoundary,
+        auth=auth,
+        static_enabled=static_root is not None,
+    )
     return app

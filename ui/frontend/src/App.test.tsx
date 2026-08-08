@@ -5,7 +5,14 @@ import { App } from "./App";
 
 describe("App", () => {
   it("renders the focused product shell", () => {
-    render(<App />);
+    render(
+      <App
+        sidebarStorage={{
+          getItem: () => null,
+          setItem: () => {},
+        }}
+      />,
+    );
 
     expect(screen.getByRole("navigation", { name: "Sessions" })).toBeVisible();
     expect(screen.getByRole("main")).toBeVisible();

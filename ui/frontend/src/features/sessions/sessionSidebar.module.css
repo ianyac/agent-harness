@@ -1,0 +1,540 @@
+.sidebar {
+  display: flex;
+  flex: 0 0 var(--sidebar-width);
+  flex-direction: column;
+  width: var(--sidebar-width);
+  min-height: 100dvh;
+  padding: 12px 10px;
+  overflow: hidden;
+  transition: width var(--motion-standard) var(--motion-easing),
+    flex-basis var(--motion-standard) var(--motion-easing);
+}
+
+.identity,
+.primaryAction,
+.utilityAction,
+.sessionButton,
+.headerButton,
+.collapseButton,
+.moreButton,
+.secondaryButton,
+.dangerButton {
+  min-height: 32px;
+  border: 0;
+  border-radius: var(--radius-control);
+  color: inherit;
+  background: transparent;
+}
+
+.identity {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 4px 8px 12px;
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.connection {
+  width: 8px;
+  height: 8px;
+  margin-inline-start: auto;
+  border-radius: 50%;
+  background: var(--color-success);
+}
+
+.primaryAction,
+.utilityAction {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  gap: 9px;
+  padding: 6px 8px;
+  text-align: start;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.primaryAction {
+  min-height: 40px;
+  color: var(--color-surface);
+  background: var(--color-ink);
+  font-weight: 600;
+}
+
+.utilityAction:hover,
+.collapseButton:hover,
+.moreButton:hover,
+.headerButton:hover {
+  background: color-mix(in srgb, var(--color-ink) 8%, transparent);
+}
+
+.shortcut {
+  margin-inline-start: auto;
+  border: 0;
+  color: var(--color-ink-muted);
+  background: transparent;
+  font-family: var(--font-sans);
+  font-size: 11px;
+}
+
+.primaryAction .shortcut {
+  color: color-mix(in srgb, var(--color-surface) 75%, transparent);
+}
+
+.sessionGroups {
+  flex: 1;
+  min-height: 0;
+  margin-top: 12px;
+  overflow: auto;
+}
+
+.groupHeading,
+.commandHeading {
+  margin: 14px 8px 5px;
+  color: var(--color-ink-muted);
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.sessionList {
+  display: grid;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.row {
+  position: relative;
+  display: flex;
+  min-width: 0;
+  border-radius: var(--radius-control);
+}
+
+.row[data-active] {
+  background: color-mix(in srgb, var(--color-accent) 13%, transparent);
+}
+
+.sessionButton {
+  display: grid;
+  grid-template-columns: 12px minmax(0, 1fr);
+  flex: 1;
+  align-items: center;
+  min-width: 0;
+  gap: 7px;
+  padding: 6px 26px 6px 8px;
+  text-align: start;
+  cursor: pointer;
+}
+
+.sessionButton:hover {
+  background: color-mix(in srgb, var(--color-ink) 6%, transparent);
+}
+
+.sessionCopy,
+.sessionTitle,
+.workspace,
+.statusText {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sessionTitle {
+  font-weight: 550;
+}
+
+.workspace,
+.statusText {
+  color: var(--color-ink-muted);
+  font-size: 11px;
+}
+
+.statusIcon {
+  color: var(--color-border);
+}
+
+.statusIcon[data-status="running"],
+.statusIcon[data-status="complete"] {
+  color: var(--color-success);
+}
+
+.statusIcon[data-status="waiting_permission"],
+.statusIcon[data-status="stopping"] {
+  color: var(--color-attention);
+}
+
+.statusIcon[data-status="error"] {
+  color: var(--color-danger);
+}
+
+.moreButton {
+  position: absolute;
+  inset-block-start: 4px;
+  inset-inline-end: 2px;
+  display: grid;
+  width: 28px;
+  min-height: 28px;
+  padding: 0;
+  place-items: center;
+  cursor: pointer;
+}
+
+.menu {
+  z-index: 50;
+  min-width: 150px;
+  padding: 5px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-menu);
+  background: var(--color-surface);
+  box-shadow: 0 10px 28px color-mix(in srgb, #000 18%, transparent);
+}
+
+.menuItem {
+  position: relative;
+  min-height: 32px;
+  padding: 6px 10px 6px 28px;
+  border-radius: 6px;
+  outline: 0;
+  cursor: default;
+}
+
+.menuItem[data-highlighted] {
+  background: color-mix(in srgb, var(--color-accent) 13%, transparent);
+}
+
+.dangerItem {
+  color: var(--color-danger);
+}
+
+.itemIndicator {
+  position: absolute;
+  inset-inline-start: 9px;
+}
+
+.renameForm {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 28px 28px;
+  width: 100%;
+  gap: 2px;
+}
+
+.renameForm input,
+.searchField input {
+  min-width: 0;
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  color: var(--color-ink);
+  background: var(--color-surface);
+}
+
+.renameForm button {
+  display: grid;
+  border: 0;
+  border-radius: 6px;
+  color: inherit;
+  background: transparent;
+  place-items: center;
+}
+
+.footer {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  padding-top: 8px;
+  border-top: 1px solid var(--color-border);
+}
+
+.collapseButton {
+  display: grid;
+  flex: 0 0 32px;
+  padding: 0;
+  place-items: center;
+  cursor: pointer;
+}
+
+.sidebar[data-collapsed="true"] {
+  flex-basis: var(--sidebar-rail-width);
+  width: var(--sidebar-rail-width);
+  padding-inline: 8px;
+}
+
+.sidebar[data-collapsed="true"] .collapseCopy,
+.sidebar[data-collapsed="true"] .shortcut,
+.sidebar[data-collapsed="true"] .groupHeading,
+.sidebar[data-collapsed="true"] .sessionCopy,
+.sidebar[data-collapsed="true"] .connection {
+  display: none;
+}
+
+.sidebar[data-collapsed="true"] .identity,
+.sidebar[data-collapsed="true"] .primaryAction,
+.sidebar[data-collapsed="true"] .utilityAction,
+.sidebar[data-collapsed="true"] .sessionButton {
+  display: grid;
+  width: 40px;
+  padding: 0;
+  place-items: center;
+}
+
+.sidebar[data-collapsed="true"] .sessionButton {
+  grid-template-columns: 12px;
+}
+
+.sidebar[data-collapsed="true"] .row {
+  display: grid;
+}
+
+.sidebar[data-collapsed="true"] .moreButton {
+  position: static;
+  display: grid;
+  width: 40px;
+}
+
+.sidebar[data-collapsed="true"] .footer {
+  display: grid;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.context,
+.branch,
+.headerActions,
+.headerButton {
+  display: flex;
+  align-items: center;
+}
+
+.context {
+  min-width: 0;
+  gap: 12px;
+}
+
+.context h1,
+.branch {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.context h1 {
+  margin: 0;
+  font-size: inherit;
+}
+
+.branch {
+  gap: 5px;
+  color: var(--color-ink-muted);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.headerActions {
+  gap: 6px;
+}
+
+.headerButton {
+  gap: 6px;
+  padding: 5px 8px;
+  cursor: pointer;
+}
+
+.overlay {
+  position: fixed;
+  z-index: 60;
+  inset: 0;
+  background: color-mix(in srgb, #000 28%, transparent);
+}
+
+.confirmDialog,
+.palette {
+  position: fixed;
+  z-index: 61;
+  inset-block-start: 50%;
+  inset-inline-start: 50%;
+  width: min(calc(100vw - 32px), 440px);
+  padding: 20px;
+  transform: translate(-50%, -50%);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-card);
+  background: var(--color-surface);
+  box-shadow: 0 18px 50px color-mix(in srgb, #000 25%, transparent);
+}
+
+.dialogTitle {
+  margin: 0;
+  font-size: 16px;
+}
+
+.dialogDescription {
+  margin: 8px 0 20px;
+  color: var(--color-ink-muted);
+}
+
+.dialogActions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.secondaryButton,
+.dangerButton {
+  padding: 6px 12px;
+  border: 1px solid var(--color-border);
+  cursor: pointer;
+}
+
+.dangerButton {
+  border-color: var(--color-danger);
+  color: var(--color-surface);
+  background: var(--color-danger);
+}
+
+.palette {
+  inset-block-start: 18%;
+  width: min(calc(100vw - 32px), 600px);
+  max-height: min(560px, 72vh);
+  padding: 0;
+  transform: translateX(-50%);
+  overflow: hidden;
+}
+
+.searchField {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 9px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.searchField input {
+  height: 36px;
+  padding: 6px 9px;
+  border: 0;
+  background: transparent;
+}
+
+.commandList {
+  max-height: min(490px, 62vh);
+  padding: 6px;
+  overflow: auto;
+}
+
+.command {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr) auto;
+  align-items: center;
+  width: 100%;
+  min-height: 40px;
+  gap: 8px;
+  padding: 6px 9px;
+  border: 0;
+  border-radius: var(--radius-control);
+  color: inherit;
+  background: transparent;
+  text-align: start;
+  cursor: pointer;
+}
+
+.command:hover,
+.command:focus-visible {
+  background: color-mix(in srgb, var(--color-accent) 13%, transparent);
+}
+
+.command kbd,
+.command small {
+  color: var(--color-ink-muted);
+  font-size: 11px;
+}
+
+.command small {
+  display: block;
+}
+
+.emptyCommands {
+  padding: 20px;
+  color: var(--color-ink-muted);
+  text-align: center;
+}
+
+.srOnly {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+@media (max-width: 999px) {
+  .sidebar,
+  .sidebar[data-collapsed="true"] {
+    flex-basis: var(--sidebar-rail-width);
+    width: var(--sidebar-rail-width);
+    padding-inline: 6px;
+  }
+
+  .sidebar .collapseCopy,
+  .sidebar .shortcut,
+  .sidebar .groupHeading,
+  .sidebar .sessionCopy,
+  .sidebar .connection {
+    display: none;
+  }
+
+  .sidebar .identity,
+  .sidebar .primaryAction,
+  .sidebar .utilityAction,
+  .sidebar .sessionButton,
+  .sidebar[data-collapsed="true"] .identity,
+  .sidebar[data-collapsed="true"] .primaryAction,
+  .sidebar[data-collapsed="true"] .utilityAction,
+  .sidebar[data-collapsed="true"] .sessionButton {
+    display: grid;
+    width: 44px;
+    padding: 0;
+    place-items: center;
+  }
+
+  .sidebar .primaryAction,
+  .sidebar[data-collapsed="true"] .primaryAction {
+    min-height: 44px;
+  }
+
+  .sidebar .sessionButton {
+    grid-template-columns: 12px;
+  }
+
+  .sidebar .row {
+    display: grid;
+  }
+
+  .sidebar .moreButton,
+  .sidebar[data-collapsed="true"] .moreButton {
+    position: static;
+    display: grid;
+    width: 44px;
+  }
+
+  .sidebar .footer {
+    display: grid;
+  }
+
+  .sidebar .collapseButton {
+    display: none;
+  }
+}

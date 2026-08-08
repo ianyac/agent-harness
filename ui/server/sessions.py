@@ -180,9 +180,15 @@ class SessionConnection:
 class _SessionChannel:
     """Session-scoped connection, turn, decision, and queue ownership."""
 
-    def __init__(self, session_id: str, runtime: HarnessRuntime) -> None:
+    def __init__(
+        self,
+        session_id: str,
+        runtime: HarnessRuntime,
+        metadata: MetadataStore,
+    ) -> None:
         self.session_id = session_id
         self.runtime = runtime
+        self.metadata = metadata
         self.generation = 0
         self.current: SessionConnection | None = None
         self.relay = _EventRelay()
@@ -278,6 +284,7 @@ class _SessionChannel:
     def _set_session_mode(self, mode: str) -> None:
         if mode not in STARTUP_MODES:
             raise ClientStateViolation("invalid base mode")
+        self.metadata.set_session_mode(self.session_id, mode)
         self.runtime.policy.base_mode = mode
         if not self.running:
             self.runtime.policy.mode = mode
@@ -1988,7 +1995,7 @@ class SessionManager:
             validated = validate_session_id(session_id)
             channel = self._channels.get(validated)
             if channel is None:
-                channel = _SessionChannel(validated, runtime)
+                channel = _SessionChannel(validated, runtime, self.metadata)
                 self._channels[validated] = channel
             return channel.connect(loop)
 

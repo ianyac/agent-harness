@@ -65,6 +65,31 @@ def test_updates_and_preferences_survive_reopening_the_database(tmp_path: Path):
             assert reopened.get_preference("theme") == saved_preference
 
 
+def test_session_mode_update_is_validated_transactional_and_durable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    database = tmp_path / "ui.sqlite3"
+    with MetadataStore(database) as store:
+        created = store.create_session(
+            NewSession.defaults("s1", tmp_path / "workspace")
+        )
+        monkeypatch.setattr(store, "_now", lambda: "9999-12-31T23:59:59.999999")
+
+        updated = store.set_session_mode("s1", "readOnly")
+
+        assert updated.mode == "readOnly"
+        assert updated.updated_at == "9999-12-31T23:59:59.999999"
+        assert updated.updated_at > created.updated_at
+        with pytest.raises(ValueError):
+            store.set_session_mode("s1", "plan")
+        assert store.get_session("s1") == updated
+        with pytest.raises(KeyError):
+            store.set_session_mode("missing", "default")
+
+    with MetadataStore(database) as reopened:
+        assert reopened.get_session("s1") == updated
+
+
 def test_discovery_adds_new_sessions_without_overwriting_user_title(tmp_path: Path):
     with MetadataStore(tmp_path / "ui.sqlite3") as store:
         discovered = NewSession.defaults("s1", tmp_path / "workspace")

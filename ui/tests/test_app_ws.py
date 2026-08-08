@@ -1,3 +1,4 @@
+import json
 import threading
 import time
 import warnings
@@ -416,20 +417,29 @@ def test_reconnected_socket_owns_permission_requested_after_supersession(service
                 first_context.__exit__(None, None, None)
 
 
-def test_failed_websocket_accept_releases_decision_ownership(
+def test_failed_accept_keeps_healthy_owner_and_does_not_consume_generation(
     service, monkeypatch
 ):
-    llm = ReconnectThenPermissionLLM()
+    llm = FakeLLM(
+        [
+            {
+                "type": "tool_calls",
+                "calls": [
+                    {
+                        "name": "write_file",
+                        "arguments": {"path": "still-owned.txt", "content": "yes"},
+                    }
+                ],
+            },
+            {"type": "text", "content": "owner stayed live"},
+        ]
+    )
     with service(llm) as (client, session_id, workspace, _):
         first_context = connect(client, session_id)
         first = first_context.__enter__()
         try:
-            first.receive_json()
-            first.send_json(
-                {"type": "send_message", "text": "write later", "mode": "base"}
-            )
-            assert first.receive_json()["type"] == "turn_started"
-            assert first.receive_json()["type"] == "assistant_delta"
+            first_snapshot = first.receive_json()
+            assert first_snapshot["generation"] == 1
 
             original_accept = WebSocket.accept
 
@@ -443,14 +453,27 @@ def test_failed_websocket_accept_releases_decision_ownership(
             finally:
                 monkeypatch.setattr(WebSocket, "accept", original_accept)
 
-            with pytest.raises(WebSocketDisconnect):
-                first.receive_json()
-            first_context.__exit__(None, None, None)
-            first_context = None
-            llm.release.set()
+            first.send_json(
+                {"type": "send_message", "text": "write", "mode": "base"}
+            )
+            assert first.receive_json()["type"] == "turn_started"
+            _, requested = receive_until(first, "permission_requested")
+            first.send_json(
+                {
+                    "type": "answer_permission",
+                    "request_id": requested["request_id"],
+                    "answer": "yes",
+                }
+            )
+            _, completed = receive_until(first, "turn_completed")
+            assert completed["messages"][-1]["content"] == "owner stayed live"
+            assert (workspace / "still-owned.txt").read_text() == "yes"
 
-            assert llm.finished.wait(timeout=0.5)
-            assert not (workspace / "after-reconnect.txt").exists()
+            with connect(client, session_id) as replacement:
+                replacement_snapshot = replacement.receive_json()
+                assert replacement_snapshot["generation"] == 2
+                with pytest.raises(WebSocketDisconnect):
+                    first.receive_json()
         finally:
             if first_context is not None:
                 first_context.__exit__(None, None, None)
@@ -585,7 +608,7 @@ def test_cancellation_emits_stopping_then_rolls_back_before_terminal(service):
 
 def test_queue_replacement_launches_only_the_latest_follow_up(service):
     llm = BlockingFirstTurnLLM()
-    with service(llm) as (client, session_id, _, _):
+    with service(llm) as (client, session_id, _, app):
         with connect(client, session_id) as ws:
             ws.receive_json()
             ws.send_json({"type": "send_message", "text": "first", "mode": "base"})
@@ -596,6 +619,19 @@ def test_queue_replacement_launches_only_the_latest_follow_up(service):
             ws.send_json(
                 {"type": "queue_message", "text": "latest", "mode": "plan"}
             )
+            channel = app.state.session_manager._channels[session_id]
+            for _ in range(1000):
+                queued = channel.queued_message
+                if (
+                    queued is not None
+                    and queued.text == "latest"
+                    and queued.mode == "plan"
+                ):
+                    break
+                time.sleep(0.001)
+            assert channel.queued_message is not None
+            assert channel.queued_message.text == "latest"
+            assert channel.queued_message.mode == "plan"
             llm.release.set()
 
             _, first_done = receive_until(ws, "turn_completed")
@@ -612,14 +648,25 @@ def test_queue_replacement_launches_only_the_latest_follow_up(service):
 
 def test_clear_queued_message_prevents_follow_up_and_snapshot_heals_queue(service):
     llm = BlockingFirstTurnLLM()
-    with service(llm) as (client, session_id, _, _):
+    with service(llm) as (client, session_id, _, app):
         with connect(client, session_id) as ws:
             ws.receive_json()
             ws.send_json({"type": "send_message", "text": "first", "mode": "base"})
             assert ws.receive_json()["type"] == "turn_started"
             assert ws.receive_json()["type"] == "assistant_delta"
             ws.send_json({"type": "queue_message", "text": "later", "mode": "base"})
+            channel = app.state.session_manager._channels[session_id]
+            for _ in range(1000):
+                if channel.queued_message is not None:
+                    break
+                time.sleep(0.001)
+            assert channel.queued_message is not None
             ws.send_json({"type": "clear_queued_message"})
+            for _ in range(1000):
+                if channel.queued_message is None:
+                    break
+                time.sleep(0.001)
+            assert channel.queued_message is None
             llm.release.set()
             receive_until(ws, "turn_completed")
 
@@ -709,6 +756,82 @@ def test_disconnect_during_permission_fails_closed_and_leaves_no_pending_turn(se
             assert completed["messages"][-1]["content"] == "next turn works"
 
 
+@pytest.mark.parametrize("send_error", [RuntimeError, OSError])
+def test_outbound_send_failure_wakes_receiver_and_releases_turn_ownership(
+    service, monkeypatch, send_error
+):
+    from server import sessions as sessions_module
+
+    llm = FinishedFakeLLM(
+        [
+            {
+                "type": "tool_calls",
+                "calls": [
+                    {
+                        "name": "write_file",
+                        "arguments": {"path": "must-not-exist.txt", "content": "no"},
+                    }
+                ],
+            },
+            {"type": "text", "content": "permission denied safely"},
+            {"type": "text", "content": "next turn works"},
+        ]
+    )
+    send_failed = threading.Event()
+    released = threading.Event()
+    release_calls: list[int] = []
+    original_send_text = WebSocket.send_text
+    original_release = sessions_module._SessionChannel.release
+
+    async def fail_permission_send(websocket, data: str):
+        if json.loads(data)["type"] == "permission_requested":
+            send_failed.set()
+            raise send_error("outbound transport failed")
+        await original_send_text(websocket, data)
+
+    def tracked_release(channel, connection):
+        release_calls.append(connection.generation)
+        original_release(channel, connection)
+        released.set()
+
+    monkeypatch.setattr(WebSocket, "send_text", fail_permission_send)
+    monkeypatch.setattr(sessions_module._SessionChannel, "release", tracked_release)
+
+    with service(llm) as (client, session_id, workspace, app):
+        with connect(client, session_id) as ws:
+            ws.receive_json()
+            ws.send_json(
+                {"type": "send_message", "text": "write", "mode": "base"}
+            )
+            assert ws.receive_json()["type"] == "turn_started"
+            assert send_failed.wait(timeout=1)
+            assert released.wait(timeout=1)
+            assert llm.finished.wait(timeout=1)
+
+            channel = app.state.session_manager._channels[session_id]
+            for _ in range(1000):
+                if not channel.running:
+                    break
+                time.sleep(0.001)
+            assert channel.running is False
+            assert channel.current is None
+            assert channel.worker is None
+            assert channel.runner is None
+            assert release_calls == [1]
+            assert not (workspace / "must-not-exist.txt").exists()
+
+        monkeypatch.setattr(WebSocket, "send_text", original_send_text)
+        with connect(client, session_id) as healed:
+            snapshot = healed.receive_json()
+            assert snapshot["generation"] == 2
+            assert snapshot["running"] is False
+            healed.send_json(
+                {"type": "send_message", "text": "again", "mode": "base"}
+            )
+            _, completed = receive_until(healed, "turn_completed")
+            assert completed["messages"][-1]["content"] == "next turn works"
+
+
 def test_second_simultaneous_turn_is_rejected_without_starting_another_worker(service):
     llm = BlockingLLM()
     with service(llm) as (client, session_id, _, _):
@@ -754,6 +877,58 @@ def test_set_session_mode_emits_updated_safety_without_constructing_plan(service
 
             assert updated["type"] == "safety_updated"
             assert updated["safety"]["mode"] == "readOnly"
+
+
+def test_set_session_mode_updates_metadata_and_survives_service_restart(
+    tmp_path: Path,
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    settings = AppSettings(
+        metadata_path=tmp_path / "metadata.sqlite3",
+        base_workspace=workspace,
+        launch_secret=SECRET,
+        allowed_origins=frozenset({ORIGIN}),
+    )
+
+    first_app = create_app(settings, lambda: WholeTextLLM("unused"))
+    with TestClient(first_app, base_url=ORIGIN) as client:
+        created = client.post(
+            "/api/sessions",
+            headers=REST_HEADERS,
+            json={
+                "workspace": str(workspace),
+                "mode": "default",
+                "context_mode": "compaction",
+                "title": "Durable mode",
+            },
+        )
+        assert created.status_code == 201
+        session_id = created.json()["session_id"]
+        with connect(client, session_id) as ws:
+            ws.receive_json()
+            ws.send_json({"type": "set_session_mode", "mode": "readOnly"})
+            assert ws.receive_json()["safety"]["mode"] == "readOnly"
+
+        record = client.get(
+            f"/api/sessions/{session_id}", headers=REST_HEADERS
+        )
+        assert record.status_code == 200
+        assert record.json()["mode"] == "readOnly"
+
+    restarted_app = create_app(settings, lambda: WholeTextLLM("unused"))
+    with TestClient(restarted_app, base_url=ORIGIN) as restarted:
+        record = restarted.get(
+            f"/api/sessions/{session_id}", headers=REST_HEADERS
+        )
+        safety = restarted.get(
+            f"/api/sessions/{session_id}/safety", headers=REST_HEADERS
+        )
+
+        assert record.status_code == 200
+        assert record.json()["mode"] == "readOnly"
+        assert safety.status_code == 200
+        assert safety.json()["mode"] == "readOnly"
 
 
 @pytest.mark.parametrize(

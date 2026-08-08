@@ -230,6 +230,18 @@ class MetadataStore:
                 raise KeyError(session_id)
         return self._required_session(session_id)
 
+    def set_session_mode(self, session_id: str, mode: str) -> SessionRecord:
+        if mode not in STARTUP_MODES:
+            raise ValueError(f"mode must be one of {STARTUP_MODES}")
+        with self._transaction() as connection:
+            result = connection.execute(
+                "UPDATE sessions SET mode = ?, updated_at = ? WHERE session_id = ?",
+                (mode, self._now(), session_id),
+            )
+            if result.rowcount != 1:
+                raise KeyError(session_id)
+        return self._required_session(session_id)
+
     def touch_session(self, session_id: str) -> SessionRecord:
         now = self._now()
         with self._transaction() as connection:

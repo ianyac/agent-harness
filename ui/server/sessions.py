@@ -16,10 +16,24 @@ import sqlite3
 import stat
 import threading
 from typing import Callable, cast
+import uuid
 
 from harness.llm import LLMClient
+from harness.permissions import STARTUP_MODES
 from harness.session import SessionLog
+from server.bridge import CancellationToken, DecisionBroker, EventSink
 from server.metadata import MetadataStore, NewSession, SessionRecord
+from server.protocol import (
+    CancelTurn,
+    ClearQueuedMessage,
+    ClientEvent,
+    PermissionAnswer,
+    PlanAnswer,
+    QueuedMessage,
+    SetSessionMode,
+    UserMessage,
+)
+from server.runner import TurnRunner
 from server.runtime import HarnessRuntime, RuntimeConfig
 
 
@@ -80,6 +94,270 @@ class SessionResumeError(RuntimeError):
 
 class SessionManagerClosed(RuntimeError):
     pass
+
+
+class ClientStateViolation(ValueError):
+    """A valid client event that is not legal in the current turn state."""
+
+
+class _EventRelay:
+    """Route worker events only to the current connection generation."""
+
+    _TERMINAL_TYPES = frozenset(
+        {"turn_completed", "turn_cancelled", "turn_failed"}
+    )
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._target: EventSink | None = None
+        self._terminal: tuple[str, dict[str, object]] | None = None
+
+    def bind_with_snapshot(self, target: EventSink, **snapshot: object) -> None:
+        with self._lock:
+            target.emit("session_snapshot", **snapshot)
+            self._target = target
+
+    def unbind(self, target: EventSink) -> None:
+        with self._lock:
+            if self._target is target:
+                self._target = None
+
+    def emit(self, event_type: str, **payload: object) -> None:
+        with self._lock:
+            if event_type in self._TERMINAL_TYPES:
+                if self._terminal is not None:
+                    raise RuntimeError("a turn terminal event is already pending")
+                self._terminal = (event_type, payload)
+                return
+            target = self._target
+        if target is not None:
+            target.emit(event_type, **payload)
+
+    def flush_terminal(self) -> None:
+        with self._lock:
+            terminal = self._terminal
+            self._terminal = None
+            target = self._target
+        if terminal is not None and target is not None:
+            event_type, payload = terminal
+            target.emit(event_type, **payload)
+
+
+class SessionConnection:
+    """One authenticated WebSocket generation attached to a live session."""
+
+    def __init__(
+        self,
+        channel: _SessionChannel,
+        generation: int,
+        sink: EventSink,
+    ) -> None:
+        self._channel = channel
+        self.generation = generation
+        self.sink = sink
+        self.stop = asyncio.Event()
+        self.superseded = False
+
+    @property
+    def session_id(self) -> str:
+        return self._channel.session_id
+
+    async def next_event(self):
+        return await self.sink.next()
+
+    def dispatch(self, event: ClientEvent) -> None:
+        self._channel.dispatch(self, event)
+
+    def mark_superseded(self) -> None:
+        self.superseded = True
+        self.stop.set()
+
+    def disconnected(self) -> None:
+        self.stop.set()
+        self._channel.release(self)
+
+
+class _SessionChannel:
+    """Session-scoped connection, turn, decision, and queue ownership."""
+
+    def __init__(self, session_id: str, runtime: HarnessRuntime) -> None:
+        self.session_id = session_id
+        self.runtime = runtime
+        self.generation = 0
+        self.current: SessionConnection | None = None
+        self.relay = _EventRelay()
+        self.messages = copy.deepcopy(runtime.messages)
+        self.safety = asdict(runtime.safety_snapshot())
+        self.running = False
+        self.stopping = False
+        self.queued_message: QueuedMessage | None = None
+        self.turn_id: str | None = None
+        self.turn_owner_generation: int | None = None
+        self.token: CancellationToken | None = None
+        self.runner: TurnRunner | None = None
+        self.worker: asyncio.Task[None] | None = None
+        self.shutting_down = False
+
+    def connect(self, loop: asyncio.AbstractEventLoop) -> SessionConnection:
+        if self.shutting_down:
+            raise SessionManagerClosed("session is shutting down")
+        previous = self.current
+        self.generation += 1
+        sink = EventSink(self.session_id, self.generation, loop)
+        connection = SessionConnection(self, self.generation, sink)
+        self.current = connection
+        if previous is not None:
+            previous.mark_superseded()
+        if self.running and self.runner is not None:
+            self.runner.decisions.disconnect()
+            self.runner.decisions = DecisionBroker()
+            self.turn_owner_generation = connection.generation
+        self.relay.bind_with_snapshot(
+            sink,
+            messages=copy.deepcopy(self.messages),
+            running=self.running,
+            turn_id=self.turn_id,
+            queued_message=(
+                self.queued_message.model_copy(deep=True)
+                if self.queued_message is not None
+                else None
+            ),
+            safety=copy.deepcopy(self.safety),
+        )
+        return connection
+
+    def release(self, connection: SessionConnection) -> None:
+        if self.current is connection:
+            self.current = None
+            self.relay.unbind(connection.sink)
+        if (
+            self.running
+            and self.turn_owner_generation == connection.generation
+            and self.runner is not None
+        ):
+            self.runner.decisions.disconnect()
+
+    def dispatch(self, connection: SessionConnection, event: ClientEvent) -> None:
+        if self.current is not connection or self.shutting_down:
+            raise ClientStateViolation("connection generation is no longer current")
+        if isinstance(event, UserMessage):
+            if self.running:
+                raise ClientStateViolation("a turn is already running")
+            self._start_turn(event.text, event.mode, connection.generation)
+        elif isinstance(event, QueuedMessage):
+            if not self.running:
+                raise ClientStateViolation("a follow-up requires a running turn")
+            self.queued_message = event.model_copy(deep=True)
+        elif isinstance(event, ClearQueuedMessage):
+            self.queued_message = None
+        elif isinstance(event, CancelTurn):
+            if (
+                self.running
+                and event.turn_id == self.turn_id
+                and self.token is not None
+                and not self.stopping
+            ):
+                self.stopping = True
+                self.relay.emit("turn_stopping", turn_id=self.turn_id)
+                self.token.cancel()
+        elif isinstance(event, PermissionAnswer):
+            if self.runner is not None:
+                self.runner.decisions.answer_permission(
+                    event.request_id, event.answer
+                )
+        elif isinstance(event, PlanAnswer):
+            if self.runner is not None:
+                self.runner.decisions.answer_plan(
+                    event.request_id, event.approved, event.feedback
+                )
+        elif isinstance(event, SetSessionMode):
+            self._set_session_mode(event.mode)
+        else:
+            raise ClientStateViolation("unsupported client event")
+
+    def _set_session_mode(self, mode: str) -> None:
+        if mode not in STARTUP_MODES:
+            raise ClientStateViolation("invalid base mode")
+        self.runtime.policy.base_mode = mode
+        if not self.running:
+            self.runtime.policy.mode = mode
+        self.safety = asdict(self.runtime.safety_snapshot())
+        self.relay.emit("safety_updated", safety=copy.deepcopy(self.safety))
+
+    def _start_turn(
+        self,
+        text: str,
+        mode: str,
+        owner_generation: int | None,
+    ) -> None:
+        if self.running or self.shutting_down:
+            raise ClientStateViolation("a turn cannot start in the current state")
+        turn_id = uuid.uuid4().hex
+        token = CancellationToken()
+        runner = TurnRunner(self.runtime)
+        if owner_generation is None:
+            runner.decisions.disconnect()
+        self.running = True
+        self.stopping = False
+        self.turn_id = turn_id
+        self.turn_owner_generation = owner_generation
+        self.token = token
+        self.runner = runner
+        self.worker = asyncio.create_task(
+            self._run_turn(runner, text, mode, turn_id, token),
+            name=f"session-turn-{self.session_id}-{turn_id}",
+        )
+
+    async def _run_turn(
+        self,
+        runner: TurnRunner,
+        text: str,
+        mode: str,
+        turn_id: str,
+        token: CancellationToken,
+    ) -> None:
+        try:
+            await asyncio.to_thread(
+                runner.run,
+                text,
+                mode,
+                turn_id,
+                self.relay,
+                token,
+            )
+        finally:
+            self.messages = copy.deepcopy(self.runtime.messages)
+            self.safety = asdict(self.runtime.safety_snapshot())
+            self.running = False
+            self.stopping = False
+            self.turn_id = None
+            self.turn_owner_generation = None
+            self.token = None
+            self.runner = None
+            self.worker = None
+            self.relay.flush_terminal()
+            queued = self.queued_message
+            self.queued_message = None
+            if queued is not None and not self.shutting_down:
+                owner = self.current.generation if self.current is not None else None
+                self._start_turn(queued.text, queued.mode, owner)
+
+    def begin_shutdown(self) -> None:
+        self.shutting_down = True
+        self.queued_message = None
+        if self.current is not None:
+            self.current.mark_superseded()
+            self.relay.unbind(self.current.sink)
+            self.current = None
+        if self.runner is not None:
+            self.runner.decisions.disconnect()
+        if self.token is not None:
+            self.token.cancel()
+
+    async def wait_for_worker(self) -> None:
+        worker = self.worker
+        if worker is not None:
+            await worker
 
 
 class CodexCredentialFactory:
@@ -716,6 +994,7 @@ class SessionManager:
         self._llm_factory = llm_factory
         self._compact_threshold = compact_threshold
         self._runtimes: dict[str, HarnessRuntime] = {}
+        self._channels: dict[str, _SessionChannel] = {}
         self._runtime_lock = asyncio.Lock()
         self._closed = False
         self._metadata_closed = False
@@ -1671,32 +1950,47 @@ class SessionManager:
             self._runtimes[session_id] = runtime
             return record
 
+    def _open_runtime_locked(self, session_id: object) -> HarnessRuntime:
+        self._ensure_open()
+        record = self._required_record(session_id)
+        existing = self._runtimes.get(record.session_id)
+        if existing is not None:
+            self._safe_session_path(
+                record.workspace,
+                record.session_id,
+                require_file=False,
+                create_parents=False,
+            )
+            return existing
+        runtime = self._construct_runtime(record)
+        lease = self._secure_runtime_lease(runtime)
+        try:
+            if lease is not None:
+                lease.publish()
+            self.metadata.touch_session(record.session_id)
+        except BaseException as error:
+            self._abort_after_failure(runtime, error)
+            raise
+        if lease is not None:
+            lease.commit()
+        self._runtimes[record.session_id] = runtime
+        return runtime
+
     async def open_runtime(self, session_id: object) -> HarnessRuntime:
         async with self._runtime_lock:
-            self._ensure_open()
-            record = self._required_record(session_id)
-            existing = self._runtimes.get(record.session_id)
-            if existing is not None:
-                self._safe_session_path(
-                    record.workspace,
-                    record.session_id,
-                    require_file=False,
-                    create_parents=False,
-                )
-                return existing
-            runtime = self._construct_runtime(record)
-            lease = self._secure_runtime_lease(runtime)
-            try:
-                if lease is not None:
-                    lease.publish()
-                self.metadata.touch_session(record.session_id)
-            except BaseException as error:
-                self._abort_after_failure(runtime, error)
-                raise
-            if lease is not None:
-                lease.commit()
-            self._runtimes[record.session_id] = runtime
-            return runtime
+            return self._open_runtime_locked(session_id)
+
+    async def connect(self, session_id: object) -> SessionConnection:
+        """Claim the next WebSocket generation for an existing session."""
+        loop = asyncio.get_running_loop()
+        async with self._runtime_lock:
+            runtime = self._open_runtime_locked(session_id)
+            validated = validate_session_id(session_id)
+            channel = self._channels.get(validated)
+            if channel is None:
+                channel = _SessionChannel(validated, runtime)
+                self._channels[validated] = channel
+            return channel.connect(loop)
 
     async def transcript(self, session_id: object) -> list[dict]:
         async with self._runtime_lock:
@@ -1736,6 +2030,11 @@ class SessionManager:
         async with self._runtime_lock:
             self._ensure_open()
             record = self._required_record(session_id)
+            channel = self._channels.get(record.session_id)
+            if channel is not None:
+                channel.begin_shutdown()
+                await channel.wait_for_worker()
+                self._channels.pop(record.session_id, None)
             runtime = self._runtimes.get(record.session_id)
             if runtime is not None:
                 runtime.close()
@@ -1771,6 +2070,15 @@ class SessionManager:
         errors: list[Exception] = []
         async with self._runtime_lock:
             self._closed = True
+            for channel in tuple(self._channels.values()):
+                channel.begin_shutdown()
+            for session_id, channel in tuple(self._channels.items()):
+                try:
+                    await channel.wait_for_worker()
+                except Exception as error:
+                    errors.append(error)
+                else:
+                    self._channels.pop(session_id, None)
             for session_id, runtime in tuple(self._runtimes.items()):
                 try:
                     runtime.close()

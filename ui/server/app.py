@@ -2,26 +2,31 @@
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable, Literal
 
-from fastapi import APIRouter, Depends, FastAPI, Request
+from fastapi import APIRouter, Depends, FastAPI, Request, WebSocket
 from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from starlette.websockets import WebSocketDisconnect
 
 from harness.llm import LLMClient
 from harness.permissions import STARTUP_MODES
 from server.auth import LaunchAuth
 from server.context_mode import CONTEXT_MODES
 from server.metadata import MetadataStore, SessionRecord
+from server.protocol import dump_server_event, parse_client_event
 from server.sessions import (
+    ClientStateViolation,
     CredentialPrerequisite,
     InvalidSessionId,
     InvalidTitle,
     InvalidWorkspace,
     SessionManager,
+    SessionManagerClosed,
     SessionNotFound,
     SessionResumeError,
 )
@@ -75,6 +80,54 @@ def _record_cleanup_failure(original: BaseException, cleanup: BaseException) -> 
     )
     existing = tuple(getattr(original, "cleanup_errors", ()))
     original.cleanup_errors = (*existing, cleanup)  # type: ignore[attr-defined]
+
+
+async def _send_connection_events(websocket: WebSocket, connection) -> None:
+    while True:
+        event_waiter = asyncio.create_task(connection.next_event())
+        stop_waiter = asyncio.create_task(connection.stop.wait())
+        done, pending = await asyncio.wait(
+            {event_waiter, stop_waiter},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for waiter in pending:
+            waiter.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        if stop_waiter in done:
+            if connection.superseded:
+                try:
+                    await websocket.close(code=1000, reason="Superseded")
+                except (RuntimeError, WebSocketDisconnect):
+                    pass
+            return
+        try:
+            await websocket.send_text(dump_server_event(event_waiter.result()))
+        except (RuntimeError, WebSocketDisconnect):
+            connection.stop.set()
+            return
+
+
+async def _receive_connection_events(websocket: WebSocket, connection) -> None:
+    try:
+        while True:
+            message = await websocket.receive()
+            if message["type"] == "websocket.disconnect":
+                return
+            raw = message.get("text")
+            if not isinstance(raw, str):
+                await websocket.close(code=1008, reason="Invalid client frame")
+                return
+            try:
+                event = parse_client_event(raw)
+                connection.dispatch(event)
+            except (ValidationError, ClientStateViolation):
+                await websocket.close(code=1008, reason="Invalid client frame")
+                return
+    except WebSocketDisconnect:
+        return
+    finally:
+        connection.stop.set()
 
 
 def create_app(
@@ -214,6 +267,30 @@ def create_app(
     @router.get("/sessions/{session_id}/safety")
     async def safety(request: Request, session_id: str) -> dict:
         return await manager(request).safety(session_id)
+
+    @app.websocket("/ws/sessions/{session_id}")
+    async def session_websocket(websocket: WebSocket, session_id: str) -> None:
+        selected_protocol = auth.require_websocket(websocket)
+        try:
+            connection = await websocket.app.state.session_manager.connect(session_id)
+        except (
+            InvalidSessionId,
+            SessionNotFound,
+            SessionResumeError,
+            SessionManagerClosed,
+        ):
+            await websocket.close(code=1008, reason="Session unavailable")
+            return
+
+        try:
+            await websocket.accept(subprotocol=selected_protocol)
+            snapshot = await connection.next_event()
+            await websocket.send_text(dump_server_event(snapshot))
+            async with asyncio.TaskGroup() as tasks:
+                tasks.create_task(_send_connection_events(websocket, connection))
+                tasks.create_task(_receive_connection_events(websocket, connection))
+        finally:
+            connection.disconnected()
 
     app.include_router(router)
     return app

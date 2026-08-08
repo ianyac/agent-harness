@@ -14,6 +14,7 @@ class LLMClient(Protocol):
         tools: list[dict] | None = None,
         system: str | None = None,
         on_text_delta: Callable[[str], None] | None = None,
+        on_stream_reset: Callable[[], None] | None = None,
         projection_hash: str | None = None,
     ) -> dict: ...
 
@@ -224,6 +225,7 @@ class CodexAdapter:
         tools: list[dict] | None = None,
         system: str | None = None,
         on_text_delta: Callable[[str], None] | None = None,
+        on_stream_reset: Callable[[], None] | None = None,
         projection_hash: str | None = None,
     ) -> dict:
         body = build_request_body(
@@ -234,9 +236,46 @@ class CodexAdapter:
         # Caveat for streaming: a retry regenerates from scratch, so chunks
         # already shown from the dead attempt are stale — the assembled
         # message (the box, not the texts) is the only source of truth.
-        return with_retries(
-            lambda: self._attempt(body, on_text_delta, projection_hash)
-        )
+        first_attempt = True
+        attempt_had_text = False
+        callback_failure: BaseException | None = None
+
+        def attempt() -> dict:
+            nonlocal first_attempt, attempt_had_text, callback_failure
+            if (
+                not first_attempt
+                and attempt_had_text
+                and on_stream_reset is not None
+            ):
+                try:
+                    on_stream_reset()
+                except BaseException as error:
+                    # Retry-shaped callback exceptions are cancellation too,
+                    # not provider failures for with_retries() to consume.
+                    callback_failure = error
+                    raise RuntimeError("stream reset callback failed") from error
+            first_attempt = False
+            attempt_had_text = False
+
+            def deliver_text(delta: str) -> None:
+                nonlocal attempt_had_text
+                attempt_had_text = True
+                if on_text_delta is not None:
+                    on_text_delta(delta)
+
+            callback = (
+                deliver_text
+                if on_text_delta is not None or on_stream_reset is not None
+                else None
+            )
+            return self._attempt(body, callback, projection_hash)
+
+        try:
+            return with_retries(attempt)
+        except RuntimeError:
+            if callback_failure is not None:
+                raise callback_failure
+            raise
 
     def _attempt(
         self,

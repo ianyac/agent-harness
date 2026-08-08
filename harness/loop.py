@@ -61,6 +61,7 @@ def run_turn(
     on_compact: Callable[[int], None] | None = None,
     breadcrumbs: str | Callable[[], str] | None = None,
     on_text_delta: Callable[[str], None] | None = None,
+    on_stream_reset: Callable[[], None] | None = None,
     context: FoldingContext | None = None,
 ) -> dict:
     if context is not None and compact_threshold is not None:
@@ -101,7 +102,11 @@ def run_turn(
                     on_compact(summarized)
         # Streaming stays opt-in; folding additionally carries its persisted
         # projection hash so retries can identify the exact request bytes.
-        extra = {"on_text_delta": on_text_delta} if on_text_delta is not None else {}
+        extra = {}
+        if on_text_delta is not None:
+            extra["on_text_delta"] = on_text_delta
+        if on_stream_reset is not None:
+            extra["on_stream_reset"] = on_stream_reset
         outgoing = context.project(messages) if context is not None else messages
         request_hash = None
         if context is not None:

@@ -8,6 +8,7 @@ class FakeLLM:
 
     {"type": "text", "content": "hi"}
     {"type": "tool_calls", "calls": [{"name": ..., "arguments": {...}}, ...]}
+    {"type": "stream_reset"}  # then continue to the following output directive
 
     Each entry is wrapped into a turn record — a full I/O trace of one
     exchange once played:  {"output": <scripted directive>,
@@ -35,38 +36,43 @@ class FakeLLM:
         tools: list[dict] | None = None,
         system: str | None = None,
         on_text_delta: Callable[[str], None] | None = None,
+        on_stream_reset: Callable[[], None] | None = None,
         projection_hash: str | None = None,
     ) -> dict:
-        turn = self.turns[self.current_line]
-        self.current_line += 1
-        turn["messages"] = deepcopy(messages)
-        turn["tools"] = deepcopy(tools)
-        turn["system"] = system
-        turn["projection_hash"] = projection_hash
-        entry = turn["output"]
-        match entry["type"]:
-            case "text":
-                self._stream(entry["content"], on_text_delta)
-                return {"role": "assistant", "content": entry["content"]}
-            case "tool_calls":
-                # optional "content": a reply may narrate before its calls,
-                # and that narration streams like any other text
-                self._stream(entry.get("content"), on_text_delta)
-                return {
-                    "role": "assistant",
-                    "content": entry.get("content"),
-                    "tool_calls": [
-                        # raw_arguments scripts a model emitting broken JSON
-                        self._tool_call(
-                            c["name"],
-                            c["arguments"],
-                            raw=c.get("raw_arguments"),
-                        )
-                        for c in entry["calls"]
-                    ],
-                }
-            case unknown:
-                raise ValueError(f"unknown FakeLLM script entry type {unknown!r}")
+        while True:
+            turn = self.turns[self.current_line]
+            self.current_line += 1
+            turn["messages"] = deepcopy(messages)
+            turn["tools"] = deepcopy(tools)
+            turn["system"] = system
+            turn["projection_hash"] = projection_hash
+            entry = turn["output"]
+            match entry["type"]:
+                case "stream_reset":
+                    if on_stream_reset is not None:
+                        on_stream_reset()
+                case "text":
+                    self._stream(entry["content"], on_text_delta)
+                    return {"role": "assistant", "content": entry["content"]}
+                case "tool_calls":
+                    # optional "content": a reply may narrate before its calls,
+                    # and that narration streams like any other text
+                    self._stream(entry.get("content"), on_text_delta)
+                    return {
+                        "role": "assistant",
+                        "content": entry.get("content"),
+                        "tool_calls": [
+                            # raw_arguments scripts a model emitting broken JSON
+                            self._tool_call(
+                                c["name"],
+                                c["arguments"],
+                                raw=c.get("raw_arguments"),
+                            )
+                            for c in entry["calls"]
+                        ],
+                    }
+                case unknown:
+                    raise ValueError(f"unknown FakeLLM script entry type {unknown!r}")
 
     def _stream(self, content, on_text_delta) -> None:
         if not content or on_text_delta is None:

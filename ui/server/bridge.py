@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import queue
 import threading
 from collections.abc import Callable
@@ -11,7 +12,11 @@ from typing import Literal
 
 from harness.llm import LLMClient
 from pydantic import TypeAdapter
-from server.protocol import PermissionDecision, ServerEvent
+from server.protocol import (
+    PermissionDecision,
+    ServerEvent,
+    validate_unicode_scalars,
+)
 
 
 class TurnCancelled(Exception):
@@ -262,6 +267,7 @@ class CancellableLLM:
 
         def text_delta(text: str) -> None:
             self._token.check()
+            validate_unicode_scalars(text)
             if on_text_delta is not None:
                 on_text_delta(text)
             self._token.check()
@@ -283,6 +289,24 @@ class CancellableLLM:
             ),
         )
         self._token.check()
+        validate_unicode_scalars(reply)
+        if isinstance(reply, dict):
+            calls = reply.get("tool_calls")
+            if isinstance(calls, list):
+                for call in calls:
+                    if not isinstance(call, dict):
+                        continue
+                    function = call.get("function")
+                    if not isinstance(function, dict):
+                        continue
+                    raw_arguments = function.get("arguments")
+                    if not isinstance(raw_arguments, str):
+                        continue
+                    try:
+                        arguments = json.loads(raw_arguments)
+                    except json.JSONDecodeError:
+                        continue
+                    validate_unicode_scalars(arguments)
         return reply
 
 

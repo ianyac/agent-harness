@@ -74,7 +74,7 @@ class MetadataStore:
             self._connection.execute("PRAGMA journal_mode=WAL")
             self._connection.execute("PRAGMA foreign_keys=ON")
             self._initialize_schema()
-        except Exception:
+        except BaseException:
             self.close()
             raise
 
@@ -207,7 +207,7 @@ class MetadataStore:
                     now,
                 ),
             )
-        return self._required_session(session.session_id)
+            return self._required_session(session.session_id)
 
     def get_session(self, session_id: str) -> SessionRecord | None:
         row = self._get_session_row(session_id)
@@ -228,7 +228,7 @@ class MetadataStore:
             )
             if result.rowcount != 1:
                 raise KeyError(session_id)
-        return self._required_session(session_id)
+            return self._required_session(session_id)
 
     def set_session_mode(self, session_id: str, mode: str) -> SessionRecord:
         if mode not in STARTUP_MODES:
@@ -254,7 +254,7 @@ class MetadataStore:
             )
             if result.rowcount != 1:
                 raise KeyError(session_id)
-        return self._required_session(session_id)
+            return self._required_session(session_id)
 
     def archive_session(self, session_id: str) -> SessionRecord:
         now = self._now()
@@ -268,7 +268,7 @@ class MetadataStore:
             )
             if result.rowcount != 1:
                 raise KeyError(session_id)
-        return self._required_session(session_id)
+            return self._required_session(session_id)
 
     def upsert_discovered_session(self, session: NewSession) -> SessionRecord:
         session = self._validated_session(session)
@@ -296,7 +296,7 @@ class MetadataStore:
                     now,
                 ),
             )
-        return self._required_session(session.session_id)
+            return self._required_session(session.session_id)
 
     def get_preference(self, key: str) -> PreferenceRecord | None:
         row = self._connection.execute(
@@ -321,9 +321,10 @@ class MetadataStore:
                 """,
                 (key, value_json, now),
             )
-        preference = self.get_preference(key)
-        assert preference is not None
-        return preference
+            preference = self.get_preference(key)
+            if preference is None:
+                raise RuntimeError("preference write did not produce a row")
+            return preference
 
     def raw_session_columns(self) -> tuple[str, ...]:
         return tuple(

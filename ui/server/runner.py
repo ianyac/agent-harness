@@ -24,6 +24,7 @@ from server.bridge import (
     rollback_to_boundary,
 )
 from server.registry import build_system
+from server.protocol import MalformedUnicodeError, validate_unicode_scalars
 from server.runtime import HarnessRuntime
 
 
@@ -43,6 +44,10 @@ _current_activity: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "ui_current_activity", default=None
 )
 _runtime_setup_lock = threading.Lock()
+
+
+class _MalformedToolPayload(BaseException):
+    """Escape the harness's ordinary tool-error conversion for unsafe data."""
 
 
 def _timestamp() -> str:
@@ -74,7 +79,8 @@ def _activity_tool(tool: Tool) -> Tool:
         started_at = _timestamp()
         started = time.monotonic_ns()
         actor = "subagent" if tool.spawns_subagents else "tool"
-        context.sink.emit(
+        _emit_activity_event(
+            context,
             "activity_started",
             turn_id=context.turn_id,
             activity_id=activity_id,
@@ -90,7 +96,8 @@ def _activity_tool(tool: Tool) -> Tool:
                 result = execute(**args)
             except Exception as error:
                 rendered = f"Error: {type(error).__name__}: {error}"
-                context.sink.emit(
+                _emit_activity_event(
+                    context,
                     "activity_completed",
                     turn_id=context.turn_id,
                     activity_id=activity_id,
@@ -104,7 +111,8 @@ def _activity_tool(tool: Tool) -> Tool:
                     duration_ms=(time.monotonic_ns() - started) // 1_000_000,
                 )
                 raise
-            context.sink.emit(
+            _emit_activity_event(
+                context,
                 "activity_completed",
                 turn_id=context.turn_id,
                 activity_id=activity_id,
@@ -126,6 +134,20 @@ def _activity_tool(tool: Tool) -> Tool:
     return replace(tool, execute=observed_execute)
 
 
+def _emit_activity_event(
+    context: _TurnContext,
+    event_type: str,
+    **payload: object,
+) -> None:
+    try:
+        validate_unicode_scalars(payload)
+    except MalformedUnicodeError as error:
+        raise _MalformedToolPayload(
+            "malformed Unicode string in tool activity data"
+        ) from error
+    context.sink.emit(event_type, **payload)
+
+
 def _prepare_runtime(runtime: HarnessRuntime) -> threading.Lock:
     with _runtime_setup_lock:
         turn_lock = getattr(runtime, "_ui_turn_lock", None)
@@ -139,7 +161,9 @@ def _prepare_runtime(runtime: HarnessRuntime) -> threading.Lock:
         return turn_lock
 
 
-def _error_category(error: Exception) -> str:
+def _error_category(error: BaseException) -> str:
+    if isinstance(error, _MalformedToolPayload):
+        return "invalid_response"
     if isinstance(
         error,
         (TimeoutError, ConnectionError, httpx.TransportError, RetryableHTTPError),
@@ -193,6 +217,8 @@ class TurnRunner:
         turn_context: contextvars.Token[_TurnContext | None] | None = None
         activity_context: contextvars.Token[str | None] | None = None
         try:
+            if getattr(runtime, "_ui_durability_failed", False):
+                self._restore_authoritative_messages()
             runtime.policy.mode = (
                 "plan" if mode == "plan" else runtime.policy.base_mode
             )
@@ -206,7 +232,9 @@ class TurnRunner:
                 text,
                 CancellableLLM(runtime.llm, token),
                 tools=runtime.tools,
-                on_tool_call=lambda _name, _args: token.check(),
+                on_tool_call=lambda name, args: self._validate_tool_call(
+                    name, args, token
+                ),
                 policy=runtime.policy,
                 asker=self._ask_permission,
                 system=lambda: build_system(runtime),
@@ -223,7 +251,7 @@ class TurnRunner:
             )
             token.check()
             self._restore_base_mode(context)
-            runtime.session_log.record_turn(runtime.messages)
+            self._record_authoritative_turn()
             sink.emit(
                 "turn_completed",
                 turn_id=turn_id,
@@ -232,6 +260,8 @@ class TurnRunner:
             )
         except TurnCancelled:
             self._finish_cancelled(sink, turn_id)
+        except _MalformedToolPayload as error:
+            self._finish_failed(sink, turn_id, error)
         except Exception as error:
             self._finish_failed(sink, turn_id, error)
         finally:
@@ -260,7 +290,7 @@ class TurnRunner:
         self,
         sink: EventSink,
         turn_id: str,
-        error: Exception,
+        error: BaseException,
     ) -> None:
         try:
             rollback_to_boundary(self.runtime.messages)
@@ -273,7 +303,7 @@ class TurnRunner:
             "turn_failed",
             turn_id=turn_id,
             error_category=_error_category(error),
-            message=str(error),
+            message=self._safe_error_message(error),
         )
 
     def _restore_base_mode_safely(self) -> None:
@@ -317,6 +347,16 @@ class TurnRunner:
         context.token.check()
         return answer
 
+    @staticmethod
+    def _validate_tool_call(
+        name: str,
+        args: dict,
+        token: CancellationToken,
+    ) -> None:
+        token.check()
+        validate_unicode_scalars({"name": name, "args": args})
+        token.check()
+
     def _review_plan(self, plan: str) -> tuple[bool, str]:
         context = self._require_context()
         context.token.check()
@@ -347,7 +387,12 @@ class TurnRunner:
         context = self._require_context()
         context.token.check()
         summary = context.runtime.messages[0]
-        context.runtime.session_log.record_compaction(cut, summary)
+        validate_unicode_scalars(context.runtime.messages)
+        try:
+            context.runtime.session_log.record_compaction(cut, summary)
+        except Exception as error:
+            self._restore_authoritative_messages_after(error)
+            raise
         context.sink.emit(
             "context_updated",
             turn_id=context.turn_id,
@@ -356,12 +401,51 @@ class TurnRunner:
         context.token.check()
 
     def _record_surviving_boundary(self) -> None:
+        if getattr(self.runtime, "_ui_durability_failed", False):
+            try:
+                self._restore_authoritative_messages()
+            except Exception:
+                return
+            return
         try:
-            self.runtime.session_log.record_turn(self.runtime.messages)
+            self._record_authoritative_turn()
         except Exception:
-            # The original turn failure remains authoritative. A later resume
-            # heals an incomplete append back to its last complete boundary.
+            # The original turn failure remains authoritative. The helper has
+            # already restored the live list and SessionLog cursor from disk.
             pass
+
+    def _record_authoritative_turn(self) -> None:
+        try:
+            validate_unicode_scalars(self.runtime.messages)
+            self.runtime.session_log.record_turn(self.runtime.messages)
+        except Exception as error:
+            self._restore_authoritative_messages_after(error)
+            raise
+
+    def _restore_authoritative_messages_after(self, original: Exception) -> None:
+        try:
+            self._restore_authoritative_messages()
+        except Exception as recovery_error:
+            setattr(self.runtime, "_ui_durability_failed", True)
+            original.add_note(
+                "authoritative transcript reload failed: "
+                f"{type(recovery_error).__name__}: {recovery_error}"
+            )
+
+    def _restore_authoritative_messages(self) -> None:
+        restored = self.runtime.session_log.load()
+        validate_unicode_scalars(restored)
+        self.runtime.messages[:] = copy.deepcopy(restored)
+        setattr(self.runtime, "_ui_durability_failed", False)
+
+    @staticmethod
+    def _safe_error_message(error: BaseException) -> str:
+        message = str(error)
+        try:
+            validate_unicode_scalars(message)
+        except MalformedUnicodeError:
+            return "upstream failure contained malformed Unicode"
+        return message
 
     @staticmethod
     def _require_context() -> _TurnContext:

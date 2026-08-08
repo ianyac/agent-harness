@@ -7,13 +7,16 @@ import copy
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
+import pwd
 import re
 import secrets
 import sqlite3
 import stat
+import sys
 import threading
 from typing import Callable, cast
 import uuid
@@ -32,6 +35,7 @@ from server.protocol import (
     QueuedMessage,
     SetSessionMode,
     UserMessage,
+    validate_unicode_scalars,
 )
 from server.runner import TurnRunner
 from server.runtime import HarnessRuntime, RuntimeConfig
@@ -66,6 +70,19 @@ _CREATE_READ_WRITE_FLAGS = (
 _CREDENTIAL_MESSAGE = "Codex credentials are required. Run `codex login` and retry."
 _PROCESS_LEASES_GUARD = threading.Lock()
 _PROCESS_LEASES: dict[tuple[int, int, int, str], object] = {}
+
+
+def _coordination_root_path() -> Path:
+    """Return an environment-independent per-user coordination domain."""
+
+    home = Path(pwd.getpwuid(os.geteuid()).pw_dir)
+    if not home.is_absolute():
+        raise SessionResumeError("session coordination home is unsafe")
+    if sys.platform == "darwin":
+        parent = home / "Library" / "Caches"
+    else:
+        parent = home / ".cache"
+    return parent / "agent-harness-ui-session-locks-v1"
 
 
 class InvalidSessionId(ValueError):
@@ -203,6 +220,7 @@ class _SessionChannel:
         self.runner: TurnRunner | None = None
         self.worker: asyncio.Task[None] | None = None
         self.shutting_down = False
+        self.lifecycle = "active"
 
     def connect(self, loop: asyncio.AbstractEventLoop) -> SessionConnection:
         if self.shutting_down:
@@ -350,6 +368,8 @@ class _SessionChannel:
                 self._start_turn(queued.text, queued.mode, owner)
 
     def begin_shutdown(self) -> None:
+        if self.lifecycle == "active":
+            self.lifecycle = "draining"
         self.shutting_down = True
         self.queued_message = None
         if self.current is not None:
@@ -361,10 +381,14 @@ class _SessionChannel:
         if self.token is not None:
             self.token.cancel()
 
+    def mark_cleanup_failed(self) -> None:
+        self.lifecycle = "cleanup_failed"
+        self.shutting_down = True
+
     async def wait_for_worker(self) -> None:
         worker = self.worker
         if worker is not None:
-            await worker
+            await asyncio.shield(worker)
 
 
 class CodexCredentialFactory:
@@ -445,20 +469,39 @@ class _DescriptorSessionLog(SessionLog):
     """SessionLog whose reads, healing, and appends stay on one opened inode."""
 
     def __init__(self, descriptor: int) -> None:
+        self._io_lock = threading.RLock()
         self._descriptor = descriptor
         self._opened_path = _OpenedSessionPath(descriptor)
         super().__init__(cast(Path, self._opened_path))
 
     def replace_descriptor(self, descriptor: int) -> None:
-        self._descriptor = descriptor
-        self._opened_path.replace_descriptor(descriptor)
+        with self._io_lock:
+            self._descriptor = descriptor
+            self._opened_path.replace_descriptor(descriptor)
+
+    def load(self) -> list[dict]:
+        with self._io_lock:
+            messages = super().load()
+            validate_unicode_scalars(messages)
+            return messages
+
+    def record_turn(self, messages: list[dict]) -> None:
+        with self._io_lock:
+            validate_unicode_scalars(messages)
+            super().record_turn(messages)
+
+    def record_compaction(self, cut: int, summary: dict) -> None:
+        with self._io_lock:
+            validate_unicode_scalars(summary)
+            super().record_compaction(cut, summary)
 
     def _append(self, payload: str) -> None:
-        encoded = payload.encode()
-        os.lseek(self._descriptor, 0, os.SEEK_END)
-        written = 0
-        while written < len(encoded):
-            written += os.write(self._descriptor, encoded[written:])
+        with self._io_lock:
+            encoded = payload.encode()
+            os.lseek(self._descriptor, 0, os.SEEK_END)
+            written = 0
+            while written < len(encoded):
+                written += os.write(self._descriptor, encoded[written:])
 
 
 @dataclass
@@ -504,6 +547,121 @@ class _ProcessLeaseClaim:
         self.released = True
 
 
+@dataclass
+class _CoordinationLeaseClaim:
+    """OS-backed authority for one canonical workspace/session pair."""
+
+    descriptor: int | None
+
+    @staticmethod
+    def _open_root() -> int:
+        root = _coordination_root_path()
+        try:
+            root.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            parent_descriptor = os.open(root.parent, _DIRECTORY_FLAGS)
+        except OSError as error:
+            raise SessionResumeError(
+                "session coordination root is unavailable or unsafe"
+            ) from error
+        try:
+            try:
+                os.mkdir(root.name, 0o700, dir_fd=parent_descriptor)
+            except FileExistsError:
+                pass
+            try:
+                descriptor = os.open(
+                    root.name,
+                    _DIRECTORY_FLAGS,
+                    dir_fd=parent_descriptor,
+                )
+            except OSError as error:
+                raise SessionResumeError(
+                    "session coordination root is unavailable or unsafe"
+                ) from error
+        finally:
+            os.close(parent_descriptor)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or opened.st_uid != os.geteuid()
+        ):
+            os.close(descriptor)
+            raise SessionResumeError("session coordination root is unsafe")
+        try:
+            os.fchmod(descriptor, 0o700)
+        except OSError:
+            os.close(descriptor)
+            raise
+        return descriptor
+
+    @classmethod
+    def acquire(
+        cls,
+        workspace_descriptor: int,
+        session_id: str,
+    ) -> _CoordinationLeaseClaim:
+        workspace = os.fstat(workspace_descriptor)
+        material = (
+            f"v1\0{workspace.st_dev}\0{workspace.st_ino}\0{session_id}"
+        ).encode("utf-8")
+        name = f"{hashlib.sha256(material).hexdigest()}.lock"
+        root_descriptor = cls._open_root()
+        descriptor: int | None = None
+        try:
+            try:
+                descriptor = os.open(
+                    name,
+                    _LOCK_FLAGS,
+                    0o600,
+                    dir_fd=root_descriptor,
+                )
+            except OSError as error:
+                raise SessionResumeError(
+                    "session coordination lock is unavailable or unsafe"
+                ) from error
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_uid != os.geteuid()
+                or opened.st_nlink != 1
+            ):
+                raise SessionResumeError("session coordination lock is unsafe")
+            os.fchmod(descriptor, 0o600)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise SessionResumeError("session is already in use") from error
+            anchor = os.stat(name, dir_fd=root_descriptor, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(anchor.st_mode)
+                or (anchor.st_dev, anchor.st_ino)
+                != (opened.st_dev, opened.st_ino)
+            ):
+                raise SessionResumeError("session coordination lock changed")
+            payload = (
+                f"pid={os.getpid()} workspace={workspace.st_dev}:{workspace.st_ino} "
+                f"session={session_id}\n"
+            ).encode("utf-8")
+            os.ftruncate(descriptor, 0)
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            written = 0
+            while written < len(payload):
+                written += os.write(descriptor, payload[written:])
+            claim = cls(descriptor)
+            descriptor = None
+            return claim
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            os.close(root_descriptor)
+
+    def release(self) -> None:
+        if self.descriptor is None:
+            return
+        os.close(self.descriptor)
+        self.descriptor = None
+
+
 class _SecureSessionLease:
     """Private live artifacts plus atomic public publication and one lock."""
 
@@ -518,6 +676,7 @@ class _SecureSessionLease:
         lock_descriptor: int,
         lock_name: str,
         process_claim: _ProcessLeaseClaim,
+        coordination_claim: _CoordinationLeaseClaim,
     ) -> None:
         self._directory_descriptors = list(directory_descriptors)
         self._stage_descriptor: int | None = stage_descriptor
@@ -532,6 +691,9 @@ class _SecureSessionLease:
         self._lock_descriptor: int | None = lock_descriptor
         self._lock_name = lock_name
         self._process_claim: _ProcessLeaseClaim | None = process_claim
+        self._coordination_claim: _CoordinationLeaseClaim | None = (
+            coordination_claim
+        )
         self._publications: dict[str, _Publication] = {}
         self._committed = False
         self.session_path = stage_path / session_name
@@ -908,6 +1070,12 @@ class _SecureSessionLease:
             self._process_claim.release()
             self._process_claim = None
 
+    def _release_coordination(self) -> None:
+        if self._coordination_claim is None:
+            return
+        self._coordination_claim.release()
+        self._coordination_claim = None
+
     def _remove_stage(self) -> None:
         if self._stage_descriptor is not None:
             errors: list[BaseException] = []
@@ -963,6 +1131,7 @@ class _SecureSessionLease:
         self._release_lock()
         self._remove_stage()
         self._close_directories()
+        self._release_coordination()
 
     def abort(self) -> None:
         if (
@@ -977,6 +1146,7 @@ class _SecureSessionLease:
         self._release_lock()
         self._remove_stage()
         self._close_directories()
+        self._release_coordination()
 
 
 def validate_session_id(session_id: object) -> str:
@@ -1002,6 +1172,7 @@ class SessionManager:
         self._compact_threshold = compact_threshold
         self._runtimes: dict[str, HarnessRuntime] = {}
         self._channels: dict[str, _SessionChannel] = {}
+        self._session_lifecycle: dict[str, str] = {}
         self._runtime_lock = asyncio.Lock()
         self._closed = False
         self._metadata_closed = False
@@ -1435,9 +1606,11 @@ class SessionManager:
         *,
         create_session: bool,
     ) -> _SecureSessionLease:
+        session_id = validate_session_id(session_id)
         directory_descriptors = cls._open_session_directory_descriptors(workspace)
         sessions_descriptor = directory_descriptors[-1]
         process_claim: _ProcessLeaseClaim | None = None
+        coordination_claim: _CoordinationLeaseClaim | None = None
         lock_descriptor: int | None = None
         stage_descriptor: int | None = None
         stage_name: str | None = None
@@ -1448,6 +1621,10 @@ class SessionManager:
         cleanup_errors: list[BaseException] = []
         try:
             process_claim = _ProcessLeaseClaim.acquire(
+                directory_descriptors[0],
+                session_id,
+            )
+            coordination_claim = _CoordinationLeaseClaim.acquire(
                 directory_descriptors[0],
                 session_id,
             )
@@ -1579,6 +1756,7 @@ class SessionManager:
                 lock_descriptor,
                 lock_name,
                 process_claim,
+                coordination_claim,
             )
             if create_session:
                 lease._publish_initial_session()
@@ -1586,6 +1764,7 @@ class SessionManager:
             lock_descriptor = None
             stage_descriptor = None
             process_claim = None
+            coordination_claim = None
             return lease
         except BaseException as primary:
             if staged_descriptor is not None:
@@ -1645,6 +1824,17 @@ class SessionManager:
                 for _attempt in range(2):
                     try:
                         process_claim.release()
+                    except BaseException as error:
+                        release_errors.append(error)
+                        continue
+                    break
+                else:
+                    cleanup_errors.extend(release_errors)
+            if coordination_claim is not None:
+                release_errors = []
+                for _attempt in range(2):
+                    try:
+                        coordination_claim.release()
                     except BaseException as error:
                         release_errors.append(error)
                         continue
@@ -1960,6 +2150,9 @@ class SessionManager:
     def _open_runtime_locked(self, session_id: object) -> HarnessRuntime:
         self._ensure_open()
         record = self._required_record(session_id)
+        lifecycle = self._session_lifecycle.get(record.session_id)
+        if lifecycle is not None:
+            raise SessionResumeError(f"session cleanup is {lifecycle}")
         existing = self._runtimes.get(record.session_id)
         if existing is not None:
             self._safe_session_path(
@@ -2003,6 +2196,9 @@ class SessionManager:
         async with self._runtime_lock:
             self._ensure_open()
             record = self._required_record(session_id)
+            lifecycle = self._session_lifecycle.get(record.session_id)
+            if lifecycle is not None:
+                raise SessionResumeError(f"session cleanup is {lifecycle}")
             self._safe_session_path(
                 record.workspace,
                 record.session_id,
@@ -2011,7 +2207,12 @@ class SessionManager:
             )
             runtime = self._runtimes.get(record.session_id)
             if runtime is not None:
-                return copy.deepcopy(runtime.messages)
+                try:
+                    return copy.deepcopy(runtime.session_log.load())
+                except SessionResumeError:
+                    raise
+                except (KeyError, OSError, ValueError) as error:
+                    raise SessionResumeError(str(error)) from None
             try:
                 return self._load_verified_transcript(
                     record.workspace, record.session_id
@@ -2037,16 +2238,31 @@ class SessionManager:
         async with self._runtime_lock:
             self._ensure_open()
             record = self._required_record(session_id)
+            self._session_lifecycle[record.session_id] = "draining"
             channel = self._channels.get(record.session_id)
             if channel is not None:
                 channel.begin_shutdown()
                 await channel.wait_for_worker()
-                self._channels.pop(record.session_id, None)
             runtime = self._runtimes.get(record.session_id)
             if runtime is not None:
-                runtime.close()
+                try:
+                    runtime.close()
+                except BaseException:
+                    self._session_lifecycle[record.session_id] = "cleanup_failed"
+                    if channel is not None:
+                        channel.mark_cleanup_failed()
+                    raise
                 self._runtimes.pop(record.session_id, None)
-            self.metadata.archive_session(record.session_id)
+                self._channels.pop(record.session_id, None)
+            try:
+                self.metadata.archive_session(record.session_id)
+            except BaseException:
+                self._session_lifecycle[record.session_id] = "cleanup_failed"
+                if channel is not None:
+                    channel.mark_cleanup_failed()
+                raise
+            self._channels.pop(record.session_id, None)
+            self._session_lifecycle.pop(record.session_id, None)
 
     @staticmethod
     def _abort_after_failure(
@@ -2077,22 +2293,36 @@ class SessionManager:
         errors: list[Exception] = []
         async with self._runtime_lock:
             self._closed = True
-            for channel in tuple(self._channels.values()):
+            for session_id, channel in tuple(self._channels.items()):
+                self._session_lifecycle[session_id] = "draining"
                 channel.begin_shutdown()
+            worker_ready: set[str] = set()
             for session_id, channel in tuple(self._channels.items()):
                 try:
                     await channel.wait_for_worker()
                 except Exception as error:
                     errors.append(error)
                 else:
-                    self._channels.pop(session_id, None)
+                    worker_ready.add(session_id)
             for session_id, runtime in tuple(self._runtimes.items()):
+                if session_id in self._channels and session_id not in worker_ready:
+                    continue
                 try:
                     runtime.close()
                 except Exception as error:
                     errors.append(error)
+                    self._session_lifecycle[session_id] = "cleanup_failed"
+                    channel = self._channels.get(session_id)
+                    if channel is not None:
+                        channel.mark_cleanup_failed()
                 else:
                     self._runtimes.pop(session_id, None)
+                    self._channels.pop(session_id, None)
+                    self._session_lifecycle.pop(session_id, None)
+            for session_id in worker_ready:
+                if session_id not in self._runtimes:
+                    self._channels.pop(session_id, None)
+                    self._session_lifecycle.pop(session_id, None)
             if not self._metadata_closed:
                 try:
                     self.metadata.close()

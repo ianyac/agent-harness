@@ -18,6 +18,7 @@ from server.context_mode import (
     resolve_context_mode,
 )
 from server.registry import PlanReviewer, build_registry
+from server.protocol import validate_unicode_scalars
 
 
 COMPACT_FRACTION = 0.8
@@ -148,6 +149,7 @@ class HarnessRuntime:
                 else SessionLog(self.session_path)
             )
             self.messages = self.session_log.load()
+            validate_unicode_scalars(self.messages)
             active_provider = (
                 default_provider()
                 if search_provider is _DEFAULT_SEARCH

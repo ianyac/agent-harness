@@ -7,6 +7,7 @@ import pytest
 import httpx
 
 from harness.llm import RetryableHTTPError
+from harness.session import SessionLog
 from harness.tools.base import Tool
 from server.bridge import CancellationToken, EventSink
 from server.runner import TurnRunner
@@ -106,6 +107,161 @@ async def test_runner_streams_text_and_completes_with_authoritative_messages(
     ]
     assert events[-1].messages == runtime.session_log.load()
     assert events[-1].final_text == "hello back"
+
+
+@pytest.mark.asyncio
+async def test_partial_record_failure_reloads_authority_before_later_turn(
+    make_runtime,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    runtime = make_runtime(
+        FakeLLM(
+            [
+                {"type": "text", "content": "first answer"},
+                {"type": "text", "content": "second answer"},
+            ]
+        )
+    )
+    original_append = runtime.session_log._append
+    failed = False
+
+    def append_partial_once(payload: str) -> None:
+        nonlocal failed
+        if not failed:
+            failed = True
+            original_append(payload.splitlines(keepends=True)[0])
+            raise OSError("injected partial append")
+        original_append(payload)
+
+    monkeypatch.setattr(runtime.session_log, "_append", append_partial_once)
+
+    first_sink = _sink()
+    await _run(TurnRunner(runtime), first_sink)
+    first_events = await _events_until(first_sink, "turn_failed")
+
+    assert first_events[-1].error_category == "filesystem"
+    assert runtime.messages == []
+    assert runtime.session_path.read_bytes() == b""
+
+    second_sink = EventSink("session", 2, asyncio.get_running_loop())
+    await _run(TurnRunner(runtime), second_sink)
+    second_events = await _events_until(second_sink, "turn_completed")
+    expected = [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "second answer"},
+    ]
+
+    assert second_events[-1].messages == expected
+    assert runtime.messages == expected
+    assert SessionLog(runtime.session_path).load() == expected
+
+
+@pytest.mark.parametrize("source", ["delta", "reply"])
+@pytest.mark.asyncio
+async def test_malformed_provider_unicode_fails_safely_without_poisoning_log(
+    make_runtime,
+    source: str,
+):
+    class MalformedProviderLLM:
+        context_window = 128_000
+
+        def complete(self, *_args, on_text_delta=None, **_kwargs):
+            if source == "delta":
+                assert on_text_delta is not None
+                on_text_delta("bad\ud800delta")
+                return {"role": "assistant", "content": "unreachable"}
+            return {"role": "assistant", "content": "bad\udfffreply"}
+
+    runtime = make_runtime(MalformedProviderLLM())
+    sink = _sink()
+    await _run(TurnRunner(runtime), sink)
+    events = []
+    while True:
+        event = await asyncio.wait_for(sink.next(), timeout=2)
+        events.append(event)
+        if event.type in {"turn_completed", "turn_cancelled", "turn_failed"}:
+            break
+
+    assert events[-1].type == "turn_failed"
+    assert events[-1].error_category == "invalid_response"
+    assert "malformed Unicode" in events[-1].message
+    events[-1].message.encode("utf-8")
+    assert runtime.messages == []
+    assert (
+        not runtime.session_path.exists()
+        or runtime.session_path.read_bytes() == b""
+    )
+
+
+@pytest.mark.asyncio
+async def test_malformed_tool_arguments_fail_before_activity_or_persistence(
+    make_runtime,
+):
+    llm = FakeLLM(
+        [
+            {
+                "type": "tool_calls",
+                "calls": [
+                    {"name": "echo", "arguments": {"value": "bad\ud800tool"}}
+                ],
+            },
+            {"type": "text", "content": "must not continue"},
+        ]
+    )
+    runtime = make_runtime(llm, mode="acceptAll")
+    runtime.tools["echo"] = _tool("echo", lambda **_kwargs: "ok")
+    sink = _sink()
+    await _run(TurnRunner(runtime), sink)
+    events = []
+    while True:
+        event = await asyncio.wait_for(sink.next(), timeout=2)
+        events.append(event)
+        if event.type in {"turn_completed", "turn_cancelled", "turn_failed"}:
+            break
+
+    assert events[-1].type == "turn_failed"
+    assert events[-1].error_category == "invalid_response"
+    assert "malformed Unicode" in events[-1].message
+    assert not any(event.type.startswith("activity_") for event in events)
+    assert runtime.messages == []
+    assert (
+        not runtime.session_path.exists()
+        or runtime.session_path.read_bytes() == b""
+    )
+
+
+@pytest.mark.asyncio
+async def test_malformed_tool_result_emits_safe_terminal_without_persistence(
+    make_runtime,
+):
+    llm = FakeLLM(
+        [
+            {
+                "type": "tool_calls",
+                "calls": [{"name": "echo", "arguments": {}}],
+            },
+            {"type": "text", "content": "must not continue"},
+        ]
+    )
+    runtime = make_runtime(llm, mode="acceptAll")
+    runtime.tools["echo"] = _tool("echo", lambda: "bad\udfffresult")
+    sink = _sink()
+    await _run(TurnRunner(runtime), sink)
+    events = []
+    while True:
+        event = await asyncio.wait_for(sink.next(), timeout=2)
+        events.append(event)
+        if event.type in {"turn_completed", "turn_cancelled", "turn_failed"}:
+            break
+
+    assert events[-1].type == "turn_failed"
+    assert events[-1].error_category == "invalid_response"
+    assert events[-1].message == "malformed Unicode string in tool activity data"
+    assert runtime.messages == []
+    assert (
+        not runtime.session_path.exists()
+        or runtime.session_path.read_bytes() == b""
+    )
 
 
 @pytest.mark.asyncio

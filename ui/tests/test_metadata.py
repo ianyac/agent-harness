@@ -204,3 +204,62 @@ def test_session_creation_rejects_modes_outside_public_contract(
                     context_mode=context_mode,
                 )
             )
+
+
+def test_create_session_record_construction_failure_rolls_back_insert(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    with MetadataStore(tmp_path / "ui.sqlite3") as store:
+        def fail_record(_row):
+            raise sqlite3.OperationalError("record construction failed")
+
+        monkeypatch.setattr(store, "_session_record", fail_record)
+
+        with pytest.raises(sqlite3.OperationalError, match="record construction"):
+            store.create_session(NewSession.defaults("ghost", tmp_path))
+
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM sessions WHERE session_id = 'ghost'"
+            ).fetchone()[0]
+            == 0
+        )
+
+
+@pytest.mark.parametrize(
+    "operation",
+    ["rename_session", "touch_session", "archive_session", "upsert_discovered_session"],
+)
+def test_mutation_return_construction_failure_is_transaction_atomic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+):
+    with MetadataStore(tmp_path / "ui.sqlite3") as store:
+        original = store.create_session(NewSession.defaults("s1", tmp_path / "one"))
+
+        def fail_record(_row):
+            raise sqlite3.OperationalError("record construction failed")
+
+        monkeypatch.setattr(store, "_session_record", fail_record)
+        with pytest.raises(sqlite3.OperationalError, match="record construction"):
+            if operation == "rename_session":
+                store.rename_session("s1", "Changed")
+            elif operation == "touch_session":
+                store.touch_session("s1")
+            elif operation == "archive_session":
+                store.archive_session("s1")
+            else:
+                store.upsert_discovered_session(
+                    NewSession(
+                        session_id="s1",
+                        workspace=tmp_path / "moved",
+                        title="Ignored",
+                        mode="readOnly",
+                        context_mode="folding",
+                    )
+                )
+
+        monkeypatch.undo()
+        assert store.get_session("s1") == original

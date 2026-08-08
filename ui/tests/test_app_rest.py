@@ -5,7 +5,11 @@ import json
 import os
 from pathlib import Path
 import shutil
+import sqlite3
+import subprocess
+import sys
 import threading
+import textwrap
 import warnings
 
 import pytest
@@ -21,7 +25,12 @@ with warnings.catch_warnings():
 
 from server.app import AppSettings, create_app
 from server.metadata import MetadataStore, NewSession
-from server.sessions import InvalidWorkspace, SessionManager
+from server.protocol import UserMessage
+from server.sessions import (
+    InvalidWorkspace,
+    SessionManager,
+    SessionResumeError,
+)
 
 
 ORIGIN = "http://testserver"
@@ -37,6 +46,21 @@ class FakeLLM:
 
     def complete(self, *_args, **_kwargs):
         raise AssertionError("REST tests must not call the model")
+
+
+class ArchiveBlockingLLM:
+    context_window = 128_000
+
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def complete(self, *_args, on_text_delta=None, **_kwargs):
+        if on_text_delta is not None:
+            on_text_delta("still running")
+        self.started.set()
+        assert self.release.wait(timeout=5)
+        return {"role": "assistant", "content": "finished"}
 
 
 @pytest.fixture
@@ -643,6 +667,81 @@ def test_transcript_uses_session_log_while_the_session_lock_is_held(
     assert_session_unlocked(session_path)
 
 
+def test_active_turn_transcript_stops_at_last_durable_boundary(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    llm = ArchiveBlockingLLM()
+    metadata = MetadataStore(tmp_path / "metadata.sqlite3")
+    manager = SessionManager(metadata, workspace, lambda: llm)
+
+    async def scenario() -> None:
+        record = await manager.create_session(
+            workspace=workspace,
+            mode="default",
+            context_mode="compaction",
+            title="Durable boundary",
+        )
+        connection = await manager.connect(record.session_id)
+        connection.dispatch(UserMessage(text="not durable yet", mode="base"))
+        assert await asyncio.to_thread(llm.started.wait, 5)
+        session_path = (
+            workspace / ".agent" / "sessions" / f"{record.session_id}.jsonl"
+        )
+
+        assert await manager.transcript(record.session_id) == []
+        assert session_path.read_bytes() == b""
+
+        llm.release.set()
+        await manager._channels[record.session_id].wait_for_worker()
+        assert await manager.transcript(record.session_id) == [
+            {"role": "user", "content": "not durable yet"},
+            {"role": "assistant", "content": "finished"},
+        ]
+        await manager.close()
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        llm.release.set()
+
+
+def test_prepoisoned_unicode_log_returns_typed_resume_error_without_mutation(
+    tmp_path: Path,
+):
+    workspace = tmp_path / "workspace"
+    session_path = workspace / ".agent" / "sessions" / "poisoned.jsonl"
+    session_path.parent.mkdir(parents=True)
+    session_path.write_text(
+        json.dumps(
+            {
+                "type": "message",
+                "message": {"role": "assistant", "content": "bad\ud800log"},
+            }
+        )
+        + "\n"
+    )
+    before = session_path.read_bytes()
+    settings = AppSettings(
+        metadata_path=tmp_path / "metadata.sqlite3",
+        base_workspace=workspace,
+        launch_secret=SECRET,
+        allowed_origins=frozenset({ORIGIN}),
+    )
+
+    with TestClient(
+        create_app(settings, FakeLLM),
+        base_url=ORIGIN,
+        headers=AUTH_HEADERS,
+    ) as test_client:
+        response = test_client.get("/api/sessions/poisoned/transcript")
+
+    assert response.status_code == 409
+    assert response.json()["error"]["type"] == "session_resume_error"
+    assert "malformed Unicode" in response.json()["error"]["message"]
+    response.content.decode("utf-8")
+    assert session_path.read_bytes() == before
+
+
 def test_safety_opens_the_reviewed_runtime_and_returns_public_snapshot(
     client: TestClient, workspace: Path
 ):
@@ -883,6 +982,118 @@ def test_manager_close_retries_final_stage_removal_without_residue(
             if runtime is not None:
                 runtime.close()
             await manager.close()
+
+    asyncio.run(scenario())
+
+
+def test_archive_cancellation_keeps_worker_owned_until_thread_finishes(
+    tmp_path: Path,
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    llm = ArchiveBlockingLLM()
+    metadata = MetadataStore(tmp_path / "metadata.sqlite3")
+    manager = SessionManager(metadata, workspace, lambda: llm)
+
+    async def scenario() -> None:
+        record = await manager.create_session(
+            workspace=workspace,
+            mode="default",
+            context_mode="compaction",
+            title="Cancellation",
+        )
+        connection = await manager.connect(record.session_id)
+        connection.dispatch(UserMessage(text="block", mode="base"))
+        assert await asyncio.to_thread(llm.started.wait, 5)
+        channel = manager._channels[record.session_id]
+        worker = channel.worker
+        assert worker is not None
+
+        archive = asyncio.create_task(manager.archive_session(record.session_id))
+        await asyncio.sleep(0)
+        assert channel.shutting_down
+        archive.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await archive
+
+        assert channel.worker is worker
+        assert not worker.done()
+        assert channel.running
+        assert record.session_id in manager._runtimes
+        assert record.session_id in manager._channels
+
+        retry = asyncio.create_task(manager.archive_session(record.session_id))
+        await asyncio.sleep(0)
+        assert not retry.done()
+        llm.release.set()
+        await retry
+
+        assert record.session_id not in manager._runtimes
+        assert record.session_id not in manager._channels
+        assert metadata.get_session(record.session_id).archived_at is not None
+        await manager.close()
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        llm.release.set()
+
+
+def test_archive_close_failure_is_non_reusable_and_retryable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    metadata = MetadataStore(tmp_path / "metadata.sqlite3")
+    manager = SessionManager(metadata, workspace, FakeLLM)
+    from server import sessions as sessions_module
+
+    async def scenario() -> None:
+        record = await manager.create_session(
+            workspace=workspace,
+            mode="default",
+            context_mode="compaction",
+            title="Close retry",
+        )
+        await manager.connect(record.session_id)
+        runtime = manager._runtimes[record.session_id]
+        channel = manager._channels[record.session_id]
+        stage_path = runtime._session_lease._stage_path
+        original_rmdir = sessions_module.os.rmdir
+        failed = False
+
+        def fail_final_stage_once(path, *args, **kwargs):
+            nonlocal failed
+            if path == stage_path.name and not failed:
+                failed = True
+                raise OSError("archive stage removal interrupted")
+            return original_rmdir(path, *args, **kwargs)
+
+        monkeypatch.setattr(sessions_module.os, "rmdir", fail_final_stage_once)
+
+        with pytest.raises(OSError, match="archive stage removal interrupted"):
+            await manager.archive_session(record.session_id)
+
+        assert manager._runtimes[record.session_id] is runtime
+        assert manager._channels[record.session_id] is channel
+        assert channel.shutting_down
+        assert metadata.get_session(record.session_id).archived_at is None
+        for operation in (
+            lambda: manager.open_runtime(record.session_id),
+            lambda: manager.connect(record.session_id),
+            lambda: manager.transcript(record.session_id),
+            lambda: manager.safety(record.session_id),
+        ):
+            with pytest.raises(SessionResumeError, match="cleanup"):
+                await operation()
+
+        await manager.archive_session(record.session_id)
+        assert not stage_path.exists()
+        assert record.session_id not in manager._runtimes
+        assert record.session_id not in manager._channels
+        assert metadata.get_session(record.session_id).archived_at is not None
+        await manager.close()
 
     asyncio.run(scenario())
 
@@ -1606,9 +1817,140 @@ def test_process_lease_serializes_concurrent_managers_after_lock_replacement(
         asyncio.run(second.close())
 
 
+def test_cross_process_lease_survives_public_lock_replacement(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    session_path = workspace / ".agent" / "sessions" / "cross-process.jsonl"
+    write_completed_session(session_path, "local")
+    lock_path = session_path.with_suffix(".lock")
+    lease = SessionManager._acquire_session_lease(
+        workspace,
+        "cross-process",
+        create_session=False,
+    )
+    owned_identity = (lock_path.stat().st_dev, lock_path.stat().st_ino)
+    lock_path.unlink()
+    lock_path.write_text("")
+    assert (lock_path.stat().st_dev, lock_path.stat().st_ino) != owned_identity
+
+    probe = textwrap.dedent(
+        """
+        import sys
+        from pathlib import Path
+        from server.sessions import SessionManager, SessionResumeError
+
+        try:
+            lease = SessionManager._acquire_session_lease(
+                Path(sys.argv[1]), "cross-process", create_session=False
+            )
+        except SessionResumeError as error:
+            print(f"BLOCKED:{error}")
+            raise SystemExit(3)
+        else:
+            print("ACQUIRED")
+            lease.close()
+        """
+    )
+
+    def run_probe() -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-c", probe, str(workspace)],
+            cwd=Path(__file__).parents[1],
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+
+    try:
+        blocked = run_probe()
+        assert blocked.returncode == 3, (blocked.stdout, blocked.stderr)
+        assert "BLOCKED:session is already in use" in blocked.stdout
+    finally:
+        lease.close()
+
+    acquired = run_probe()
+    assert acquired.returncode == 0, (acquired.stdout, acquired.stderr)
+    assert acquired.stdout.strip() == "ACQUIRED"
+
+
+def test_coordination_lock_allows_distinct_sessions_concurrently(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    first_path = workspace / ".agent" / "sessions" / "first.jsonl"
+    second_path = workspace / ".agent" / "sessions" / "second.jsonl"
+    write_completed_session(first_path, "one")
+    write_completed_session(second_path, "two")
+
+    first = SessionManager._acquire_session_lease(
+        workspace, "first", create_session=False
+    )
+    second = None
+    try:
+        second = SessionManager._acquire_session_lease(
+            workspace, "second", create_session=False
+        )
+    finally:
+        first.close()
+        if second is not None:
+            second.close()
+
+
+@pytest.mark.parametrize(
+    "unsafe_entry",
+    ["root_symlink", "root_file", "lock_symlink", "lock_directory"],
+)
+def test_coordination_domain_rejects_symlinks_and_nonregular_entries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unsafe_entry: str,
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    coordination_root = tmp_path / "runtime" / "agent-harness-ui"
+    coordination_root.parent.mkdir()
+    from server import sessions as sessions_module
+
+    monkeypatch.setattr(
+        sessions_module,
+        "_coordination_root_path",
+        lambda: coordination_root,
+    )
+    if unsafe_entry == "root_symlink":
+        outside = tmp_path / "outside-root"
+        outside.mkdir()
+        coordination_root.symlink_to(outside, target_is_directory=True)
+    elif unsafe_entry == "root_file":
+        coordination_root.write_text("not a directory")
+    else:
+        workspace_descriptor = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            claim = sessions_module._CoordinationLeaseClaim.acquire(
+                workspace_descriptor, "unsafe"
+            )
+            claim.release()
+        finally:
+            os.close(workspace_descriptor)
+        lock_path = next(coordination_root.glob("*.lock"))
+        lock_path.unlink()
+        if unsafe_entry == "lock_symlink":
+            outside = tmp_path / "outside-lock"
+            outside.write_text("external")
+            lock_path.symlink_to(outside)
+        else:
+            lock_path.mkdir()
+
+    workspace_descriptor = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(SessionResumeError, match="coordination"):
+            sessions_module._CoordinationLeaseClaim.acquire(
+                workspace_descriptor, "unsafe"
+            )
+    finally:
+        os.close(workspace_descriptor)
+
+
 @pytest.mark.parametrize(
     "failure_point",
-    ["session_descriptor", "lock_clear", "process_registry"],
+    ["session_descriptor", "lock_clear", "process_registry", "coordination"],
 )
 def test_secure_session_lease_release_is_retryable(
     tmp_path: Path,
@@ -1652,7 +1994,7 @@ def test_secure_session_lease_release_is_retryable(
             return original(descriptor, length)
 
         monkeypatch.setattr(sessions_module.os, "ftruncate", fail_once)
-    else:
+    elif failure_point == "process_registry":
         target = lease._process_claim
         original = sessions_module._ProcessLeaseClaim.release
         failed = False
@@ -1666,6 +2008,23 @@ def test_secure_session_lease_release_is_retryable(
 
         monkeypatch.setattr(
             sessions_module._ProcessLeaseClaim,
+            "release",
+            fail_once,
+        )
+    else:
+        target = lease._coordination_claim
+        original = sessions_module._CoordinationLeaseClaim.release
+        failed = False
+
+        def fail_once(claim):
+            nonlocal failed
+            if claim is target and not failed:
+                failed = True
+                raise OSError("coordination release interrupted")
+            return original(claim)
+
+        monkeypatch.setattr(
+            sessions_module._CoordinationLeaseClaim,
             "release",
             fail_once,
         )
@@ -2074,11 +2433,19 @@ def test_session_lease_close_retries_stage_removal_without_reclosing_descriptor(
     with pytest.raises(OSError, match="stage removal interrupted"):
         lease.close()
     assert stage_path.is_dir()
+    assert stage_close_calls == 1
+    assert lease._stage_descriptor is None
+    with pytest.raises(SessionResumeError, match="in use"):
+        SessionManager._acquire_session_lease(
+            workspace,
+            "stage-retry",
+            create_session=False,
+        )
 
     lease.close()
 
     assert not stage_path.exists()
-    assert stage_close_calls == 1
+    assert lease._stage_descriptor is None
 
 
 def test_new_empty_transcript_is_authoritative_then_deletion_is_a_conflict(
@@ -2128,6 +2495,51 @@ def test_new_empty_session_artifacts_roll_back_if_metadata_insert_fails(
             assert len(artifacts) == 1
             assert artifacts[0].suffix == ".lock"
             assert artifacts[0].read_text() == ""
+            assert manager._runtimes == {}
+        finally:
+            await manager.close()
+
+    asyncio.run(scenario())
+
+
+def test_session_record_construction_failure_leaves_no_ghost_row_or_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    metadata = MetadataStore(tmp_path / "metadata.sqlite3")
+    manager = SessionManager(metadata, workspace, FakeLLM)
+    session_id = "no-ghost"
+    monkeypatch.setattr(manager, "_new_session_id", lambda: session_id)
+
+    def fail_record(_row):
+        raise sqlite3.OperationalError("record construction failed")
+
+    monkeypatch.setattr(metadata, "_session_record", fail_record)
+
+    async def scenario() -> None:
+        try:
+            with pytest.raises(sqlite3.OperationalError, match="record construction"):
+                await manager.create_session(
+                    workspace=workspace,
+                    mode="default",
+                    context_mode="compaction",
+                    title="No ghost",
+                )
+            assert (
+                metadata._connection.execute(
+                    "SELECT COUNT(*) FROM sessions WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()[0]
+                == 0
+            )
+            sessions_dir = workspace / ".agent" / "sessions"
+            assert not (sessions_dir / f"{session_id}.jsonl").exists()
+            assert not any(
+                path.name.startswith(f".runtime-{session_id}-")
+                for path in sessions_dir.iterdir()
+            )
             assert manager._runtimes == {}
         finally:
             await manager.close()

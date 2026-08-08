@@ -12,6 +12,7 @@ from pydantic import (
     StringConstraints,
     TypeAdapter,
     field_validator,
+    model_validator,
 )
 
 
@@ -21,8 +22,52 @@ BaseMode = Literal["default", "acceptAll", "readOnly"]
 PermissionDecision = Literal["yes", "no", "always"]
 
 
+class MalformedUnicodeError(ValueError):
+    """A string contains a surrogate and cannot be encoded as UTF-8."""
+
+
+def validate_unicode_scalars(value: object) -> object:
+    """Reject malformed strings recursively without echoing unsafe content."""
+
+    seen: set[int] = set()
+
+    def validate(item: object) -> None:
+        if isinstance(item, str):
+            try:
+                item.encode("utf-8", errors="strict")
+            except UnicodeEncodeError as error:
+                raise MalformedUnicodeError(
+                    "malformed Unicode string in protocol data"
+                ) from error
+            return
+        if isinstance(item, dict):
+            identity = id(item)
+            if identity in seen:
+                return
+            seen.add(identity)
+            for key, nested in item.items():
+                validate(key)
+                validate(nested)
+            return
+        if isinstance(item, (list, tuple, set, frozenset)):
+            identity = id(item)
+            if identity in seen:
+                return
+            seen.add(identity)
+            for nested in item:
+                validate(nested)
+
+    validate(value)
+    return value
+
+
 class ProtocolModel(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def require_unicode_scalars(cls, value: object) -> object:
+        return validate_unicode_scalars(value)
 
 
 class _TextMessage(ProtocolModel):
@@ -241,4 +286,5 @@ ServerEvent = Annotated[
 
 def dump_server_event(event: ServerEvent) -> str:
     """Return a compact JSON text frame for a validated server event."""
+    validate_unicode_scalars(event.model_dump(mode="python"))
     return event.model_dump_json()

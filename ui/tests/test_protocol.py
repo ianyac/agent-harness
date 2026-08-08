@@ -215,3 +215,42 @@ def test_server_events_reject_extra_fields_independently():
             type="assistant_delta", session_id="s1", generation=1, sequence=1,
             text="hello", extra="nope",
         )
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda: AssistantDelta(
+            session_id="s1",
+            generation=1,
+            sequence=1,
+            turn_id="t1",
+            text="bad\ud800delta",
+        ),
+        lambda: ActivityCompleted(
+            session_id="s1",
+            generation=1,
+            sequence=1,
+            turn_id="t1",
+            activity_id="a1",
+            actor="tool",
+            name="read_file",
+            args={"nested": ["bad\udfffargument"]},
+            result={"content": "ok"},
+            is_error=False,
+            started_at="2026-08-08T00:00:00Z",
+            duration_ms=0,
+        ),
+        lambda: SessionSnapshot(
+            session_id="s1",
+            generation=1,
+            sequence=1,
+            messages=[{"role": "assistant", "content": "bad\ud800snapshot"}],
+            running=False,
+            safety={"mode": "default"},
+        ),
+    ],
+)
+def test_server_events_reject_malformed_unicode_recursively(factory):
+    with pytest.raises(ValidationError, match="malformed Unicode"):
+        factory()

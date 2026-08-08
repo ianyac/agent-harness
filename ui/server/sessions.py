@@ -589,6 +589,33 @@ class _CoordinationLeaseClaim:
 
         device_descriptor: int | None = None
         descriptor: int | None = None
+
+        def close_owned_descriptors(primary: BaseException) -> None:
+            cleanup_errors: list[BaseException] = []
+            for open_descriptor in (descriptor, device_descriptor):
+                if open_descriptor is None:
+                    continue
+                for _attempt in range(2):
+                    try:
+                        os.close(open_descriptor)
+                    except BaseException as error:
+                        cleanup_errors.append(error)
+                        continue
+                    break
+            if cleanup_errors:
+                primary.add_note(
+                    "coordination authority cleanup encountered: "
+                    + "; ".join(
+                        f"{type(error).__name__}: {error}"
+                        for error in cleanup_errors
+                    )
+                )
+                existing = tuple(getattr(primary, "cleanup_errors", ()))
+                primary.cleanup_errors = (  # type: ignore[attr-defined]
+                    *existing,
+                    *cleanup_errors,
+                )
+
         try:
             device_descriptor = os.open("/dev", _DIRECTORY_FLAGS)
             device = os.fstat(device_descriptor)
@@ -634,20 +661,28 @@ class _CoordinationLeaseClaim:
                 fcntl.fcntl(descriptor, command, lock)
             except BlockingIOError as error:
                 raise SessionResumeError("session is already in use") from error
-            result = descriptor
-            descriptor = None
-            return result
-        except SessionResumeError:
+        except SessionResumeError as primary:
+            close_owned_descriptors(primary)
             raise
         except (OSError, struct.error) as error:
-            raise SessionResumeError(
+            primary = SessionResumeError(
                 "session coordination authority is unavailable"
-            ) from error
-        finally:
-            if descriptor is not None:
-                os.close(descriptor)
-            if device_descriptor is not None:
-                os.close(device_descriptor)
+            )
+            close_owned_descriptors(primary)
+            raise primary from error
+        except BaseException as primary:
+            close_owned_descriptors(primary)
+            raise
+
+        try:
+            os.close(device_descriptor)
+        except BaseException as primary:
+            close_owned_descriptors(primary)
+            raise
+        device_descriptor = None
+        result = descriptor
+        descriptor = None
+        return result
 
     @staticmethod
     def _open_root() -> int:

@@ -2108,6 +2108,179 @@ def test_coordination_acquisition_failure_is_resource_atomic(
         os.close(workspace_descriptor)
 
 
+def test_authority_transfer_close_interruption_is_resource_atomic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    workspace_descriptor = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY)
+    from server import sessions as sessions_module
+
+    before_descriptors = len(os.listdir("/dev/fd"))
+    primary = OSError("injected temporary authority directory close failure")
+    device_descriptor: int | None = None
+    authority_descriptor: int | None = None
+    close_interrupted = False
+    original_open = sessions_module.os.open
+    original_close = sessions_module.os.close
+
+    def record_authority_open(path, flags, *args, **kwargs):
+        nonlocal device_descriptor, authority_descriptor
+        descriptor = original_open(path, flags, *args, **kwargs)
+        if path == "/dev":
+            device_descriptor = descriptor
+        elif path == "null" and kwargs.get("dir_fd") == device_descriptor:
+            authority_descriptor = descriptor
+        return descriptor
+
+    def interrupt_device_close_once(descriptor: int) -> None:
+        nonlocal close_interrupted
+        if descriptor == device_descriptor and not close_interrupted:
+            close_interrupted = True
+            raise primary
+        original_close(descriptor)
+
+    replacement = None
+    retry_error: BaseException | None = None
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(sessions_module.os, "open", record_authority_open)
+            patch.setattr(sessions_module.os, "close", interrupt_device_close_once)
+
+            with pytest.raises(BaseException) as raised:
+                sessions_module._CoordinationLeaseClaim._acquire_authority(
+                    os.fstat(workspace_descriptor),
+                    "authority-transfer-cleanup",
+                )
+
+        after_failure = len(os.listdir("/dev/fd"))
+        try:
+            replacement = sessions_module._CoordinationLeaseClaim._acquire_authority(
+                os.fstat(workspace_descriptor),
+                "authority-transfer-cleanup",
+            )
+        except BaseException as error:
+            retry_error = error
+        finally:
+            if replacement is not None:
+                os.close(replacement)
+        after_retry = len(os.listdir("/dev/fd"))
+
+        assert device_descriptor is not None
+        assert authority_descriptor is not None
+        assert raised.value is primary, (
+            raised.value,
+            f"fd_growth={after_failure - before_descriptors}",
+            retry_error,
+        )
+        assert getattr(raised.value, "cleanup_errors", ()) == ()
+        assert after_failure == before_descriptors
+        assert retry_error is None
+        assert after_retry == before_descriptors
+    finally:
+        for descriptor in (authority_descriptor, device_descriptor):
+            if descriptor is not None:
+                try:
+                    original_close(descriptor)
+                except OSError:
+                    pass
+        os.close(workspace_descriptor)
+
+
+def test_authority_acquisition_failure_cleanup_is_resource_atomic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    workspace_descriptor = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY)
+    from server import sessions as sessions_module
+
+    before_descriptors = len(os.listdir("/dev/fd"))
+    primary = SessionResumeError("injected authority acquisition failure")
+    cleanup_error = OSError("injected authority descriptor close failure")
+    device_descriptor: int | None = None
+    authority_descriptor: int | None = None
+    close_interrupted = False
+    original_open = sessions_module.os.open
+    original_close = sessions_module.os.close
+
+    def record_authority_open(path, flags, *args, **kwargs):
+        nonlocal device_descriptor, authority_descriptor
+        descriptor = original_open(path, flags, *args, **kwargs)
+        if path == "/dev":
+            device_descriptor = descriptor
+        elif path == "null" and kwargs.get("dir_fd") == device_descriptor:
+            authority_descriptor = descriptor
+        return descriptor
+
+    def fail_authority_acquisition(
+        _descriptor: int,
+        _command: int,
+        _lock: bytes,
+    ) -> None:
+        raise primary
+
+    def interrupt_authority_close_once(descriptor: int) -> None:
+        nonlocal close_interrupted
+        if descriptor == authority_descriptor and not close_interrupted:
+            close_interrupted = True
+            raise cleanup_error
+        original_close(descriptor)
+
+    replacement = None
+    retry_error: BaseException | None = None
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(sessions_module.os, "open", record_authority_open)
+            patch.setattr(sessions_module.fcntl, "fcntl", fail_authority_acquisition)
+            patch.setattr(
+                sessions_module.os,
+                "close",
+                interrupt_authority_close_once,
+            )
+
+            with pytest.raises(BaseException) as raised:
+                sessions_module._CoordinationLeaseClaim._acquire_authority(
+                    os.fstat(workspace_descriptor),
+                    "authority-acquisition-cleanup",
+                )
+
+        after_failure = len(os.listdir("/dev/fd"))
+        try:
+            replacement = sessions_module._CoordinationLeaseClaim._acquire_authority(
+                os.fstat(workspace_descriptor),
+                "authority-acquisition-cleanup",
+            )
+        except BaseException as error:
+            retry_error = error
+        finally:
+            if replacement is not None:
+                os.close(replacement)
+        after_retry = len(os.listdir("/dev/fd"))
+
+        assert device_descriptor is not None
+        assert authority_descriptor is not None
+        assert raised.value is primary, (
+            raised.value,
+            f"fd_growth={after_failure - before_descriptors}",
+            retry_error,
+        )
+        assert getattr(raised.value, "cleanup_errors", ()) == (cleanup_error,)
+        assert after_failure == before_descriptors
+        assert retry_error is None
+        assert after_retry == before_descriptors
+    finally:
+        for descriptor in (authority_descriptor, device_descriptor):
+            if descriptor is not None:
+                try:
+                    original_close(descriptor)
+                except OSError:
+                    pass
+        os.close(workspace_descriptor)
+
+
 @pytest.mark.parametrize(
     "failure_point",
     ["session_descriptor", "lock_clear", "process_registry", "coordination"],

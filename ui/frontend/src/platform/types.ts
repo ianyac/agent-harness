@@ -8,7 +8,7 @@ export interface PlatformAdapter {
   getServiceConnection(): Promise<ServiceConnection>;
   chooseWorkspace(): Promise<string | null>;
   notify(input: { title: string; body: string }): Promise<void>;
-  revealPath(path: string): Promise<void>;
+  openLogs?: () => Promise<void>;
 }
 
 const capabilityPattern = /^[A-Za-z0-9_-]{43}$/;

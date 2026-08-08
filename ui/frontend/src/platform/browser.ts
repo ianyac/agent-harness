@@ -82,6 +82,5 @@ export function createBrowserPlatform(
       return null;
     },
     async notify(): Promise<void> {},
-    async revealPath(): Promise<void> {},
   });
 }

@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ClientEvent, ServerEvent, SessionSnapshot } from "../protocol/types";
 import { createTauriPlatform } from "../platform/tauri";
 import type { BrowserEnvironment } from "../platform/browser";
-import type { ServiceConnection } from "../platform/types";
+import type { PlatformAdapter, ServiceConnection } from "../platform/types";
 import { ApiClient } from "./http";
 import {
   SessionSocket,
@@ -216,6 +216,22 @@ describe("SessionSocket", () => {
     session.dispose();
   });
 
+  it("sends buffered commands before commands sent reentrantly by snapshot subscribers", () => {
+    const { session, sockets } = openSession();
+    const active = sockets.latest();
+    const buffered: ClientEvent = { type: "send_message", text: "start", mode: "base" };
+    const reentrant: ClientEvent = { type: "cancel_turn", turn_id: "t1" };
+    session.send(buffered);
+    session.subscribe((state) => {
+      if (state.lastSequence === 1) session.send(reentrant);
+    });
+
+    active.receive(snapshot());
+
+    expect(active.sent).toEqual([JSON.stringify(buffered), JSON.stringify(reentrant)]);
+    session.dispose();
+  });
+
   it("keeps a reentrant replacement gated until that socket receives its own snapshot", () => {
     const { session, sockets } = openSession();
     const first = sockets.latest();
@@ -269,6 +285,31 @@ describe("SessionSocket", () => {
     vi.advanceTimersByTime(1_000);
 
     expect(sockets.instances).toHaveLength(2);
+    session.dispose();
+  });
+
+  it("retires a protocol-failed socket before notification sends and clears the error after recovery", () => {
+    const { session, sockets } = openSession();
+    const failed = sockets.latest();
+    const duringNotification: ClientEvent = { type: "clear_queued_message" };
+    failed.receive(snapshot());
+    session.subscribe((state) => {
+      if (state.error?.category === "protocol") session.send(duringNotification);
+    });
+
+    failed.receiveBinary();
+
+    expect(failed.sent).toEqual([]);
+    expect(session.getState().error?.category).toBe("protocol");
+    vi.advanceTimersByTime(1_000);
+    const replacement = sockets.latest();
+    replacement.open();
+    expect(replacement.sent).toEqual([]);
+
+    replacement.receive(snapshot({ generation: 2 }));
+
+    expect(replacement.sent).toEqual([JSON.stringify(duringNotification)]);
+    expect(session.getState().error).toBeNull();
     session.dispose();
   });
 
@@ -374,6 +415,17 @@ describe("browser platform", () => {
     expect(replaced).toEqual([`/_app/${staticToken}/`]);
     expect(environment.location.hash).toBe("");
   });
+
+  it("omits native log opening and generic path reveal capabilities", async () => {
+    const { createBrowserPlatform } = await import("../platform/browser");
+    const { environment } = browserEnvironment(
+      `http://127.0.0.1:49152/_app/${staticToken}/#token=${apiToken}`,
+    );
+    const platform = createBrowserPlatform(environment);
+
+    expect(platform).not.toHaveProperty("openLogs");
+    expect(platform).not.toHaveProperty("revealPath");
+  });
 });
 
 describe("Tauri platform", () => {
@@ -391,7 +443,7 @@ describe("Tauri platform", () => {
     expect(commands).toEqual([{ command: "service_connection", args: undefined }]);
   });
 
-  it("uses only approved native commands and fails closed for general path reveal", async () => {
+  it("uses only approved workspace and notification commands", async () => {
     const commands: Array<{ command: string; args?: Record<string, unknown> }> = [];
     const invoke = async <T,>(command: string, args?: Record<string, unknown>): Promise<T> => {
       commands.push({ command, args });
@@ -402,9 +454,6 @@ describe("Tauri platform", () => {
 
     await expect(platform.chooseWorkspace()).resolves.toBe("/canonical/workspace");
     await platform.notify({ title: "Turn complete", body: "The answer is ready." });
-    await expect(platform.revealPath("/tmp/not-approved")).rejects.toThrow(
-      "Path reveal is not available",
-    );
 
     expect(commands).toEqual([
       { command: "choose_workspace", args: undefined },
@@ -413,5 +462,23 @@ describe("Tauri platform", () => {
         args: { title: "Turn complete", body: "The answer is ready." },
       },
     ]);
+  });
+
+  it("exposes only the capability-specific open_logs command and no generic reveal", async () => {
+    const commands: Array<{ command: string; args?: Record<string, unknown> }> = [];
+    const invoke = async <T,>(command: string, args?: Record<string, unknown>): Promise<T> => {
+      commands.push({ command, args });
+      return undefined as T;
+    };
+    const platform = createTauriPlatform(invoke);
+    type GenericRevealRemoved = "revealPath" extends keyof PlatformAdapter ? false : true;
+    const genericRevealRemoved: GenericRevealRemoved = true;
+
+    expect(genericRevealRemoved).toBe(true);
+    expect(platform).not.toHaveProperty("revealPath");
+    expect(platform.openLogs).toBeTypeOf("function");
+    await platform.openLogs?.();
+
+    expect(commands).toEqual([{ command: "open_logs", args: undefined }]);
   });
 });

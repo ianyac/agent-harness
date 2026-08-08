@@ -40,8 +40,8 @@ export function createTauriPlatform(invoke: NativeInvoke = defaultInvoke): Platf
     async notify(input: { title: string; body: string }): Promise<void> {
       await invoke<void>("notify", { title: input.title, body: input.body });
     },
-    async revealPath(_path: string): Promise<void> {
-      throw new Error("Path reveal is not available through the approved native commands.");
+    async openLogs(): Promise<void> {
+      await invoke<void>("open_logs");
     },
   });
 }

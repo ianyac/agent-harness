@@ -211,8 +211,8 @@ export class SessionSocket {
       }
       this.#snapshotReady = true;
       this.#reconnectAttempt = 0;
-      this.#publish(next);
       this.#flush(socket);
+      this.#publish(next);
       return;
     }
 
@@ -250,8 +250,8 @@ export class SessionSocket {
   }
 
   #reportProtocolError(socket: SessionSocketWebSocket): void {
-    this.#publish({ ...this.#state, error: protocolError });
     this.#retireAndReconnect(socket, "Protocol error");
+    this.#publish({ ...this.#state, error: protocolError });
   }
 
   #publish(next: TranscriptState): void {

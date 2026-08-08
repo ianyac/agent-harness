@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import threading
 import time
 import warnings
@@ -929,6 +930,58 @@ def test_set_session_mode_updates_metadata_and_survives_service_restart(
         assert record.json()["mode"] == "readOnly"
         assert safety.status_code == 200
         assert safety.json()["mode"] == "readOnly"
+
+
+def test_session_mode_result_read_failure_rolls_back_metadata_and_live_policy(
+    service, monkeypatch
+):
+    with service(WholeTextLLM("unused")) as (client, session_id, _, app):
+        with connect(client, session_id) as ws:
+            snapshot = ws.receive_json()
+            manager = app.state.session_manager
+            channel = manager._channels[session_id]
+            assert client.portal is not None
+
+            def current_state():
+                return (
+                    manager.get_session(session_id),
+                    json.loads(json.dumps(channel.safety)),
+                    channel.runtime.policy.base_mode,
+                    channel.runtime.policy.mode,
+                )
+
+            before_record, before_safety, before_base_mode, before_mode = (
+                client.portal.call(current_state)
+            )
+            original_get_session_row = manager.metadata._get_session_row
+
+            def fail_result_select(_session_id: str):
+                raise sqlite3.OperationalError("result SELECT failed")
+
+            monkeypatch.setattr(
+                manager.metadata, "_get_session_row", fail_result_select
+            )
+            try:
+                with pytest.raises(
+                    sqlite3.OperationalError, match="result SELECT failed"
+                ):
+                    client.portal.call(channel._set_session_mode, "readOnly")
+            finally:
+                monkeypatch.setattr(
+                    manager.metadata,
+                    "_get_session_row",
+                    original_get_session_row,
+                )
+
+            after_record, after_safety, after_base_mode, after_mode = (
+                client.portal.call(current_state)
+            )
+            assert after_record == before_record
+            assert after_record.mode == "default"
+            assert before_base_mode == after_base_mode == "default"
+            assert before_mode == after_mode == "default"
+            assert after_safety == before_safety
+            assert snapshot["safety"] == before_safety
 
 
 @pytest.mark.parametrize(

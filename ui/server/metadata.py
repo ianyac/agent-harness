@@ -240,7 +240,7 @@ class MetadataStore:
             )
             if result.rowcount != 1:
                 raise KeyError(session_id)
-        return self._required_session(session_id)
+            return self._required_session(session_id)
 
     def touch_session(self, session_id: str) -> SessionRecord:
         now = self._now()

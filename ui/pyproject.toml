@@ -1,0 +1,26 @@
+[project]
+name = "agent-harness-ui"
+version = "0.1.0"
+description = "Local UI service for agent-harness"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "fastapi",
+    "httpx",
+    "platformdirs",
+    "pydantic",
+    "requests",
+    "tiktoken",
+    "uvicorn[standard]",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "pytest-cov",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

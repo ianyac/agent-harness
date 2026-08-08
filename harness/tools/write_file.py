@@ -34,4 +34,5 @@ def write_file_tool(workspace: Path | None = None) -> Tool:
             "required": ["path", "content"],
         },
         execute=lambda path, content: _write_file(path, content, workspace),
+        foldable_inputs=("content",),
     )

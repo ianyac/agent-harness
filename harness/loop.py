@@ -2,6 +2,7 @@ import json
 from typing import Callable
 
 from harness.compaction import compact, estimate_tokens
+from harness.folding import FoldingContext
 from harness.llm import LLMClient
 from harness.permissions import PermissionPolicy
 from harness.tools.base import Tool, definitions
@@ -9,6 +10,23 @@ from harness.tools.base import Tool, definitions
 # prefix of the reply run_turn fabricates when max_iterations is exhausted;
 # wrappers (e.g. the agent tool) detect aborts by it
 ABORTED_PREFIX = "[turn aborted by harness"
+
+
+def _model_tools(
+    tools: dict[str, Tool], context: FoldingContext | None
+) -> tuple[list[dict] | None, dict[str, Tool]]:
+    if context is None:
+        return definitions(tools) or None, tools
+    aliases = context.model_tool_names(tools)
+    rendered: list[dict] = []
+    executable: dict[str, Tool] = {}
+    for tool in tools.values():
+        offered_name = aliases.get(tool.name, tool.name)
+        definition = tool.definition()
+        definition["function"]["name"] = offered_name
+        rendered.append(definition)
+        executable[offered_name] = tool
+    return rendered or None, executable
 
 
 def _permitted(
@@ -43,15 +61,25 @@ def run_turn(
     on_compact: Callable[[int], None] | None = None,
     breadcrumbs: str | Callable[[], str] | None = None,
     on_text_delta: Callable[[str], None] | None = None,
+    context: FoldingContext | None = None,
 ) -> dict:
+    if context is not None and compact_threshold is not None:
+        raise ValueError("context folding and compaction are mutually exclusive")
     tools = tools or {}
-    defs = definitions(tools) or None
+    defs, executable_tools = _model_tools(tools, context)
+    if context is not None:
+        context.begin_turn(messages, executable_tools)
     messages.append({"role": "user", "content": user_input})
     for _ in range(max_iterations):
         # re-evaluated every iteration: a callable system prompt can change
         # mid-turn (e.g. plan mode is left after exit_plan_mode is approved,
         # so the plan-mode section must drop for the remaining iterations)
         sys_prompt = system() if callable(system) else system
+        if context is not None:
+            context.sync(messages, executable_tools)
+            defs, executable_tools = _model_tools(tools, context)
+            if context.should_checkpoint(estimate_tokens(messages, defs, sys_prompt)):
+                context.checkpoint(reason="marked token threshold")
         # re-checked every iteration: tool results can balloon the context
         # mid-turn, long after the turn-start estimate looked safe
         if (
@@ -71,19 +99,39 @@ def run_turn(
                 messages[:] = compacted  # in place: the caller owns this list
                 if on_compact is not None:
                     on_compact(summarized)
-        # the kwarg travels only when streaming is on: pre-seam LLMClient
-        # implementations keep working until their caller opts in
+        # Streaming stays opt-in; folding additionally carries its persisted
+        # projection hash so retries can identify the exact request bytes.
         extra = {"on_text_delta": on_text_delta} if on_text_delta is not None else {}
-        reply = llm.complete(messages, tools=defs, system=sys_prompt, **extra)
+        outgoing = context.project(messages) if context is not None else messages
+        request_hash = None
+        if context is not None:
+            request_hash = context.record_request(outgoing)
+        reply = llm.complete(
+            outgoing,
+            tools=defs,
+            system=sys_prompt,
+            **extra,
+            **(
+                {"projection_hash": request_hash}
+                if request_hash is not None
+                else {}
+            ),
+        )
         messages.append(reply)
+        if context is not None:
+            context.sync(messages, executable_tools)
         calls = reply.get("tool_calls")
         if not calls:
             return reply
         for call in calls:
-            result = _run_one_call(call, tools, policy, asker, on_tool_call)
+            result = _run_one_call(
+                call, executable_tools, policy, asker, on_tool_call
+            )
             messages.append(
                 {"role": "tool", "tool_call_id": call["id"], "content": result}
             )
+            if context is not None:
+                context.sync(messages, executable_tools)
     # cap hit: close the transcript gracefully — the law is that every turn
     # ends with a plain assistant message, even an unsuccessful one
     reply = {
@@ -92,6 +140,8 @@ def run_turn(
         f"{max_iterations} iterations]",
     }
     messages.append(reply)
+    if context is not None:
+        context.sync(messages, executable_tools)
     return reply
 
 

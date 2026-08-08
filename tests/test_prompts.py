@@ -1,4 +1,4 @@
-from harness.prompts import Environment, build_system_prompt
+from harness.prompts import Environment, WORKSPACE_HYGIENE, build_system_prompt
 
 
 def sample_env() -> Environment:
@@ -38,3 +38,15 @@ def test_no_extra_sections_is_the_default():
     prompt = build_system_prompt(sample_env())
     assert prompt.endswith("assumptions.")
     assert prompt.strip() == prompt
+
+
+def test_workspace_hygiene_section_teaches_verdict_folding_without_a_savings_target():
+    # Regression caught: telling the model to maximize savings incentivizes
+    # premature closure; the policy may teach phase boundaries and note quality
+    # but never an optimization target.
+    prompt = build_system_prompt(sample_env(), [WORKSPACE_HYGIENE])
+    assert "When a line of work CLOSES" in prompt
+    assert "fold(span_id, reason, note)" in prompt
+    assert "future-you" in prompt
+    assert "Never interrupt an active investigation" in prompt
+    assert "token savings" not in prompt.lower()

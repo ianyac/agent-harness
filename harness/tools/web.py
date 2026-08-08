@@ -489,6 +489,7 @@ def web_fetch_tool(client=None, char_limit: int = DEFAULT_CHAR_LIMIT) -> Tool:
         },
         execute=execute,
         read_only=True,  # observes only; the outbound channel is an accepted risk
+        untrusted_output=True,
     )
 
 
@@ -552,4 +553,5 @@ def web_search_tool(provider: SearchProvider) -> Tool:
         },
         execute=execute,
         read_only=True,
+        untrusted_output=True,
     )

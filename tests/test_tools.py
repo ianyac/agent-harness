@@ -3,6 +3,7 @@ import json
 import pytest
 
 from harness.tools.base import Tool, definitions
+from harness.tools.write_file import write_file_tool
 
 
 def sample_tool() -> Tool:
@@ -59,3 +60,10 @@ def test_rejects_required_names_missing_from_properties():
     }
     with pytest.raises(ValueError, match="'b'"):
         Tool(name="bad", description="x", parameters=schema, execute=str)
+
+
+def test_write_file_declares_only_its_large_content_as_foldable(tmp_path):
+    # Regression caught: treating `path` as payload would erase the canonical
+    # recovery pointer from the projected call.
+    tool = write_file_tool(tmp_path)
+    assert tool.foldable_inputs == ("content",)

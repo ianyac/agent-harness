@@ -1,0 +1,53 @@
+# agent-harness
+
+A teaching agent harness built lesson by lesson in Python 3.14.
+
+## Running
+
+```bash
+uv sync
+uv run python main.py --workspace /path/to/project
+```
+
+Sessions are persisted under `<workspace>/.agent/sessions/` and can be resumed
+with `--continue` or `--resume ID`.
+
+## Recoverable context folding
+
+Enable the folding projection instead of whole-history compaction:
+
+```bash
+uv run python main.py --workspace /path/to/project --fold-context
+```
+
+Tool results are labeled with stable handles such as `m17.r0` (and
+`m17.r0.c2` for an ingestion-time chunk). The agent can call `fold` after a
+line of work closes, recording the conclusion that replaces the evidence, and
+call `unfold` to restore the full span at the context tail. Large batches apply
+at a checkpoint when their marked share reaches 15%; smaller batches apply at
+the next user-turn boundary. Ordinary folds leave the full transcript as an
+immutable shadow record. The explicit carve-outs are credential scanning and
+user deletion: both purge the affected bytes instead of making them recoverable.
+
+Each session keeps its folding ledger and content-free decision log beside the
+transcript as `<session>.folds.sqlite3` and `<session>.fold-decisions.jsonl`.
+Resuming the session reuses those files, so its folded footprint and verdicts
+survive process restarts. The context-management mode is persisted too; a
+folding session resumes with folding automatically and cannot silently fall
+back to compaction.
+
+## Request replay and erasure
+
+Each model dispatch stores its exact projected request and aligned ledger
+sources. `reconstruct_projection(id)` verifies non-redacted snapshots against
+the persisted hash.
+
+User deletion and sensitive scanning rewrite affected historical snapshots to
+markers, preserve the original hash chain, and expose `redacted: true` because
+hard-erased bytes are intentionally no longer reconstructable. User deletion
+follows ledger provenance and exact aliases; it is not a global
+find-and-replace operation.
+
+`--fold-context` and `--compact-threshold` are intentionally mutually
+exclusive. Two context managers rewriting the same message array would make
+neither one's state reconstructable.

@@ -18,6 +18,35 @@ PLAN_MODE_SUBAGENT = (
     "find — do not act."
 )
 
+WORKSPACE_HYGIENE = """## Workspace hygiene
+
+Your context is your working memory. Keep it dense with what matters now.
+
+When a line of work CLOSES — an investigation concludes, a hypothesis is
+confirmed or ruled out, or a subtask completes — fold its evidence and record
+your verdict:
+
+  fold(span_id, reason, note)
+
+Your note is what future-you will have INSTEAD of the content. State the
+conclusion, the key facts supporting it, and anything you would otherwise
+re-check: file paths, line numbers, and exact values.
+
+Rules:
+- Fold at natural pauses, after finishing and before starting the next thing.
+  Never interrupt an active investigation to clean up.
+- If you cannot write a specific note, do not fold. "No longer needed" means
+  you have not finished thinking about the evidence.
+- When unsure whether something is finished or merely irrelevant so far, keep
+  it. Recovery is available through unfold, but fold only when confident.
+- If content is WRONG, fold it as `poisoned` with a corrective note immediately.
+- Hygiene serves the task; never pause a productive thread just to tidy.
+- Evidence contradicting your current hypothesis is the last thing to fold,
+  not the first.
+
+Before moving on or saying something is confirmed, ask which evidence from the
+phase just closed can be folded with a verdict."""
+
 
 @dataclass
 class Environment:

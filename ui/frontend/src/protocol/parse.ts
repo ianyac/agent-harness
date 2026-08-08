@@ -46,12 +46,25 @@ const isPermissionDecision: Validator = (value) =>
 function isJsonValue(value: unknown, depth = 0, seen = new Set<object>()): value is JsonValue {
   if (value === null || typeof value === "boolean") return true;
   if (typeof value === "string") return hasUnicodeScalars(value);
-  if (typeof value === "number") return Number.isFinite(value);
+  if (typeof value === "number") {
+    return Number.isFinite(value) && (!Number.isInteger(value) || Number.isSafeInteger(value));
+  }
   if (depth >= maxJsonDepth || typeof value !== "object") return false;
   if (seen.has(value)) return false;
   seen.add(value);
 
   if (Array.isArray(value)) {
+    const keys = Object.keys(value);
+    const hasOnlyDenseIndices =
+      keys.length === value.length &&
+      keys.every((key, index) => key === String(index)) &&
+      !Object.getOwnPropertySymbols(value).some((key) =>
+        Object.prototype.propertyIsEnumerable.call(value, key),
+      );
+    if (!hasOnlyDenseIndices) {
+      seen.delete(value);
+      return false;
+    }
     const valid = value.every((item) => isJsonValue(item, depth + 1, seen));
     seen.delete(value);
     return valid;

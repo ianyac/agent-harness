@@ -103,7 +103,7 @@ const completeEvents = [
     ...envelope,
     type: "safety_updated",
     turn_id: null,
-    safety: { mode: "readOnly", sandbox: { backend: "none" } },
+    safety: { mode: "readOnly", sampling_ratio: 0.5, sandbox: { backend: "none" } },
   },
 ] as const;
 
@@ -135,6 +135,36 @@ describe("parseServerEvent", () => {
     { ...completeEvents[5], is_error: 0 },
   ])("rejects invalid bounded primitive values", (input) => {
     expect(parseServerEvent(input).ok).toBe(false);
+  });
+
+  it("rejects unsafe integer-valued numbers nested in authoritative JSON payloads", () => {
+    const input = {
+      ...completeEvents[15],
+      safety: { limits: { tokens: Number.MAX_SAFE_INTEGER + 1 } },
+    };
+
+    expect(parseServerEvent(input).ok).toBe(false);
+  });
+
+  it("rejects sparse arrays in authoritative JSON payloads", () => {
+    const sparse: unknown[] = [];
+    sparse.length = 1;
+
+    expect(
+      parseServerEvent({ ...completeEvents[5], result: { nested: sparse } }).ok,
+    ).toBe(false);
+  });
+
+  it("rejects arrays with non-index enumerable properties", () => {
+    const withExtraProperty: unknown[] = ["value"];
+    Object.defineProperty(withExtraProperty, "metadata", {
+      value: "not an array index",
+      enumerable: true,
+    });
+
+    expect(
+      parseServerEvent({ ...completeEvents[5], result: { nested: withExtraProperty } }).ok,
+    ).toBe(false);
   });
 
   it.each([

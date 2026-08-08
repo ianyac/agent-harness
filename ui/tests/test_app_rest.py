@@ -1893,7 +1893,7 @@ def test_process_lease_serializes_concurrent_managers_after_lock_replacement(
         asyncio.run(second.close())
 
 
-def test_cross_process_lease_survives_public_lock_replacement(tmp_path: Path):
+def test_cross_process_lease_survives_every_lock_path_replacement(tmp_path: Path):
     workspace = tmp_path / "workspace"
     session_path = workspace / ".agent" / "sessions" / "cross-process.jsonl"
     write_completed_session(session_path, "local")
@@ -1903,10 +1903,26 @@ def test_cross_process_lease_survives_public_lock_replacement(tmp_path: Path):
         "cross-process",
         create_session=False,
     )
-    owned_identity = (lock_path.stat().st_dev, lock_path.stat().st_ino)
-    lock_path.unlink()
-    lock_path.write_text("")
-    assert (lock_path.stat().st_dev, lock_path.stat().st_ino) != owned_identity
+    from server import sessions as sessions_module
+
+    coordination_descriptor = lease._coordination_claim.descriptor
+    assert coordination_descriptor is not None
+    coordination_path = sessions_module._SecureSessionLease._descriptor_path(
+        coordination_descriptor
+    )
+    for authoritative_path in (lock_path, coordination_path):
+        owned_identity = (
+            authoritative_path.stat().st_dev,
+            authoritative_path.stat().st_ino,
+        )
+        authoritative_path.unlink()
+        authoritative_path.write_text("")
+        assert (
+            authoritative_path.stat().st_dev,
+            authoritative_path.stat().st_ino,
+        ) != owned_identity
+    unrelated_device = os.open("/dev/null", os.O_RDWR | os.O_CLOEXEC)
+    os.close(unrelated_device)
 
     probe = textwrap.dedent(
         """

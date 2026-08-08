@@ -16,6 +16,7 @@ import re
 import secrets
 import sqlite3
 import stat
+import struct
 import sys
 import threading
 from typing import Callable, cast
@@ -566,6 +567,87 @@ class _CoordinationLeaseClaim:
     """OS-backed authority for one canonical workspace/session pair."""
 
     descriptor: int | None
+    authority_descriptor: int | None
+
+    @staticmethod
+    def _acquire_authority(
+        workspace: os.stat_result,
+        session_id: str,
+    ) -> int:
+        material = (
+            f"ofd-v1\0{os.geteuid()}\0{workspace.st_dev}\0"
+            f"{workspace.st_ino}\0{session_id}"
+        ).encode("utf-8")
+        offset = int.from_bytes(
+            hashlib.sha256(material).digest()[:8], "big"
+        ) & ((1 << 63) - 1)
+        command = getattr(fcntl, "F_OFD_SETLK", None)
+        if command is None or sys.platform != "darwin":
+            raise SessionResumeError(
+                "session coordination authority is unavailable"
+            )
+
+        device_descriptor: int | None = None
+        descriptor: int | None = None
+        try:
+            device_descriptor = os.open("/dev", _DIRECTORY_FLAGS)
+            device = os.fstat(device_descriptor)
+            if (
+                not stat.S_ISDIR(device.st_mode)
+                or device.st_uid != 0
+                or device.st_mode & 0o022
+            ):
+                raise SessionResumeError(
+                    "session coordination authority is unsafe"
+                )
+            descriptor = os.open(
+                "null",
+                _READ_WRITE_FLAGS,
+                dir_fd=device_descriptor,
+            )
+            opened = os.fstat(descriptor)
+            anchor = os.stat(
+                "null",
+                dir_fd=device_descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISCHR(opened.st_mode)
+                or opened.st_uid != 0
+                or opened.st_nlink != 1
+                or not stat.S_ISCHR(anchor.st_mode)
+                or (anchor.st_dev, anchor.st_ino)
+                != (opened.st_dev, opened.st_ino)
+            ):
+                raise SessionResumeError(
+                    "session coordination authority is unsafe"
+                )
+            lock = struct.pack(
+                "@qqihh",
+                offset,
+                1,
+                0,
+                fcntl.F_WRLCK,
+                os.SEEK_SET,
+            )
+            try:
+                fcntl.fcntl(descriptor, command, lock)
+            except BlockingIOError as error:
+                raise SessionResumeError("session is already in use") from error
+            result = descriptor
+            descriptor = None
+            return result
+        except SessionResumeError:
+            raise
+        except (OSError, struct.error) as error:
+            raise SessionResumeError(
+                "session coordination authority is unavailable"
+            ) from error
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            if device_descriptor is not None:
+                os.close(device_descriptor)
 
     @staticmethod
     def _open_root() -> int:
@@ -619,9 +701,11 @@ class _CoordinationLeaseClaim:
             f"v1\0{workspace.st_dev}\0{workspace.st_ino}\0{session_id}"
         ).encode("utf-8")
         name = f"{hashlib.sha256(material).hexdigest()}.lock"
-        root_descriptor = cls._open_root()
+        authority_descriptor = cls._acquire_authority(workspace, session_id)
+        root_descriptor: int | None = None
         descriptor: int | None = None
         try:
+            root_descriptor = cls._open_root()
             try:
                 descriptor = os.open(
                     name,
@@ -661,19 +745,25 @@ class _CoordinationLeaseClaim:
             written = 0
             while written < len(payload):
                 written += os.write(descriptor, payload[written:])
-            claim = cls(descriptor)
+            claim = cls(descriptor, authority_descriptor)
             descriptor = None
+            authority_descriptor = None
             return claim
         finally:
             if descriptor is not None:
                 os.close(descriptor)
-            os.close(root_descriptor)
+            if root_descriptor is not None:
+                os.close(root_descriptor)
+            if authority_descriptor is not None:
+                os.close(authority_descriptor)
 
     def release(self) -> None:
-        if self.descriptor is None:
-            return
-        os.close(self.descriptor)
-        self.descriptor = None
+        if self.descriptor is not None:
+            os.close(self.descriptor)
+            self.descriptor = None
+        if self.authority_descriptor is not None:
+            os.close(self.authority_descriptor)
+            self.authority_descriptor = None
 
 
 class _SecureSessionLease:

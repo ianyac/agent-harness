@@ -1,0 +1,85 @@
+:root {
+  color-scheme: light dark;
+  --color-page: #fafaf7;
+  --color-sidebar: #eeeee8;
+  --color-ink: #292b24;
+  --color-ink-muted: #6e7067;
+  --color-success: #5b8d68;
+  --color-attention: #c58b35;
+  --color-danger: #b95d55;
+  --color-accent: #386f52;
+  --color-focus-ring: #386f52;
+  --color-border: #d8d8d1;
+  --color-surface: #ffffff;
+
+  --radius-control: 8px;
+  --radius-menu: 10px;
+  --radius-card: 12px;
+  --radius-conversation: 16px;
+
+  --sidebar-width: 224px;
+  --sidebar-rail-width: 56px;
+  --transcript-measure: 820px;
+
+  --motion-fast: 120ms;
+  --motion-standard: 180ms;
+  --motion-easing: ease-out;
+
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  --font-size-body: 14px;
+  --line-height-body: 1.55;
+  --focus-ring: 0 0 0 3px color-mix(in srgb, var(--color-focus-ring) 42%, transparent);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-page: #171813;
+    --color-sidebar: #20211c;
+    --color-ink: #f2f2ec;
+    --color-ink-muted: #a9aba1;
+    --color-accent: #9cc9a7;
+    --color-focus-ring: #9cc9a7;
+    --color-border: #393a34;
+    --color-surface: #24251f;
+  }
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --color-page: #fafaf7;
+  --color-sidebar: #eeeee8;
+  --color-ink: #292b24;
+  --color-ink-muted: #6e7067;
+  --color-accent: #386f52;
+  --color-focus-ring: #386f52;
+  --color-border: #d8d8d1;
+  --color-surface: #ffffff;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --color-page: #171813;
+  --color-sidebar: #20211c;
+  --color-ink: #f2f2ec;
+  --color-ink-muted: #a9aba1;
+  --color-accent: #9cc9a7;
+  --color-focus-ring: #9cc9a7;
+  --color-border: #393a34;
+  --color-surface: #24251f;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --motion-fast: 0ms;
+    --motion-standard: 0ms;
+  }
+}
+
+@media (prefers-contrast: more) {
+  :root {
+    --color-ink-muted: var(--color-ink);
+    --color-border: var(--color-ink);
+    --focus-ring: 0 0 0 4px var(--color-focus-ring);
+  }
+}

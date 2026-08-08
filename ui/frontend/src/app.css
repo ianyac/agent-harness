@@ -1,0 +1,47 @@
+#root {
+  min-height: 100dvh;
+}
+
+.app-shell {
+  display: grid;
+  grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
+  min-height: 100dvh;
+  background: var(--color-page);
+}
+
+.session-sidebar {
+  min-width: 0;
+  background: var(--color-sidebar);
+  border-inline-end: 1px solid var(--color-border);
+  transition: width var(--motion-standard) var(--motion-easing);
+}
+
+.conversation-shell {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  min-width: 0;
+}
+
+.conversation-header {
+  min-height: 56px;
+  padding: 16px 24px;
+  border-block-end: 1px solid var(--color-border);
+}
+
+.conversation-header h1 {
+  margin: 0;
+  font-size: inherit;
+  font-weight: 600;
+}
+
+.transcript {
+  width: min(100%, var(--transcript-measure));
+  min-height: 0;
+  margin-inline: auto;
+}
+
+@media (max-width: 999px) {
+  .app-shell {
+    grid-template-columns: var(--sidebar-rail-width) minmax(0, 1fr);
+  }
+}

@@ -1,0 +1,7 @@
+# Vite production output is generated from the committed source and package lock.
+dist/
+
+# Local verification artifacts.
+playwright-report/
+test-results/
+tsconfig.tsbuildinfo

@@ -291,6 +291,83 @@ def test_authenticated_unsafe_static_fallback_never_serves_the_spa(
     assert "frontend fallback" not in response.text
 
 
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("TRACE", "/unknown"),
+        ("PROPFIND", "/api/not-a-route"),
+    ],
+)
+def test_arbitrary_http_methods_authenticate_before_framework_method_handling(
+    settings: AppSettings,
+    tmp_path: Path,
+    method: str,
+    path: str,
+):
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_text("<main>frontend fallback</main>")
+    app = create_app(settings, FakeLLM, static_root=dist)
+
+    with TestClient(app, base_url=ORIGIN) as anonymous:
+        response = anonymous.request(method, path, headers={"Origin": ORIGIN})
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Unauthorized"}
+
+
+@pytest.mark.parametrize("method", ["TRACE", "PROPFIND", "X-ARBITRARY"])
+def test_credentialed_arbitrary_unsafe_methods_still_require_allowed_origin(
+    settings: AppSettings,
+    tmp_path: Path,
+    method: str,
+):
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_text("<main>frontend fallback</main>")
+    app = create_app(settings, FakeLLM, static_root=dist)
+
+    with TestClient(app, base_url=ORIGIN) as test_client:
+        response = test_client.request(
+            method,
+            "/unknown",
+            headers={"Authorization": f"Bearer {SECRET}"},
+        )
+
+    assert response.status_code == 403
+    assert response.json() == {"detail": "Forbidden"}
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "status_code", "allow"),
+    [
+        ("TRACE", "/unknown", 405, "GET, HEAD"),
+        ("X-GET-HEAD", "/unknown", 405, "GET, HEAD"),
+        ("PROPFIND", "/api/not-a-route", 404, None),
+        ("MKCOL", "/ws/not-a-route", 404, None),
+    ],
+)
+def test_authenticated_arbitrary_methods_reach_non_spa_fallback(
+    settings: AppSettings,
+    tmp_path: Path,
+    method: str,
+    path: str,
+    status_code: int,
+    allow: str | None,
+):
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_text("<main>frontend fallback</main>")
+    app = create_app(settings, FakeLLM, static_root=dist)
+
+    with TestClient(app, base_url=ORIGIN, headers=AUTH_HEADERS) as test_client:
+        response = test_client.request(method, path)
+
+    assert response.status_code == status_code
+    assert response.headers.get("allow") == allow
+    assert "frontend fallback" not in response.text
+
+
 def test_missing_credentials_return_typed_non_disclosing_prerequisite(
     settings: AppSettings, workspace: Path
 ):

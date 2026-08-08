@@ -5,15 +5,16 @@ from __future__ import annotations
 from pathlib import Path, PurePosixPath
 import sys
 
-from fastapi import Depends, FastAPI, Request
+from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, PlainTextResponse, Response
+from starlette.routing import Route
+from starlette.types import Receive, Scope, Send
 
 from server.auth import LaunchAuth
 
 
 _SERVICE_NAMESPACES = frozenset({"api", "ws"})
 _STATIC_METHODS = ("GET", "HEAD")
-_FALLBACK_METHODS = (*_STATIC_METHODS, "POST", "PUT", "PATCH", "DELETE", "OPTIONS")
 _MISSING_BUILD = (
     "Frontend build is unavailable. Run `cd frontend && npm run build`, "
     "then restart the service."
@@ -59,21 +60,26 @@ def _safe_file(root: Path, path: str) -> Path | None:
     return candidate
 
 
-def install_static_routes(
-    app: FastAPI,
-    root: Path,
-    auth: LaunchAuth,
-) -> None:
-    """Install an authenticated frontend route after API and WS routes."""
-    configured_root = Path(root)
+class _StaticFallback:
+    """Authenticate and route every HTTP method not claimed by exact routes."""
 
-    @app.api_route(
-        "/{path:path}",
-        methods=list(_FALLBACK_METHODS),
-        dependencies=[Depends(auth.require_http)],
-        include_in_schema=False,
-    )
-    async def serve_frontend(request: Request, path: str) -> Response:
+    def __init__(self, root: Path, auth: LaunchAuth) -> None:
+        self._root = Path(root)
+        self._auth = auth
+
+    async def __call__(
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+    ) -> None:
+        request = Request(scope, receive=receive)
+        self._auth.require_http(request)
+        response = self._response(request)
+        await response(scope, receive, send)
+
+    def _response(self, request: Request) -> Response:
+        path = request.path_params["path"]
         if _is_service_path(path):
             return _not_found()
         if request.method not in _STATIC_METHODS:
@@ -82,7 +88,7 @@ def install_static_routes(
                 headers={"Allow": ", ".join(_STATIC_METHODS)},
             )
         try:
-            resolved_root = configured_root.resolve(strict=True)
+            resolved_root = self._root.resolve(strict=True)
         except (OSError, RuntimeError):
             return PlainTextResponse(_MISSING_BUILD, status_code=503)
         if not resolved_root.is_dir():
@@ -99,3 +105,20 @@ def install_static_routes(
         if index is None:
             return PlainTextResponse(_MISSING_BUILD, status_code=503)
         return FileResponse(index, media_type="text/html")
+
+
+def install_static_routes(
+    app: FastAPI,
+    root: Path,
+    auth: LaunchAuth,
+) -> None:
+    """Install an authenticated frontend route after API and WS routes."""
+    app.router.routes.append(
+        Route(
+            "/{path:path}",
+            endpoint=_StaticFallback(root, auth),
+            methods=None,
+            name="authenticated-static-fallback",
+            include_in_schema=False,
+        )
+    )

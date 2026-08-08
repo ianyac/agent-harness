@@ -586,30 +586,161 @@ class ClosingRuntime:
 
 
 class ClosingMetadata:
-    def __init__(self, calls: list[str]):
+    def __init__(self, calls: list[str], failure: Exception | None = None):
         self.calls = calls
+        self.failure = failure
 
     def close(self) -> None:
         self.calls.append("metadata")
+        if self.failure is not None:
+            raise self.failure
 
 
-def test_manager_close_attempts_every_runtime_and_metadata_after_an_error(
+def test_manager_close_retries_only_failed_resources_and_stays_closed(
     tmp_path: Path,
 ):
     calls: list[str] = []
-    manager = SessionManager(ClosingMetadata(calls), tmp_path, FakeLLM)
+    runtime_one = ClosingRuntime("one", calls, RuntimeError("runtime close failed"))
+    runtime_two = ClosingRuntime("two", calls)
+    metadata = ClosingMetadata(calls, RuntimeError("metadata close failed"))
+    manager = SessionManager(metadata, tmp_path, FakeLLM)
     manager._runtimes.update(
         {
-            "one": ClosingRuntime("one", calls, RuntimeError("close failed")),
-            "two": ClosingRuntime("two", calls),
+            "one": runtime_one,
+            "two": runtime_two,
         }
     )
 
-    with pytest.raises(ExceptionGroup, match="session manager close failed"):
-        asyncio.run(manager.close())
+    async def scenario() -> None:
+        with pytest.raises(ExceptionGroup, match="session manager close failed") as raised:
+            await manager.close()
+        assert {str(error) for error in raised.value.exceptions} == {
+            "runtime close failed",
+            "metadata close failed",
+        }
+        assert manager._runtimes == {"one": runtime_one}
 
-    assert calls == ["one", "two", "metadata"]
+        with pytest.raises(RuntimeError) as sync_rejected:
+            manager.list_sessions()
+        assert type(sync_rejected.value).__name__ == "SessionManagerClosed"
+        with pytest.raises(RuntimeError) as async_rejected:
+            await manager.discover()
+        assert type(async_rejected.value).__name__ == "SessionManagerClosed"
+
+        runtime_one.failure = None
+        metadata.failure = None
+        await manager.close()
+        await manager.close()
+
+    asyncio.run(scenario())
+
+    assert calls == ["one", "two", "metadata", "one", "metadata"]
     assert manager._runtimes == {}
+
+
+def test_manager_close_retries_process_claim_release_and_allows_reacquire(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    workspace = tmp_path / "workspace"
+    session_path = workspace / ".agent" / "sessions" / "shutdown-claim.jsonl"
+    write_completed_session(session_path, "local")
+    metadata = MetadataStore(tmp_path / "metadata.sqlite3")
+    metadata.create_session(NewSession.defaults("shutdown-claim", workspace))
+    manager = SessionManager(metadata, workspace, FakeLLM)
+    replacement_metadata = MetadataStore(tmp_path / "replacement.sqlite3")
+    replacement_metadata.create_session(
+        NewSession.defaults("shutdown-claim", workspace)
+    )
+    replacement = SessionManager(replacement_metadata, workspace, FakeLLM)
+    from server import sessions as sessions_module
+
+    runtime = None
+
+    async def scenario() -> None:
+        nonlocal runtime
+        runtime = await manager.open_runtime("shutdown-claim")
+        claim = runtime._session_lease._process_claim
+        original_release = sessions_module._ProcessLeaseClaim.release
+        failed = False
+
+        def fail_release_once(current_claim):
+            nonlocal failed
+            if current_claim is claim and not failed:
+                failed = True
+                raise OSError("shutdown process claim release interrupted")
+            return original_release(current_claim)
+
+        monkeypatch.setattr(
+            sessions_module._ProcessLeaseClaim,
+            "release",
+            fail_release_once,
+        )
+
+        try:
+            with pytest.raises(ExceptionGroup, match="session manager close failed"):
+                await manager.close()
+
+            await manager.close()
+            reopened = await replacement.open_runtime("shutdown-claim")
+            assert reopened is not None
+        finally:
+            if runtime is not None:
+                runtime.close()
+            await manager.close()
+            await replacement.close()
+
+    asyncio.run(scenario())
+
+
+def test_manager_close_retries_final_stage_removal_without_residue(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    workspace = tmp_path / "workspace"
+    session_path = workspace / ".agent" / "sessions" / "shutdown-stage.jsonl"
+    write_completed_session(session_path, "local")
+    metadata = MetadataStore(tmp_path / "metadata.sqlite3")
+    metadata.create_session(NewSession.defaults("shutdown-stage", workspace))
+    manager = SessionManager(metadata, workspace, FakeLLM)
+    from server import sessions as sessions_module
+
+    runtime = None
+
+    async def scenario() -> None:
+        nonlocal runtime
+        runtime = await manager.open_runtime("shutdown-stage")
+        stage_path = runtime._session_lease._stage_path
+        original_rmdir = sessions_module.os.rmdir
+        failed = False
+
+        def fail_stage_removal_once(path, *args, **kwargs):
+            nonlocal failed
+            if path == stage_path.name and not failed:
+                failed = True
+                raise OSError("shutdown stage removal interrupted")
+            return original_rmdir(path, *args, **kwargs)
+
+        monkeypatch.setattr(sessions_module.os, "rmdir", fail_stage_removal_once)
+
+        try:
+            with pytest.raises(ExceptionGroup, match="session manager close failed"):
+                await manager.close()
+            assert stage_path.is_dir()
+
+            await manager.close()
+
+            assert not stage_path.exists()
+            assert not any(
+                path.name.startswith(".runtime-shutdown-stage-")
+                for path in session_path.parent.iterdir()
+            )
+        finally:
+            if runtime is not None:
+                runtime.close()
+            await manager.close()
+
+    asyncio.run(scenario())
 
 
 def test_lifespan_closes_open_runtimes_and_metadata(

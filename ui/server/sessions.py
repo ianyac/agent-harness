@@ -718,6 +718,7 @@ class SessionManager:
         self._runtimes: dict[str, HarnessRuntime] = {}
         self._runtime_lock = asyncio.Lock()
         self._closed = False
+        self._metadata_closed = False
 
     @staticmethod
     def _validated_workspace(workspace: Path | str) -> Path:
@@ -1769,20 +1770,20 @@ class SessionManager:
     async def close(self) -> None:
         errors: list[Exception] = []
         async with self._runtime_lock:
-            if self._closed:
-                return
             self._closed = True
-            try:
-                for runtime in list(self._runtimes.values()):
-                    try:
-                        runtime.close()
-                    except Exception as error:
-                        errors.append(error)
-            finally:
-                self._runtimes.clear()
+            for session_id, runtime in tuple(self._runtimes.items()):
+                try:
+                    runtime.close()
+                except Exception as error:
+                    errors.append(error)
+                else:
+                    self._runtimes.pop(session_id, None)
+            if not self._metadata_closed:
                 try:
                     self.metadata.close()
                 except Exception as error:
                     errors.append(error)
+                else:
+                    self._metadata_closed = True
         if errors:
             raise ExceptionGroup("session manager close failed", errors)

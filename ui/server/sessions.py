@@ -14,6 +14,7 @@ import re
 import secrets
 import sqlite3
 import stat
+import threading
 from typing import Callable, cast
 
 from harness.llm import LLMClient
@@ -49,6 +50,8 @@ _CREATE_READ_WRITE_FLAGS = (
     os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
 )
 _CREDENTIAL_MESSAGE = "Codex credentials are required. Run `codex login` and retry."
+_PROCESS_LEASES_GUARD = threading.Lock()
+_PROCESS_LEASES: dict[tuple[int, int, int, str], object] = {}
 
 
 class InvalidSessionId(ValueError):
@@ -178,6 +181,42 @@ class _Publication:
     name: str
     identity: tuple[int, int]
     backup_name: str | None = None
+    capture_name: str | None = None
+
+
+@dataclass
+class _ProcessLeaseClaim:
+    """One in-process workspace/session owner layered over advisory locking."""
+
+    key: tuple[int, int, int, str]
+    token: object
+    released: bool = False
+
+    @classmethod
+    def acquire(
+        cls,
+        workspace_descriptor: int,
+        session_id: str,
+    ) -> _ProcessLeaseClaim:
+        workspace = os.fstat(workspace_descriptor)
+        key = (os.getpid(), workspace.st_dev, workspace.st_ino, session_id)
+        token = object()
+        with _PROCESS_LEASES_GUARD:
+            if key in _PROCESS_LEASES:
+                raise SessionResumeError("session is already in use")
+            _PROCESS_LEASES[key] = token
+        return cls(key, token)
+
+    def release(self) -> None:
+        if self.released:
+            return
+        with _PROCESS_LEASES_GUARD:
+            current = _PROCESS_LEASES.get(self.key)
+            if current is self.token:
+                del _PROCESS_LEASES[self.key]
+            elif current is not None:
+                raise RuntimeError("process session lease ownership changed")
+        self.released = True
 
 
 class _SecureSessionLease:
@@ -193,16 +232,21 @@ class _SecureSessionLease:
         session_anchor_name: str,
         lock_descriptor: int,
         lock_name: str,
+        process_claim: _ProcessLeaseClaim,
     ) -> None:
         self._directory_descriptors = list(directory_descriptors)
         self._stage_descriptor: int | None = stage_descriptor
         self._stage_path = stage_path
-        self._stage_name = stage_path.name
+        self._stage_name: str | None = stage_path.name
+        self._stage_directory_identity: tuple[int, int] | None = self._identity(
+            stage_descriptor
+        )
         self._session_descriptor: int | None = session_descriptor
         self._session_name = session_name
         self._session_anchor_name = session_anchor_name
         self._lock_descriptor: int | None = lock_descriptor
         self._lock_name = lock_name
+        self._process_claim: _ProcessLeaseClaim | None = process_claim
         self._publications: dict[str, _Publication] = {}
         self._committed = False
         self.session_path = stage_path / session_name
@@ -392,30 +436,44 @@ class _SecureSessionLease:
         os.unlink(private_name, dir_fd=self._owned_stage_descriptor)
 
     def _rollback_publication(self, publication: _Publication) -> None:
-        capture_name = self._private_name("quarantine", publication.name)
-        try:
-            os.rename(
-                publication.name,
-                capture_name,
-                src_dir_fd=self._sessions_descriptor,
-                dst_dir_fd=self._owned_stage_descriptor,
-            )
-        except FileNotFoundError:
-            capture_name = ""
-        if capture_name:
-            captured = os.stat(
-                capture_name,
-                dir_fd=self._owned_stage_descriptor,
-                follow_symlinks=False,
-            )
-            captured_identity = (captured.st_dev, captured.st_ino)
-            if stat.S_ISREG(captured.st_mode) and captured_identity == publication.identity:
-                os.unlink(capture_name, dir_fd=self._owned_stage_descriptor)
+        capture_name = publication.capture_name
+        if capture_name is None:
+            candidate = self._private_name("quarantine", publication.name)
+            try:
+                os.rename(
+                    publication.name,
+                    candidate,
+                    src_dir_fd=self._sessions_descriptor,
+                    dst_dir_fd=self._owned_stage_descriptor,
+                )
+            except FileNotFoundError:
+                pass
             else:
-                self._restore_private(capture_name, publication.name)
-                if publication.backup_name is not None:
-                    self._discard_backup(publication)
-                return
+                publication.capture_name = candidate
+                capture_name = candidate
+        if capture_name is not None:
+            try:
+                captured = os.stat(
+                    capture_name,
+                    dir_fd=self._owned_stage_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                publication.capture_name = None
+            else:
+                captured_identity = (captured.st_dev, captured.st_ino)
+                if (
+                    stat.S_ISREG(captured.st_mode)
+                    and captured_identity == publication.identity
+                ):
+                    os.unlink(capture_name, dir_fd=self._owned_stage_descriptor)
+                    publication.capture_name = None
+                else:
+                    self._restore_private(capture_name, publication.name)
+                    publication.capture_name = None
+                    if publication.backup_name is not None:
+                        self._discard_backup(publication)
+                    return
         if publication.backup_name is not None:
             self._restore_private(publication.backup_name, publication.name)
 
@@ -555,31 +613,53 @@ class _SecureSessionLease:
             self._discard_backup(publication)
 
     def _release_lock(self) -> None:
-        if self._lock_descriptor is None:
-            return
-        self._restore_lock_name()
-        os.ftruncate(self._lock_descriptor, 0)
-        os.lseek(self._lock_descriptor, 0, os.SEEK_SET)
-        os.close(self._lock_descriptor)
-        self._lock_descriptor = None
+        if self._lock_descriptor is not None:
+            self._restore_lock_name()
+            os.ftruncate(self._lock_descriptor, 0)
+            os.lseek(self._lock_descriptor, 0, os.SEEK_SET)
+            os.close(self._lock_descriptor)
+            self._lock_descriptor = None
+        if self._process_claim is not None:
+            self._process_claim.release()
+            self._process_claim = None
 
     def _remove_stage(self) -> None:
-        if self._stage_descriptor is None:
+        if self._stage_descriptor is not None:
+            errors: list[BaseException] = []
+            for name in os.listdir(self._stage_descriptor):
+                try:
+                    os.unlink(name, dir_fd=self._stage_descriptor)
+                except BaseException as error:
+                    errors.append(error)
+            if errors:
+                raise ExceptionGroup("private session stage cleanup failed", errors)
+            os.close(self._stage_descriptor)
+            self._stage_descriptor = None
+        if self._stage_name is None:
             return
-        errors: list[BaseException] = []
-        for name in os.listdir(self._stage_descriptor):
-            try:
-                os.unlink(name, dir_fd=self._stage_descriptor)
-            except BaseException as error:
-                errors.append(error)
-        if errors:
-            raise ExceptionGroup("private session stage cleanup failed", errors)
-        os.close(self._stage_descriptor)
-        self._stage_descriptor = None
+        try:
+            current = os.stat(
+                self._stage_name,
+                dir_fd=self._sessions_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            self._stage_name = None
+            self._stage_directory_identity = None
+            return
+        if (
+            not stat.S_ISDIR(current.st_mode)
+            or (current.st_dev, current.st_ino) != self._stage_directory_identity
+        ):
+            self._stage_name = None
+            self._stage_directory_identity = None
+            return
         try:
             os.rmdir(self._stage_name, dir_fd=self._sessions_descriptor)
         except FileNotFoundError:
             pass
+        self._stage_name = None
+        self._stage_directory_identity = None
 
     def _close_directories(self) -> None:
         while self._directory_descriptors:
@@ -1070,6 +1150,7 @@ class SessionManager:
     ) -> _SecureSessionLease:
         directory_descriptors = cls._open_session_directory_descriptors(workspace)
         sessions_descriptor = directory_descriptors[-1]
+        process_claim: _ProcessLeaseClaim | None = None
         lock_descriptor: int | None = None
         stage_descriptor: int | None = None
         stage_name: str | None = None
@@ -1079,6 +1160,10 @@ class SessionManager:
         staged_descriptor: int | None = None
         cleanup_errors: list[BaseException] = []
         try:
+            process_claim = _ProcessLeaseClaim.acquire(
+                directory_descriptors[0],
+                session_id,
+            )
             lock_descriptor = cls._acquire_secure_lock(
                 sessions_descriptor, session_id
             )
@@ -1206,12 +1291,14 @@ class SessionManager:
                 session_anchor_name,
                 lock_descriptor,
                 lock_name,
+                process_claim,
             )
             if create_session:
                 lease._publish_initial_session()
             session_descriptor = None
             lock_descriptor = None
             stage_descriptor = None
+            process_claim = None
             return lease
         except BaseException as primary:
             if staged_descriptor is not None:
@@ -1266,6 +1353,17 @@ class SessionManager:
                     os.close(lock_descriptor)
                 except BaseException as error:
                     cleanup_errors.append(error)
+            if process_claim is not None:
+                release_errors: list[BaseException] = []
+                for _attempt in range(2):
+                    try:
+                        process_claim.release()
+                    except BaseException as error:
+                        release_errors.append(error)
+                        continue
+                    break
+                else:
+                    cleanup_errors.extend(release_errors)
             for descriptor in reversed(directory_descriptors):
                 try:
                     os.close(descriptor)

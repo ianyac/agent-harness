@@ -1,9 +1,11 @@
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
 import shutil
+import threading
 import warnings
 
 import pytest
@@ -1243,7 +1245,96 @@ def test_secure_runtime_lock_has_one_owner_and_keeps_a_stable_inode(tmp_path: Pa
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("failure_point", ["session_descriptor", "lock_clear"])
+def test_process_lease_serializes_concurrent_managers_after_lock_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    workspace = tmp_path / "workspace"
+    session_path = workspace / ".agent" / "sessions" / "concurrent.jsonl"
+    write_completed_session(session_path, "local")
+    first = SessionManager(
+        MetadataStore(tmp_path / "first.sqlite3"),
+        workspace,
+        FakeLLM,
+    )
+    second = SessionManager(
+        MetadataStore(tmp_path / "second.sqlite3"),
+        workspace,
+        FakeLLM,
+    )
+    record = NewSession.defaults("concurrent", workspace)
+    lock_path = session_path.with_suffix(".lock")
+    first_lease_ready = threading.Event()
+    resume_first = threading.Event()
+    call_guard = threading.Lock()
+    instantiate_calls = 0
+    from server import sessions as sessions_module
+
+    original_instantiate = sessions_module.SessionManager._instantiate_runtime
+
+    def pause_first_instantiation(config, llm, lease, *, resuming):
+        nonlocal instantiate_calls
+        with call_guard:
+            instantiate_calls += 1
+            call_number = instantiate_calls
+        if call_number == 1:
+            first_lease_ready.set()
+            if not resume_first.wait(5):
+                raise TimeoutError("first runtime acquisition was not resumed")
+        return original_instantiate(
+            config,
+            llm,
+            lease,
+            resuming=resuming,
+        )
+
+    monkeypatch.setattr(
+        sessions_module.SessionManager,
+        "_instantiate_runtime",
+        staticmethod(pause_first_instantiation),
+    )
+
+    first_runtime = None
+    second_runtime = None
+    replacement_runtime = None
+    second_error: BaseException | None = None
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            first_future = executor.submit(first._construct_runtime, record)
+            assert first_lease_ready.wait(5)
+            owned_inode = lock_path.stat().st_ino
+            lock_path.unlink()
+            lock_path.write_text("")
+            assert lock_path.stat().st_ino != owned_inode
+
+            second_future = executor.submit(second._construct_runtime, record)
+            try:
+                second_runtime = second_future.result(timeout=5)
+            except BaseException as error:
+                second_error = error
+            finally:
+                resume_first.set()
+            first_runtime = first_future.result(timeout=5)
+
+        assert isinstance(second_error, RuntimeError), second_runtime
+        assert "in use" in str(second_error)
+
+        first_runtime.close()
+        first_runtime = None
+        replacement_runtime = second._construct_runtime(record)
+    finally:
+        resume_first.set()
+        for runtime in (second_runtime, first_runtime, replacement_runtime):
+            if runtime is not None:
+                runtime.close()
+        asyncio.run(first.close())
+        asyncio.run(second.close())
+
+
+@pytest.mark.parametrize(
+    "failure_point",
+    ["session_descriptor", "lock_clear", "process_registry"],
+)
 def test_secure_session_lease_release_is_retryable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1273,7 +1364,7 @@ def test_secure_session_lease_release_is_retryable(
             return original(descriptor)
 
         monkeypatch.setattr(sessions_module.os, "close", fail_once)
-    else:
+    elif failure_point == "lock_clear":
         target = lease._lock_descriptor
         original = sessions_module.os.ftruncate
         failed = False
@@ -1286,6 +1377,23 @@ def test_secure_session_lease_release_is_retryable(
             return original(descriptor, length)
 
         monkeypatch.setattr(sessions_module.os, "ftruncate", fail_once)
+    else:
+        target = lease._process_claim
+        original = sessions_module._ProcessLeaseClaim.release
+        failed = False
+
+        def fail_once(claim):
+            nonlocal failed
+            if claim is target and not failed:
+                failed = True
+                raise OSError("process registry release interrupted")
+            return original(claim)
+
+        monkeypatch.setattr(
+            sessions_module._ProcessLeaseClaim,
+            "release",
+            fail_once,
+        )
 
     with pytest.raises(OSError, match="interrupted"):
         lease.close()
@@ -1362,6 +1470,52 @@ def test_repeated_session_publication_keeps_original_abort_backup(tmp_path: Path
     lease.abort()
 
     assert session_path.read_text() == original
+
+
+def test_session_lease_abort_retries_post_capture_inspection_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    workspace = tmp_path / "workspace"
+    session_path = workspace / ".agent" / "sessions" / "capture.jsonl"
+    write_completed_session(session_path, "before lease")
+    from server import sessions as sessions_module
+
+    lease = SessionManager._acquire_session_lease(
+        workspace,
+        "capture",
+        create_session=False,
+    )
+    lease.publish()
+    session_path.unlink()
+    session_path.write_text("replacement installed during lease\n")
+    original_stat = sessions_module.os.stat
+    failed = False
+
+    def fail_captured_inspection_once(path, *args, **kwargs):
+        nonlocal failed
+        if (
+            isinstance(path, str)
+            and path.startswith(".quarantine-capture.jsonl-")
+            and kwargs.get("dir_fd") == lease._stage_descriptor
+            and not failed
+        ):
+            failed = True
+            raise OSError("captured replacement inspection interrupted")
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(sessions_module.os, "stat", fail_captured_inspection_once)
+
+    with pytest.raises(ExceptionGroup, match="publication rollback") as raised:
+        lease.abort()
+    assert any(
+        "captured replacement inspection interrupted" in str(error)
+        for error in raised.value.exceptions
+    )
+
+    lease.abort()
+
+    assert session_path.read_text() == "replacement installed during lease\n"
 
 
 def test_session_lease_recovers_private_sqlite_journal_from_stale_stage(
@@ -1566,6 +1720,12 @@ def test_partial_lease_acquisition_preserves_primary_and_closes_all_descriptors(
         with pytest.raises(OSError):
             sessions_module.os.fstat(descriptor)
     assert not any(path.name.startswith(".runtime-missing-") for path in sessions_dir.iterdir())
+    replacement = SessionManager._acquire_session_lease(
+        workspace,
+        "missing",
+        create_session=True,
+    )
+    replacement.abort()
 
 
 def test_transcript_preserves_load_error_when_abort_cleanup_fails(
@@ -1595,6 +1755,55 @@ def test_transcript_preserves_load_error_when_abort_cleanup_fails(
 
     notes = "\n".join(getattr(raised.value, "__notes__", ()))
     assert "transcript cleanup interrupted" in notes
+
+
+def test_session_lease_close_retries_stage_removal_without_reclosing_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    workspace = tmp_path / "workspace"
+    session_path = workspace / ".agent" / "sessions" / "stage-retry.jsonl"
+    write_completed_session(session_path, "local")
+    from server import sessions as sessions_module
+
+    lease = SessionManager._acquire_session_lease(
+        workspace,
+        "stage-retry",
+        create_session=False,
+    )
+    lease.publish()
+    lease.commit()
+    stage_path = lease._stage_path
+    stage_descriptor = lease._stage_descriptor
+    original_close = sessions_module.os.close
+    original_rmdir = sessions_module.os.rmdir
+    stage_close_calls = 0
+    failed = False
+
+    def record_close(descriptor: int):
+        nonlocal stage_close_calls
+        if descriptor == stage_descriptor:
+            stage_close_calls += 1
+        return original_close(descriptor)
+
+    def fail_stage_removal_once(path, *args, **kwargs):
+        nonlocal failed
+        if path == stage_path.name and not failed:
+            failed = True
+            raise OSError("stage removal interrupted")
+        return original_rmdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(sessions_module.os, "close", record_close)
+    monkeypatch.setattr(sessions_module.os, "rmdir", fail_stage_removal_once)
+
+    with pytest.raises(OSError, match="stage removal interrupted"):
+        lease.close()
+    assert stage_path.is_dir()
+
+    lease.close()
+
+    assert not stage_path.exists()
+    assert stage_close_calls == 1
 
 
 def test_new_empty_transcript_is_authoritative_then_deletion_is_a_conflict(

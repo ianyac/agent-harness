@@ -90,6 +90,36 @@ def write_completed_session(path: Path, content: str = "hello") -> None:
     )
 
 
+def valid_credential_file(tmp_path: Path) -> Path:
+    path = tmp_path / "auth.json"
+    path.write_text(
+        json.dumps(
+            {
+                "tokens": {
+                    "access_token": "test-access-token",
+                    "account_id": "test-account",
+                }
+            }
+        )
+    )
+    return path
+
+
+def codex_credential_factory(
+    llm_factory,
+    credential_path: Path,
+    *,
+    read_text=None,
+):
+    from server import sessions as sessions_module
+
+    return sessions_module.CodexCredentialFactory(
+        llm_factory,
+        credential_path=credential_path,
+        read_text=read_text,
+    )
+
+
 def test_create_list_load_rename_and_archive_session(
     client: TestClient, workspace: Path
 ):
@@ -198,7 +228,11 @@ def test_missing_credentials_return_typed_non_disclosing_prerequisite(
             f"no codex credentials ({token_material}); run `codex login` first"
         )
 
-    app = create_app(settings, missing_credentials)
+    credential_path = valid_credential_file(settings.metadata_path.parent)
+    app = create_app(
+        settings,
+        codex_credential_factory(missing_credentials, credential_path),
+    )
     with TestClient(app, base_url=ORIGIN, headers=AUTH_HEADERS) as test_client:
         response = test_client.post(
             "/api/sessions",
@@ -227,11 +261,18 @@ def test_missing_credentials_return_typed_non_disclosing_prerequisite(
 def test_missing_or_invalid_credential_files_share_the_typed_prerequisite(
     settings: AppSettings, workspace: Path, failure: Exception
 ):
-    def invalid_credentials():
+    def fail_read(_path: Path):
         raise failure
 
     with TestClient(
-        create_app(settings, invalid_credentials),
+        create_app(
+            settings,
+            codex_credential_factory(
+                FakeLLM,
+                settings.metadata_path.parent / "auth.json",
+                read_text=fail_read,
+            ),
+        ),
         base_url=ORIGIN,
         headers=AUTH_HEADERS,
     ) as test_client:
@@ -766,6 +807,99 @@ def test_transcript_revalidates_missing_artifacts_for_an_open_runtime(
         assert not session_path.exists()
 
 
+def test_transcript_pins_validated_inode_across_load_boundary_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    workspace = tmp_path / "workspace"
+    session_path = workspace / ".agent" / "sessions" / "swap.jsonl"
+    write_completed_session(session_path, "local-authoritative")
+    external = tmp_path / "external-target.jsonl"
+    external.write_text("NOT SESSION DATA")
+    external_before = external.read_bytes()
+    metadata_path = tmp_path / "metadata.sqlite3"
+    with MetadataStore(metadata_path) as metadata:
+        metadata.create_session(NewSession.defaults("swap", workspace))
+    settings = AppSettings(
+        metadata_path=metadata_path,
+        base_workspace=workspace,
+        launch_secret=SECRET,
+        allowed_origins=frozenset({ORIGIN}),
+    )
+    from server import sessions as sessions_module
+
+    original_load = sessions_module.SessionLog.load
+
+    def swap_then_load(log):
+        session_path.unlink()
+        session_path.symlink_to(external)
+        return original_load(log)
+
+    monkeypatch.setattr(sessions_module.SessionLog, "load", swap_then_load)
+    with TestClient(
+        create_app(settings, FakeLLM),
+        base_url=ORIGIN,
+        headers=AUTH_HEADERS,
+    ) as test_client:
+        response = test_client.get("/api/sessions/swap/transcript")
+
+    assert response.status_code == 200
+    assert response.json()["messages"] == [
+        {"role": "assistant", "content": "local-authoritative"}
+    ]
+    assert external.read_bytes() == external_before
+
+
+def test_new_empty_transcript_is_authoritative_then_deletion_is_a_conflict(
+    client: TestClient, workspace: Path
+):
+    session_id = create_session(client, workspace)["session_id"]
+    session_path = workspace / ".agent" / "sessions" / f"{session_id}.jsonl"
+
+    assert session_path.is_file()
+    assert session_path.read_bytes() == b""
+    first = client.get(f"/api/sessions/{session_id}/transcript")
+    assert first.status_code == 200
+    assert first.json() == {"session_id": session_id, "messages": []}
+
+    session_path.unlink()
+    missing = client.get(f"/api/sessions/{session_id}/transcript")
+    assert missing.status_code == 409
+    assert missing.json()["error"]["type"] == "session_resume_error"
+    assert "missing" in missing.json()["error"]["message"].lower()
+    assert not session_path.exists()
+
+
+def test_new_empty_session_artifacts_roll_back_if_metadata_insert_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    metadata = MetadataStore(tmp_path / "metadata.sqlite3")
+    manager = SessionManager(metadata, workspace, FakeLLM)
+
+    def fail_create(_session: NewSession):
+        raise RuntimeError("metadata insert failed")
+
+    monkeypatch.setattr(metadata, "create_session", fail_create)
+
+    async def scenario() -> None:
+        try:
+            with pytest.raises(RuntimeError, match="metadata insert failed"):
+                await manager.create_session(
+                    workspace=workspace,
+                    mode="default",
+                    context_mode="compaction",
+                    title="Rollback",
+                )
+            sessions_dir = workspace / ".agent" / "sessions"
+            assert list(sessions_dir.iterdir()) == []
+            assert manager._runtimes == {}
+        finally:
+            await manager.close()
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize(
     "failure",
     [
@@ -786,11 +920,18 @@ def test_transcript_revalidates_missing_artifacts_for_an_open_runtime(
 def test_every_local_credential_file_failure_is_a_fixed_non_disclosing_409(
     settings: AppSettings, workspace: Path, failure: Exception
 ):
-    def invalid_credentials():
+    def fail_read(_path: Path):
         raise failure
 
     with TestClient(
-        create_app(settings, invalid_credentials),
+        create_app(
+            settings,
+            codex_credential_factory(
+                FakeLLM,
+                settings.metadata_path.parent / "auth.json",
+                read_text=fail_read,
+            ),
+        ),
         base_url=ORIGIN,
         headers=AUTH_HEADERS,
     ) as test_client:
@@ -815,26 +956,33 @@ def test_every_local_credential_file_failure_is_a_fixed_non_disclosing_409(
     assert not (workspace / ".agent").exists()
 
 
-@pytest.mark.parametrize(
-    "failure",
-    [
-        RuntimeError("codex auth implementation bug access-token-leak"),
-        TypeError("factory implementation bug access-token-leak"),
-        KeyError("unrelated_factory_key"),
-    ],
-)
-def test_unrelated_factory_bugs_are_not_mislabeled_as_credentials(
-    settings: AppSettings, workspace: Path, failure: Exception
+@pytest.mark.parametrize("bug", ["type", "key", "os", "runtime"])
+def test_natural_unrelated_factory_bugs_are_not_mislabeled_as_credentials(
+    settings: AppSettings, workspace: Path, tmp_path: Path, bug: str
 ):
     def broken_factory():
-        raise failure
+        if bug == "type":
+            value = None
+            return value["tokens"]
+        if bug == "key":
+            return {}["tokens"]
+        if bug == "os":
+            return (tmp_path / "missing-model-cache").read_text()
+        raise RuntimeError("no codex credentials; run `codex login` first")
+
+    expected = {
+        "type": TypeError,
+        "key": KeyError,
+        "os": FileNotFoundError,
+        "runtime": RuntimeError,
+    }[bug]
 
     with TestClient(
         create_app(settings, broken_factory),
         base_url=ORIGIN,
         headers=AUTH_HEADERS,
     ) as test_client:
-        with pytest.raises(type(failure), match="access-token-leak|unrelated_factory_key"):
+        with pytest.raises(expected):
             test_client.post(
                 "/api/sessions",
                 json={

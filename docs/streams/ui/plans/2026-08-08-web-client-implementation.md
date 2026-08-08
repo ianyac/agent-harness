@@ -124,7 +124,9 @@ overrides as CSS custom properties.
 
 `App` renders `<nav aria-label="Sessions">`, `<header>`, `<main>`, and an
 inspector `<aside>` that is absent while closed. Use `min-height: 100dvh`; do
-not lock layout to `100vh`.
+not lock layout to `100vh`. Configure Vite with a relative asset base so the
+same build loads below the browser capability path
+`/_app/<static-capability>/` and from the Tauri asset origin.
 
 - [ ] **Step 4: Run unit tests, typecheck, and production build**
 
@@ -280,7 +282,7 @@ Expected: FAIL because the adapters do not exist.
 ```ts
 export interface PlatformAdapter {
   kind: "browser" | "tauri";
-  getServiceConnection(): Promise<{ baseUrl: string; token?: string }>;
+  getServiceConnection(): Promise<{ baseUrl: string; token: string }>;
   chooseWorkspace(): Promise<string | null>;
   notify(input: { title: string; body: string }): Promise<void>;
   revealPath(path: string): Promise<void>;
@@ -292,10 +294,19 @@ path field and recents. Tauri methods invoke only the narrow commands defined
 in Plan 3. Detect Tauri once in `platform/index.ts`; no feature component may
 read Tauri globals.
 
-`ApiClient` adds bearer auth only when the adapter returns a token; browser
-requests rely on the HttpOnly cookie. `SessionSocket` converts `http/https` to
-`ws/wss`, calls `new WebSocket(url, ["harness-ui", token])` in Tauri, and owns
-reconnect timers and disposal.
+The browser adapter starts at
+`/_app/<static-capability>/#token=<api-capability>`. Capture the fragment token
+exactly once into module memory, validate it, and immediately remove the
+fragment with `history.replaceState` while preserving the capability pathname.
+Never put either capability in cookies, query strings, local/session storage,
+logs, or referrers. The browser base URL is the current loopback origin. The
+Tauri adapter obtains the launch token from the narrow host command and keeps
+it in memory.
+
+`ApiClient` sends `Authorization: Bearer <token>` for both browser and Tauri.
+`SessionSocket` converts `http/https` to `ws/wss` and always calls
+`new WebSocket(url, ["harness-ui", token])`; it owns reconnect timers and
+disposal. Browser code never reuses the retired launch secret.
 
 - [ ] **Step 4: Run API tests and typecheck**
 

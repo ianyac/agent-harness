@@ -318,8 +318,13 @@ Tauri bundle and its nested sidecar.
 ### Browser startup
 
 The local web command starts the same Python service and prints a one-time URL.
-Opening that URL exchanges a bootstrap secret for an HttpOnly, SameSite cookie
-and redirects to a clean local URL. The service binds only to loopback.
+Opening that URL exchanges the bootstrap secret for two independent browser
+capabilities: a static-route token in the redirected
+`/_app/<static-capability>/` path and an API token in the URL fragment. The
+client captures the fragment token into memory, removes the fragment from the
+visible URL, and uses that token as the REST bearer and second WebSocket
+subprotocol. No credential cookie is created. The service binds only to
+loopback.
 
 ## Data ownership
 
@@ -466,8 +471,9 @@ explain the missing path, and offer Locate workspace or Archive session.
 - Bind the service to `127.0.0.1` only.
 - Authenticate every REST and WebSocket request with a per-launch secret.
 - Permit only the expected local web and Tauri origins.
-- Exchange browser bootstrap secrets for an HttpOnly cookie, then remove them
-  from the visible URL.
+- Exchange the browser bootstrap secret once for distinct static-path and API
+  capabilities; keep the API token only in client memory and remove its
+  fragment from the visible URL.
 - Keep the Tauri secret in Rust/webview memory, not local storage or logs.
 - Apply the existing permission policy and sandbox to every harness tool.
 - Display the real sandbox backend and write boundary; never label `NoSandbox`

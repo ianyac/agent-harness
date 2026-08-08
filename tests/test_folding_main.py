@@ -1,3 +1,4 @@
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -88,6 +89,11 @@ def test_resume_automatically_restores_the_persisted_folding_mode(tmp_path):
     )
     (sessions / "s.context-mode").write_text("folding\n")
     FoldingContext(sessions / "s.folds.sqlite3", "s").close()
+    auth = tmp_path / ".codex" / "auth.json"
+    auth.parent.mkdir()
+    auth.write_text(
+        '{"tokens":{"access_token":"test-token","account_id":"test-account"}}'
+    )
 
     result = subprocess.run(
         [
@@ -100,6 +106,7 @@ def test_resume_automatically_restores_the_persisted_folding_mode(tmp_path):
         ],
         capture_output=True,
         text=True,
+        env={**os.environ, "HOME": str(tmp_path)},
     )
 
     assert result.returncode == 0

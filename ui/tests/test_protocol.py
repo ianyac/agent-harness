@@ -1,7 +1,7 @@
 import json
 
 import pytest
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 
 from server.protocol import (
     ActivityCompleted,
@@ -78,7 +78,22 @@ def test_client_events_reject_unknown_fields_and_blank_identifiers():
         parse_client_event('{"type":"cancel_turn","turn_id":"t1","unexpected":true}')
 
 
-def test_dump_server_event_round_trips_every_server_event_type():
+@pytest.mark.parametrize("approved", ['"false"', "1"])
+def test_parse_client_event_rejects_coerced_boolean_wire_types(approved):
+    with pytest.raises(ValidationError):
+        parse_client_event(
+            '{"type":"answer_plan","request_id":"r1","approved":'
+            f"{approved}"
+            "}"
+        )
+
+
+def test_parse_client_event_rejects_extra_fields_independently():
+    with pytest.raises(ValidationError):
+        parse_client_event('{"type":"clear_queued_message","extra":true}')
+
+
+def test_dump_server_event_preserves_every_field_and_round_trips_every_server_event_type():
     events: list[ServerEvent] = [
         SessionSnapshot(
             type="session_snapshot",
@@ -140,13 +155,63 @@ def test_dump_server_event_round_trips_every_server_event_type():
         ),
     ]
 
+    server_event_adapter = TypeAdapter(ServerEvent)
     for event in events:
-        assert json.loads(dump_server_event(event))["type"] == event.type
+        dumped = dump_server_event(event)
+        assert json.loads(dumped) == event.model_dump(mode="json")
+        assert server_event_adapter.validate_json(dumped) == event
 
 
-def test_server_events_enforce_envelope_bounds_and_forbid_extra_fields():
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("generation", "1"),
+        ("generation", True),
+        ("sequence", "1"),
+        ("sequence", False),
+    ],
+)
+def test_server_events_reject_coerced_envelope_integer_wire_types(field, value):
+    event = {
+        "type": "assistant_delta",
+        "session_id": "s1",
+        "generation": 1,
+        "sequence": 1,
+        "text": "hello",
+    }
+    event[field] = value
+    with pytest.raises(ValidationError):
+        AssistantDelta(**event)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("is_error", 0), ("is_error", "false"), ("duration_ms", True), ("duration_ms", "12")],
+)
+def test_server_events_reject_coerced_activity_primitive_wire_types(field, value):
+    event = {
+        "type": "activity_completed",
+        "session_id": "s1",
+        "generation": 1,
+        "sequence": 1,
+        "turn_id": "t1",
+        "activity_id": "a1",
+        "actor": "tool",
+        "name": "read_file",
+        "args": {},
+        "result": None,
+        "is_error": False,
+        "started_at": "2026-08-08T00:00:00Z",
+        "duration_ms": 0,
+    }
+    event[field] = value
+    with pytest.raises(ValidationError):
+        ActivityCompleted(**event)
+
+
+def test_server_events_reject_extra_fields_independently():
     with pytest.raises(ValidationError):
         AssistantDelta(
-            type="assistant_delta", session_id="s1", generation=0, sequence=1,
+            type="assistant_delta", session_id="s1", generation=1, sequence=1,
             text="hello", extra="nope",
         )

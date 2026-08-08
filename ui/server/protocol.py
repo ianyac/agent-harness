@@ -22,7 +22,7 @@ PermissionDecision = Literal["yes", "no", "always"]
 
 
 class ProtocolModel(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", strict=True)
 
 
 class _TextMessage(ProtocolModel):

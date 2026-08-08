@@ -745,17 +745,42 @@ class _CoordinationLeaseClaim:
             written = 0
             while written < len(payload):
                 written += os.write(descriptor, payload[written:])
+            os.close(root_descriptor)
+            root_descriptor = None
             claim = cls(descriptor, authority_descriptor)
             descriptor = None
             authority_descriptor = None
             return claim
-        finally:
-            if descriptor is not None:
-                os.close(descriptor)
-            if root_descriptor is not None:
-                os.close(root_descriptor)
-            if authority_descriptor is not None:
-                os.close(authority_descriptor)
+        except BaseException as primary:
+            cleanup_errors: list[BaseException] = []
+            for open_descriptor in (
+                descriptor,
+                root_descriptor,
+                authority_descriptor,
+            ):
+                if open_descriptor is None:
+                    continue
+                for _attempt in range(2):
+                    try:
+                        os.close(open_descriptor)
+                    except BaseException as error:
+                        cleanup_errors.append(error)
+                        continue
+                    break
+            if cleanup_errors:
+                primary.add_note(
+                    "coordination acquisition cleanup encountered: "
+                    + "; ".join(
+                        f"{type(error).__name__}: {error}"
+                        for error in cleanup_errors
+                    )
+                )
+                existing = tuple(getattr(primary, "cleanup_errors", ()))
+                primary.cleanup_errors = (  # type: ignore[attr-defined]
+                    *existing,
+                    *cleanup_errors,
+                )
+            raise
 
     def release(self) -> None:
         if self.descriptor is not None:

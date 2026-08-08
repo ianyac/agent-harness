@@ -2040,6 +2040,74 @@ def test_coordination_domain_rejects_symlinks_and_nonregular_entries(
         os.close(workspace_descriptor)
 
 
+def test_coordination_acquisition_failure_is_resource_atomic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    workspace_descriptor = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY)
+    from server import sessions as sessions_module
+
+    before_descriptors = len(os.listdir("/dev/fd"))
+    primary = OSError("injected hashed-lock acquisition failure")
+    cleanup_error = OSError("injected coordination descriptor close failure")
+    failed_descriptor: int | None = None
+    close_interrupted = False
+    original_close = sessions_module.os.close
+
+    def fail_hashed_lock(descriptor: int, _operation: int) -> None:
+        nonlocal failed_descriptor
+        failed_descriptor = descriptor
+        raise primary
+
+    def interrupt_hashed_close_once(descriptor: int) -> None:
+        nonlocal close_interrupted
+        if descriptor == failed_descriptor and not close_interrupted:
+            close_interrupted = True
+            raise cleanup_error
+        original_close(descriptor)
+
+    replacement = None
+    retry_error: BaseException | None = None
+    try:
+        monkeypatch.setattr(sessions_module.fcntl, "flock", fail_hashed_lock)
+        monkeypatch.setattr(sessions_module.os, "close", interrupt_hashed_close_once)
+
+        with pytest.raises(OSError) as raised:
+            sessions_module._CoordinationLeaseClaim.acquire(
+                workspace_descriptor,
+                "acquisition-cleanup",
+            )
+
+        monkeypatch.undo()
+        after_failure = len(os.listdir("/dev/fd"))
+        try:
+            replacement = sessions_module._CoordinationLeaseClaim.acquire(
+                workspace_descriptor,
+                "acquisition-cleanup",
+            )
+        except BaseException as error:
+            retry_error = error
+        finally:
+            if replacement is not None:
+                replacement.release()
+        after_retry = len(os.listdir("/dev/fd"))
+
+        assert raised.value is primary, (
+            raised.value,
+            f"fd_growth={after_failure - before_descriptors}",
+            retry_error,
+        )
+        assert getattr(raised.value, "cleanup_errors", ()) == (cleanup_error,)
+        assert after_failure == before_descriptors
+        assert retry_error is None
+        assert after_retry == before_descriptors
+    finally:
+        monkeypatch.undo()
+        os.close(workspace_descriptor)
+
+
 @pytest.mark.parametrize(
     "failure_point",
     ["session_descriptor", "lock_clear", "process_registry", "coordination"],

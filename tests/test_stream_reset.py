@@ -5,6 +5,7 @@ import pathlib
 import httpx
 import pytest
 
+from harness.folding import FoldConfig, FoldingContext
 from harness.llm import CodexAdapter, LLMClient
 from harness.loop import run_turn
 from harness.tools.agent import agent_tool
@@ -23,6 +24,72 @@ def test_stream_reset_callback_is_exposed_by_every_public_completion_seam():
         assert parameter.default is None
 
 
+def test_stream_reset_is_appended_after_every_preexisting_parameter():
+    for complete in (LLMClient.complete, CodexAdapter.complete, FakeLLM.complete):
+        assert list(inspect.signature(complete).parameters)[-2:] == [
+            "projection_hash",
+            "on_stream_reset",
+        ]
+    assert list(inspect.signature(run_turn).parameters)[-2:] == [
+        "context",
+        "on_stream_reset",
+    ]
+
+
+def test_fake_llm_preserves_legacy_positional_projection_hash_behavior():
+    positional = FakeLLM([{"type": "text", "content": "same"}])
+    keyword = FakeLLM([{"type": "text", "content": "same"}])
+    positional_chunks = []
+    keyword_chunks = []
+
+    positional_reply = positional.complete(
+        [], None, None, positional_chunks.append, "legacy-hash"
+    )
+    keyword_reply = keyword.complete(
+        [],
+        on_text_delta=keyword_chunks.append,
+        projection_hash="legacy-hash",
+    )
+
+    assert positional_reply == keyword_reply
+    assert positional_chunks == keyword_chunks
+    assert positional.turns[0]["projection_hash"] == "legacy-hash"
+    assert positional.turns[0] == keyword.turns[0]
+
+
+def test_run_turn_preserves_legacy_positional_folding_context_behavior(tmp_path):
+    context = FoldingContext(
+        tmp_path / "folds.sqlite3",
+        "legacy-position",
+        config=FoldConfig(min_span_tokens=0),
+    )
+    llm = FakeLLM([{"type": "text", "content": "same"}])
+    messages = []
+    try:
+        reply = run_turn(
+            messages,
+            "go",
+            llm,
+            None,
+            20,
+            None,
+            None,
+            None,
+            None,
+            None,
+            8,
+            None,
+            None,
+            None,
+            context,
+        )
+    finally:
+        context.close()
+
+    assert reply == {"role": "assistant", "content": "same"}
+    assert llm.turns[0]["projection_hash"] is not None
+
+
 class _CapturingLLM:
     def __init__(self, script):
         self.inner = FakeLLM(script)
@@ -34,8 +101,8 @@ class _CapturingLLM:
         tools=None,
         system=None,
         on_text_delta=None,
-        on_stream_reset=None,
         projection_hash=None,
+        on_stream_reset=None,
     ):
         self.reset_callbacks.append(on_stream_reset)
         return self.inner.complete(
@@ -180,6 +247,7 @@ class _StreamClient:
         self.responses = iter(responses)
         self.events = events
         self.attempts = 0
+        self.requests = []
 
     def __enter__(self):
         return self
@@ -187,9 +255,10 @@ class _StreamClient:
     def __exit__(self, *_):
         return None
 
-    def stream(self, *_args, **_kwargs):
+    def stream(self, *_args, **kwargs):
         self.attempts += 1
         self.events.append("attempt")
+        self.requests.append(kwargs)
         return next(self.responses)
 
 
@@ -262,6 +331,21 @@ def test_adapter_does_not_reset_on_the_first_attempt(adapter, monkeypatch):
     adapter.complete([], on_stream_reset=lambda: resets.append("reset"))
 
     assert resets == []
+
+
+def test_adapter_preserves_legacy_positional_projection_hash_behavior(
+    adapter, monkeypatch
+):
+    client = _install_stream(
+        monkeypatch,
+        [_StreamResponse([_completed("same")])],
+        [],
+    )
+
+    reply = adapter.complete([], None, None, None, "legacy-hash")
+
+    assert reply == {"role": "assistant", "content": "same"}
+    assert client.requests[0]["headers"]["x-agent-projection-hash"] == "legacy-hash"
 
 
 @pytest.mark.parametrize("first_events", [[], [_delta("")]])

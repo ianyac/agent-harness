@@ -61,8 +61,8 @@ def run_turn(
     on_compact: Callable[[int], None] | None = None,
     breadcrumbs: str | Callable[[], str] | None = None,
     on_text_delta: Callable[[str], None] | None = None,
-    on_stream_reset: Callable[[], None] | None = None,
     context: FoldingContext | None = None,
+    on_stream_reset: Callable[[], None] | None = None,
 ) -> dict:
     if context is not None and compact_threshold is not None:
         raise ValueError("context folding and compaction are mutually exclusive")

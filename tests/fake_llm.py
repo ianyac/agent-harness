@@ -36,8 +36,8 @@ class FakeLLM:
         tools: list[dict] | None = None,
         system: str | None = None,
         on_text_delta: Callable[[str], None] | None = None,
-        on_stream_reset: Callable[[], None] | None = None,
         projection_hash: str | None = None,
+        on_stream_reset: Callable[[], None] | None = None,
     ) -> dict:
         while True:
             turn = self.turns[self.current_line]

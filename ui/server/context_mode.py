@@ -1,0 +1,114 @@
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from harness.folding import FoldingContext
+
+
+CONTEXT_MODES = ("compaction", "folding")
+
+
+def _contains_compaction(session_path: Path) -> bool:
+    try:
+        lines = session_path.read_text().splitlines()
+    except FileNotFoundError:
+        return False
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") == "compact":
+            return True
+    return False
+
+
+@dataclass
+class PreparedContext:
+    mode: str
+    compact_threshold: int | None
+    folding: FoldingContext | None = None
+    _closed: bool = field(default=False, init=False, repr=False)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self.folding is not None:
+            self.folding.close()
+
+
+def prepare_context_mode(
+    session_path: Path,
+    *,
+    requested: str | None,
+    resuming: bool,
+    compact_threshold: int | None = None,
+) -> PreparedContext:
+    """Select and open the documented context artifacts for one session."""
+    session_path = Path(session_path)
+    if requested not in (None, *CONTEXT_MODES):
+        raise ValueError(f"invalid requested context mode: {requested!r}")
+    if compact_threshold is not None and compact_threshold <= 0:
+        raise ValueError("compact threshold must be a positive token count")
+
+    mode_path = session_path.with_suffix(".context-mode")
+    try:
+        stored = mode_path.read_text().strip() if mode_path.exists() else None
+    except OSError as error:
+        raise ValueError(
+            f"cannot read context mode for {session_path.name}: {error}"
+        ) from error
+    if stored not in (None, *CONTEXT_MODES):
+        raise ValueError(
+            f"invalid persisted context mode for {session_path.name}: {stored!r}"
+        )
+
+    ledger = session_path.with_suffix(".folds.sqlite3")
+    if stored == "folding" and resuming and not ledger.exists():
+        raise ValueError(
+            f"session {session_path.name} uses context folding but its ledger is missing"
+        )
+    if stored is None and ledger.exists():
+        stored = "folding"
+
+    if stored == "folding":
+        selected = "folding"
+    elif stored == "compaction":
+        if requested == "folding":
+            raise ValueError(
+                f"session {session_path.name} uses compaction and cannot switch to folding"
+            )
+        selected = "compaction"
+    else:
+        selected = requested or "compaction"
+        if (
+            selected == "folding"
+            and resuming
+            and _contains_compaction(session_path)
+        ):
+            raise ValueError(
+                f"session {session_path.name} contains compaction events and cannot switch to folding"
+            )
+
+    if selected == "folding" and compact_threshold is not None:
+        raise ValueError("context folding cannot be combined with a compact threshold")
+
+    try:
+        mode_path.parent.mkdir(parents=True, exist_ok=True)
+        mode_path.write_text(selected + "\n")
+    except OSError as error:
+        raise ValueError(
+            f"cannot persist context mode for {session_path.name}: {error}"
+        ) from error
+
+    if selected == "compaction":
+        return PreparedContext(selected, compact_threshold)
+
+    folding = FoldingContext(
+        ledger,
+        session_id=session_path.stem,
+        decision_log_path=session_path.with_suffix(".fold-decisions.jsonl"),
+        session_log_path=session_path,
+    )
+    return PreparedContext(selected, None, folding)

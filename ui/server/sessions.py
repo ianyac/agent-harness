@@ -223,6 +223,8 @@ class _SessionChannel:
         self.lifecycle = "active"
 
     def connect(self, loop: asyncio.AbstractEventLoop) -> SessionConnection:
+        if getattr(self.runtime, "_ui_durability_failed", False):
+            raise SessionResumeError("session transcript authority is unavailable")
         if self.shutting_down:
             raise SessionManagerClosed("session is shutting down")
         previous = self.current
@@ -315,7 +317,11 @@ class _SessionChannel:
         mode: str,
         owner_generation: int | None,
     ) -> None:
-        if self.running or self.shutting_down:
+        if (
+            self.running
+            or self.shutting_down
+            or getattr(self.runtime, "_ui_durability_failed", False)
+        ):
             raise ClientStateViolation("a turn cannot start in the current state")
         turn_id = uuid.uuid4().hex
         token = CancellationToken()
@@ -351,7 +357,15 @@ class _SessionChannel:
                 token,
             )
         finally:
-            self.messages = copy.deepcopy(self.runtime.messages)
+            durability_failed = getattr(
+                self.runtime, "_ui_durability_failed", False
+            )
+            if durability_failed:
+                self.lifecycle = "durability_failed"
+                self.shutting_down = True
+                self.queued_message = None
+            else:
+                self.messages = copy.deepcopy(self.runtime.messages)
             self.safety = asdict(self.runtime.safety_snapshot())
             self.running = False
             self.stopping = False
@@ -2155,6 +2169,10 @@ class SessionManager:
             raise SessionResumeError(f"session cleanup is {lifecycle}")
         existing = self._runtimes.get(record.session_id)
         if existing is not None:
+            if getattr(existing, "_ui_durability_failed", False):
+                raise SessionResumeError(
+                    "session transcript authority is unavailable"
+                )
             self._safe_session_path(
                 record.workspace,
                 record.session_id,

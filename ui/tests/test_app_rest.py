@@ -881,6 +881,82 @@ def test_manager_close_retries_only_failed_resources_and_stays_closed(
     assert manager._runtimes == {}
 
 
+def test_persistent_durability_failure_quarantines_non_durable_messages(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class CompletingLLM:
+        context_window = 128_000
+
+        def complete(self, *_args, on_text_delta=None, **_kwargs):
+            if on_text_delta is not None:
+                on_text_delta("uncommitted answer")
+            return {"role": "assistant", "content": "uncommitted answer"}
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    metadata = MetadataStore(tmp_path / "metadata.sqlite3")
+    manager = SessionManager(metadata, workspace, CompletingLLM)
+
+    async def scenario() -> None:
+        try:
+            record = await manager.create_session(
+                workspace=workspace,
+                mode="default",
+                context_mode="compaction",
+                title="Durability quarantine",
+            )
+            connection = await manager.connect(record.session_id)
+            runtime = manager._runtimes[record.session_id]
+            original_append = runtime.session_log._append
+
+            def append_partial(payload: str) -> None:
+                original_append(payload.splitlines(keepends=True)[0])
+                raise OSError("persistent append failure")
+
+            def fail_authoritative_reload() -> list[dict]:
+                raise OSError("authoritative reload unavailable")
+
+            monkeypatch.setattr(runtime.session_log, "_append", append_partial)
+            monkeypatch.setattr(
+                runtime.session_log,
+                "load",
+                fail_authoritative_reload,
+            )
+
+            connection.dispatch(UserMessage(text="must not surface", mode="base"))
+            while True:
+                event = await asyncio.wait_for(connection.next_event(), timeout=2)
+                if event.type in {
+                    "turn_completed",
+                    "turn_cancelled",
+                    "turn_failed",
+                }:
+                    terminal = event
+                    break
+
+            channel = manager._channels[record.session_id]
+            assert terminal.type == "turn_failed"
+            assert terminal.error_category == "filesystem"
+            assert runtime.messages == []
+            assert channel.messages == []
+            assert getattr(runtime, "_ui_durability_failed", False)
+            assert channel.lifecycle == "durability_failed"
+            assert channel.shutting_down
+
+            for operation in (
+                lambda: manager.open_runtime(record.session_id),
+                lambda: manager.connect(record.session_id),
+                lambda: manager.safety(record.session_id),
+            ):
+                with pytest.raises(SessionResumeError, match="authority"):
+                    await operation()
+        finally:
+            await manager.close()
+
+    asyncio.run(scenario())
+
+
 def test_manager_close_retries_process_claim_release_and_allows_reacquire(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

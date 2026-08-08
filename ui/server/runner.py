@@ -190,6 +190,7 @@ class TurnRunner:
         self.runtime = runtime
         self.decisions = decisions or DecisionBroker()
         self._turn_lock = _prepare_runtime(runtime)
+        self._authoritative_messages_before_turn: list[dict] | None = None
 
     def run(
         self,
@@ -219,6 +220,9 @@ class TurnRunner:
         try:
             if getattr(runtime, "_ui_durability_failed", False):
                 self._restore_authoritative_messages()
+            self._authoritative_messages_before_turn = copy.deepcopy(
+                runtime.messages
+            )
             runtime.policy.mode = (
                 "plan" if mode == "plan" else runtime.policy.base_mode
             )
@@ -393,6 +397,11 @@ class TurnRunner:
         except Exception as error:
             self._restore_authoritative_messages_after(error)
             raise
+        trusted = self._authoritative_messages_before_turn or []
+        self._authoritative_messages_before_turn = [
+            copy.deepcopy(summary),
+            *copy.deepcopy(trusted[cut:]),
+        ]
         context.sink.emit(
             "context_updated",
             turn_id=context.turn_id,
@@ -421,11 +430,18 @@ class TurnRunner:
         except Exception as error:
             self._restore_authoritative_messages_after(error)
             raise
+        self._authoritative_messages_before_turn = copy.deepcopy(
+            self.runtime.messages
+        )
 
     def _restore_authoritative_messages_after(self, original: Exception) -> None:
         try:
             self._restore_authoritative_messages()
         except Exception as recovery_error:
+            trusted = self._authoritative_messages_before_turn
+            self.runtime.messages[:] = (
+                copy.deepcopy(trusted) if trusted is not None else []
+            )
             setattr(self.runtime, "_ui_durability_failed", True)
             original.add_note(
                 "authoritative transcript reload failed: "
@@ -436,6 +452,7 @@ class TurnRunner:
         restored = self.runtime.session_log.load()
         validate_unicode_scalars(restored)
         self.runtime.messages[:] = copy.deepcopy(restored)
+        self._authoritative_messages_before_turn = copy.deepcopy(restored)
         setattr(self.runtime, "_ui_durability_failed", False)
 
     @staticmethod

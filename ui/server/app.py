@@ -30,6 +30,7 @@ from server.sessions import (
     SessionNotFound,
     SessionResumeError,
 )
+from server.static import install_static_routes
 
 
 @dataclass(frozen=True)
@@ -151,6 +152,8 @@ async def _receive_connection_events(websocket: WebSocket, connection) -> None:
 def create_app(
     settings: AppSettings,
     llm_factory: Callable[[], LLMClient],
+    *,
+    static_root: Path | None = None,
 ) -> FastAPI:
     auth = LaunchAuth(settings.launch_secret, set(settings.allowed_origins))
 
@@ -314,4 +317,13 @@ def create_app(
                 connection.disconnected()
 
     app.include_router(router)
+
+    @app.websocket("/{path:path}")
+    async def unknown_websocket(websocket: WebSocket, _path: str) -> None:
+        selected_protocol = auth.require_websocket(websocket)
+        await websocket.accept(subprotocol=selected_protocol)
+        await websocket.close(code=1008, reason="Unknown WebSocket route")
+
+    if static_root is not None:
+        install_static_routes(app, static_root, auth)
     return app

@@ -1011,3 +1011,25 @@ def test_websocket_selects_only_the_public_subprotocol(service):
             assert ws.accepted_subprotocol == "harness-ui"
             assert SECRET not in ws.accepted_subprotocol
             assert ws.receive_json()["type"] == "session_snapshot"
+
+
+@pytest.mark.parametrize(
+    ("headers", "subprotocols"),
+    [
+        ({"Origin": ORIGIN}, None),
+        ({"Origin": ORIGIN}, ["harness-ui", SECRET]),
+    ],
+)
+def test_unknown_websocket_routes_are_authenticated_and_never_served_by_spa(
+    service, headers: dict, subprotocols: list[str] | None
+):
+    with service(WholeTextLLM("unused")) as (client, _session_id, _, _):
+        with pytest.raises(WebSocketDisconnect) as closed:
+            with client.websocket_connect(
+                "/ws/not-a-route",
+                headers=headers,
+                subprotocols=subprotocols,
+            ):
+                pass
+
+        assert closed.value.code == 1008

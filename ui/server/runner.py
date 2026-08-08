@@ -11,6 +11,8 @@ import uuid
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 
+import httpx
+from harness.llm import RetryableHTTPError
 from harness.loop import run_turn
 from harness.tools.base import Tool
 from server.bridge import (
@@ -138,7 +140,15 @@ def _prepare_runtime(runtime: HarnessRuntime) -> threading.Lock:
 
 
 def _error_category(error: Exception) -> str:
-    if isinstance(error, (TimeoutError, ConnectionError)):
+    if isinstance(
+        error,
+        (TimeoutError, ConnectionError, httpx.TransportError, RetryableHTTPError),
+    ):
+        return "provider"
+    if isinstance(error, RuntimeError) and (
+        str(error).startswith("codex HTTP ")
+        or str(error) == "codex stream ended without response.completed"
+    ):
         return "provider"
     if isinstance(error, OSError):
         return "filesystem"
@@ -156,7 +166,6 @@ class TurnRunner:
         self.runtime = runtime
         self.decisions = decisions or DecisionBroker()
         self._turn_lock = _prepare_runtime(runtime)
-        runtime.bind_plan_reviewer(self._review_plan)
 
     def run(
         self,
@@ -180,13 +189,18 @@ class TurnRunner:
         token: CancellationToken,
     ) -> None:
         runtime = self.runtime
-        runtime.policy.mode = "plan" if mode == "plan" else runtime.policy.base_mode
-        boundary = len(runtime.messages)
-        context = _TurnContext(runtime, sink, turn_id, token, _safety(runtime))
-        turn_context = _current_turn.set(context)
-        activity_context = _current_activity.set(None)
-        sink.emit("turn_started", turn_id=turn_id, mode=mode)
+        context: _TurnContext | None = None
+        turn_context: contextvars.Token[_TurnContext | None] | None = None
+        activity_context: contextvars.Token[str | None] | None = None
         try:
+            runtime.policy.mode = (
+                "plan" if mode == "plan" else runtime.policy.base_mode
+            )
+            context = _TurnContext(runtime, sink, turn_id, token, _safety(runtime))
+            turn_context = _current_turn.set(context)
+            activity_context = _current_activity.set(None)
+            runtime.bind_plan_reviewer(self._review_plan)
+            sink.emit("turn_started", turn_id=turn_id, mode=mode)
             reply = run_turn(
                 runtime.messages,
                 text,
@@ -217,28 +231,64 @@ class TurnRunner:
                 final_text=reply.get("content") or "",
             )
         except TurnCancelled:
-            rollback_to_boundary(runtime.messages)
-            if len(runtime.messages) < boundary:
-                raise RuntimeError("rollback crossed the recorded turn boundary")
-            self._restore_base_mode(context)
-            self._record_surviving_boundary()
-            sink.emit("turn_cancelled", turn_id=turn_id)
+            self._finish_cancelled(sink, turn_id)
         except Exception as error:
-            rollback_to_boundary(runtime.messages)
-            if len(runtime.messages) < boundary:
-                error.add_note("rollback crossed the recorded turn boundary")
-            self._restore_base_mode(context)
-            self._record_surviving_boundary()
-            sink.emit(
-                "turn_failed",
-                turn_id=turn_id,
-                error_category=_error_category(error),
-                message=str(error),
-            )
+            self._finish_failed(sink, turn_id, error)
         finally:
             runtime.policy.mode = runtime.policy.base_mode
-            _current_activity.reset(activity_context)
-            _current_turn.reset(turn_context)
+            try:
+                if activity_context is not None:
+                    _current_activity.reset(activity_context)
+            finally:
+                if turn_context is not None:
+                    _current_turn.reset(turn_context)
+
+    def _finish_cancelled(
+        self,
+        sink: EventSink,
+        turn_id: str,
+    ) -> None:
+        try:
+            rollback_to_boundary(self.runtime.messages)
+        except Exception:
+            pass
+        self._restore_base_mode_safely()
+        self._record_surviving_boundary()
+        self._emit_terminal_safely(sink, "turn_cancelled", turn_id=turn_id)
+
+    def _finish_failed(
+        self,
+        sink: EventSink,
+        turn_id: str,
+        error: Exception,
+    ) -> None:
+        try:
+            rollback_to_boundary(self.runtime.messages)
+        except Exception:
+            pass
+        self._restore_base_mode_safely()
+        self._record_surviving_boundary()
+        self._emit_terminal_safely(
+            sink,
+            "turn_failed",
+            turn_id=turn_id,
+            error_category=_error_category(error),
+            message=str(error),
+        )
+
+    def _restore_base_mode_safely(self) -> None:
+        self.runtime.policy.mode = self.runtime.policy.base_mode
+
+    @staticmethod
+    def _emit_terminal_safely(
+        sink: EventSink,
+        event_type: str,
+        **payload: object,
+    ) -> None:
+        try:
+            sink.emit(event_type, **payload)
+        except Exception:
+            pass
 
     def _ask_permission(self, action: str, args: dict) -> str:
         context = self._require_context()
@@ -255,7 +305,9 @@ class TurnRunner:
                 reason=f"{action} requires permission",
             )
 
-        answer = self.decisions.request_permission(request_id, announce)
+        answer = self.decisions.request_permission(
+            request_id, announce, token=context.token
+        )
         context.sink.emit(
             "permission_resolved",
             turn_id=context.turn_id,
@@ -278,7 +330,9 @@ class TurnRunner:
                 plan=plan,
             )
 
-        approved, feedback = self.decisions.request_plan(request_id, announce)
+        approved, feedback = self.decisions.request_plan(
+            request_id, announce, token=context.token
+        )
         context.sink.emit(
             "plan_approval_resolved",
             turn_id=context.turn_id,

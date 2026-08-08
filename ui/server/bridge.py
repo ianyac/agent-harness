@@ -21,13 +21,38 @@ class TurnCancelled(Exception):
 class CancellationToken:
     def __init__(self) -> None:
         self._cancelled = threading.Event()
+        self._callback_lock = threading.Lock()
+        self._callbacks: set[Callable[[], None]] = set()
 
     def cancel(self) -> None:
-        self._cancelled.set()
+        with self._callback_lock:
+            if self._cancelled.is_set():
+                return
+            self._cancelled.set()
+            callbacks = tuple(self._callbacks)
+            self._callbacks.clear()
+        for callback in callbacks:
+            callback()
 
     def check(self) -> None:
         if self._cancelled.is_set():
             raise TurnCancelled()
+
+    def add_cancel_callback(
+        self, callback: Callable[[], None]
+    ) -> Callable[[], None]:
+        with self._callback_lock:
+            cancelled = self._cancelled.is_set()
+            if not cancelled:
+                self._callbacks.add(callback)
+        if cancelled:
+            callback()
+
+        def remove() -> None:
+            with self._callback_lock:
+                self._callbacks.discard(callback)
+
+        return remove
 
 
 class EventSink:
@@ -48,19 +73,25 @@ class EventSink:
         self._adapter = TypeAdapter(ServerEvent)
 
     def emit(self, event_type: str, **payload: object) -> None:
+        reserved = {"type", "session_id", "generation", "sequence"}
+        overrides = sorted(reserved.intersection(payload))
+        if overrides:
+            raise ValueError(
+                "reserved event field override: " + ", ".join(overrides)
+            )
         with self._sequence_lock:
-            self._sequence += 1
-            sequence = self._sequence
-        event = self._adapter.validate_python(
-            {
-                "type": event_type,
-                "session_id": self.session_id,
-                "generation": self.generation,
-                "sequence": sequence,
-                **payload,
-            }
-        )
-        self.loop.call_soon_threadsafe(self._queue.put_nowait, event)
+            sequence = self._sequence + 1
+            event = self._adapter.validate_python(
+                {
+                    "type": event_type,
+                    "session_id": self.session_id,
+                    "generation": self.generation,
+                    "sequence": sequence,
+                    **payload,
+                }
+            )
+            self.loop.call_soon_threadsafe(self._queue.put_nowait, event)
+            self._sequence = sequence
 
     async def next(self) -> ServerEvent:
         return await self._queue.get()
@@ -85,6 +116,7 @@ class DecisionBroker:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._pending: _PendingDecision | None = None
+        self._disconnected = False
 
     @property
     def pending_request_id(self) -> str | None:
@@ -95,8 +127,10 @@ class DecisionBroker:
         self,
         request_id: str,
         on_pending: Callable[[], None] | None = None,
+        *,
+        token: CancellationToken | None = None,
     ) -> PermissionResult:
-        result = self._request("permission", request_id, on_pending)
+        result = self._request("permission", request_id, on_pending, token)
         if not isinstance(result, str):
             raise RuntimeError("permission request received a plan answer")
         return result
@@ -105,8 +139,10 @@ class DecisionBroker:
         self,
         request_id: str,
         on_pending: Callable[[], None] | None = None,
+        *,
+        token: CancellationToken | None = None,
     ) -> PlanResult:
-        result = self._request("plan", request_id, on_pending)
+        result = self._request("plan", request_id, on_pending, token)
         if not isinstance(result, tuple):
             raise RuntimeError("plan request received a permission answer")
         return result
@@ -116,17 +152,28 @@ class DecisionBroker:
         kind: DecisionKind,
         request_id: str,
         on_pending: Callable[[], None] | None,
+        token: CancellationToken | None,
     ) -> PermissionResult | PlanResult:
         pending = _PendingDecision(kind, request_id, queue.Queue(maxsize=1))
         with self._lock:
+            if self._disconnected:
+                return self._fallback(kind)
             if self._pending is not None:
                 raise RuntimeError("a decision request is already pending")
             self._pending = pending
+        remove_cancel_callback = (
+            token.add_cancel_callback(
+                lambda: self._resolve(pending, self._fallback(kind))
+            )
+            if token is not None
+            else lambda: None
+        )
         try:
             if on_pending is not None:
                 on_pending()
             return pending.answers.get()
         finally:
+            remove_cancel_callback()
             with self._lock:
                 if self._pending is pending:
                     self._pending = None
@@ -169,14 +216,27 @@ class DecisionBroker:
 
     def disconnect(self) -> None:
         with self._lock:
+            self._disconnected = True
             pending = self._pending
             if pending is None or pending.answered:
                 return
             pending.answered = True
-            fallback: PermissionResult | PlanResult = (
-                "no" if pending.kind == "permission" else (False, "")
-            )
-            pending.answers.put_nowait(fallback)
+            pending.answers.put_nowait(self._fallback(pending.kind))
+
+    def _resolve(
+        self,
+        pending: _PendingDecision,
+        answer: PermissionResult | PlanResult,
+    ) -> None:
+        with self._lock:
+            if self._pending is not pending or pending.answered:
+                return
+            pending.answered = True
+            pending.answers.put_nowait(answer)
+
+    @staticmethod
+    def _fallback(kind: DecisionKind) -> PermissionResult | PlanResult:
+        return "no" if kind == "permission" else (False, "")
 
 
 class CancellableLLM:

@@ -4,7 +4,9 @@ import time
 from pathlib import Path
 
 import pytest
+import httpx
 
+from harness.llm import RetryableHTTPError
 from harness.tools.base import Tool
 from server.bridge import CancellationToken, EventSink
 from server.runner import TurnRunner
@@ -26,7 +28,12 @@ def _tool(name: str, execute, *, read_only: bool = False) -> Tool:
 def make_runtime(tmp_path: Path):
     runtimes: list[HarnessRuntime] = []
 
-    def make(llm: FakeLLM, *, mode: str = "default") -> HarnessRuntime:
+    def make(
+        llm: FakeLLM,
+        *,
+        mode: str = "default",
+        compact_threshold: int = 100_000,
+    ) -> HarnessRuntime:
         workspace = tmp_path / f"workspace-{len(runtimes)}"
         workspace.mkdir()
         session_path = workspace / ".agent" / f"session-{len(runtimes)}.jsonl"
@@ -36,7 +43,7 @@ def make_runtime(tmp_path: Path):
                 workspace=workspace,
                 mode=mode,
                 context_mode="compaction",
-                compact_threshold=100_000,
+                compact_threshold=compact_threshold,
             ),
             llm,
             session_path,
@@ -308,6 +315,95 @@ async def test_cancellation_rolls_back_partial_turn_to_transcript_boundary(
 
 
 @pytest.mark.asyncio
+async def test_cancellation_after_in_place_compaction_emits_one_terminal_event(
+    make_runtime,
+):
+    token = CancellationToken()
+
+    class CancelAfterSummaryLLM:
+        context_window = 128_000
+
+        def __init__(self):
+            self.calls = 0
+
+        def complete(
+            self,
+            messages,
+            tools=None,
+            system=None,
+            on_text_delta=None,
+            projection_hash=None,
+            on_stream_reset=None,
+        ):
+            self.calls += 1
+            if self.calls == 1:
+                return {"role": "assistant", "content": "older turns summary"}
+            token.cancel()
+            return {"role": "assistant", "content": "must be discarded"}
+
+    runtime = make_runtime(CancelAfterSummaryLLM(), compact_threshold=1)
+    for number in range(6):
+        runtime.messages.extend(
+            [
+                {"role": "user", "content": f"question {number}"},
+                {"role": "assistant", "content": f"answer {number}"},
+            ]
+        )
+    runtime.session_log.record_turn(runtime.messages)
+    original_length = len(runtime.messages)
+    runner = TurnRunner(runtime)
+    sink = _sink()
+
+    await asyncio.to_thread(
+        runner.run, "new question", "base", "turn-1", sink, token
+    )
+    events = await _events_until(sink, "turn_cancelled")
+    await asyncio.sleep(0)
+
+    assert [event.type for event in events].count("turn_cancelled") == 1
+    assert events[-1].type == "turn_cancelled"
+    assert len(runtime.messages) < original_length
+    assert runtime.messages[-1] == {"role": "assistant", "content": "answer 5"}
+    assert runtime.session_log.load() == runtime.messages
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(sink.next(), timeout=0.01)
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_permission_wait_wakes_and_cancels_turn(
+    make_runtime,
+):
+    llm = FakeLLM(
+        [
+            {"type": "tool_calls", "calls": [{"name": "change", "arguments": {}}]},
+            {"type": "text", "content": "must not continue"},
+        ]
+    )
+    runtime = make_runtime(llm)
+    runtime.tools["change"] = _tool("change", lambda: "changed")
+    runner = TurnRunner(runtime)
+    sink = _sink()
+    token = CancellationToken()
+    task = asyncio.create_task(
+        asyncio.to_thread(runner.run, "hello", "base", "turn-1", sink, token)
+    )
+
+    assert (await sink.next()).type == "turn_started"
+    requested = await sink.next()
+    assert requested.type == "permission_requested"
+    token.cancel()
+    done, _ = await asyncio.wait({task}, timeout=0.1)
+    if not done:
+        runner.decisions.disconnect()
+    await asyncio.wait_for(task, timeout=2)
+    events = await _events_until(sink, "turn_cancelled")
+
+    assert done == {task}
+    assert any(event.type == "permission_resolved" for event in events)
+    assert runtime.messages == []
+
+
+@pytest.mark.asyncio
 async def test_runner_serializes_two_turns_in_one_runtime_worker_lane(make_runtime):
     class LaneLLM:
         context_window = 128_000
@@ -376,6 +472,117 @@ async def test_runner_serializes_two_turns_in_one_runtime_worker_lane(make_runti
 
 
 @pytest.mark.asyncio
+async def test_two_runners_route_each_plan_review_to_the_active_turn_broker(
+    make_runtime,
+):
+    llm = FakeLLM(
+        [
+            {
+                "type": "tool_calls",
+                "calls": [
+                    {"name": "exit_plan_mode", "arguments": {"plan": "Plan A"}}
+                ],
+            },
+            {"type": "text", "content": "A done"},
+            {
+                "type": "tool_calls",
+                "calls": [
+                    {"name": "exit_plan_mode", "arguments": {"plan": "Plan B"}}
+                ],
+            },
+            {"type": "text", "content": "B done"},
+        ]
+    )
+    runtime = make_runtime(llm, mode="acceptAll")
+    runner_a = TurnRunner(runtime)
+    runner_b = TurnRunner(runtime)
+
+    async def run_and_approve(runner, label, generation):
+        sink = EventSink("session", generation, asyncio.get_running_loop())
+        task = asyncio.create_task(
+            asyncio.to_thread(
+                runner.run,
+                f"question {label}",
+                "plan",
+                f"turn-{label}",
+                sink,
+                CancellationToken(),
+            )
+        )
+        assert (await sink.next()).type == "turn_started"
+        assert (await sink.next()).type == "activity_started"
+        requested = await sink.next()
+        assert requested.type == "plan_approval_requested"
+        accepted = runner.decisions.answer_plan(requested.request_id, True, "")
+        if not accepted:
+            other = runner_b if runner is runner_a else runner_a
+            other.decisions.answer_plan(requested.request_id, False, "cleanup")
+        await asyncio.wait_for(task, timeout=2)
+        await _events_until(sink, "turn_completed")
+        return accepted
+
+    assert await run_and_approve(runner_a, "a", 1) is True
+    assert await run_and_approve(runner_b, "b", 2) is True
+
+
+@pytest.mark.asyncio
+async def test_turn_start_failure_restores_mode_and_context_and_emits_failure(
+    make_runtime,
+):
+    runtime = make_runtime(FakeLLM([{"type": "text", "content": "unused"}]))
+    runner = TurnRunner(runtime)
+
+    class RejectStartedSink(EventSink):
+        def emit(self, event_type: str, **payload: object) -> None:
+            if event_type == "turn_started":
+                raise ValueError("invalid turn_started")
+            super().emit(event_type, **payload)
+
+    sink = RejectStartedSink("session", 1, asyncio.get_running_loop())
+    observed: list[tuple[BaseException | None, object, object, str]] = []
+
+    def run_and_inspect_context():
+        import server.runner as runner_module
+
+        caught = None
+        try:
+            runner.run("hello", "plan", "turn-1", sink, CancellationToken())
+        except BaseException as error:
+            caught = error
+        observed.append(
+            (
+                caught,
+                runner_module._current_turn.get(),
+                runner_module._current_activity.get(),
+                runtime.policy.mode,
+            )
+        )
+
+    worker = threading.Thread(target=run_and_inspect_context)
+    worker.start()
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+    failed = await asyncio.wait_for(sink.next(), timeout=1)
+
+    assert observed == [(None, None, None, "default")]
+    assert failed.type == "turn_failed"
+    assert failed.error_category == "invalid_response"
+    assert failed.message == "invalid turn_started"
+
+
+def test_closed_event_loop_failure_restores_base_mode_without_escaping(make_runtime):
+    runtime = make_runtime(FakeLLM([{"type": "text", "content": "unused"}]))
+    runner = TurnRunner(runtime)
+    closed_loop = asyncio.new_event_loop()
+    closed_loop.close()
+    sink = EventSink("session", 1, closed_loop)
+
+    runner.run("hello", "plan", "turn-1", sink, CancellationToken())
+
+    assert runtime.policy.mode == "default"
+
+
+@pytest.mark.asyncio
 async def test_runner_rolls_back_and_categorizes_non_cancellation_failures(
     make_runtime,
 ):
@@ -391,3 +598,50 @@ async def test_runner_rolls_back_and_categorizes_non_cancellation_failures(
     assert failed.message == "unknown FakeLLM script entry type 'broken'"
     assert runtime.messages == []
     assert runtime.session_log.load() == []
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        httpx.ReadError("stream lost"),
+        RetryableHTTPError(503),
+        RuntimeError("codex HTTP 401: unauthorized"),
+        RuntimeError("codex stream ended without response.completed"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_runner_categorizes_concrete_provider_failures(
+    make_runtime, error
+):
+    class FailingLLM:
+        context_window = 128_000
+
+        def complete(self, *_args, **_kwargs):
+            raise error
+
+    runtime = make_runtime(FailingLLM())
+    runner = TurnRunner(runtime)
+    sink = _sink()
+
+    await _run(runner, sink)
+    events = await _events_until(sink, "turn_failed")
+
+    assert events[-1].error_category == "provider"
+
+
+@pytest.mark.asyncio
+async def test_runner_keeps_unrecognized_runtime_errors_internal(make_runtime):
+    class FailingLLM:
+        context_window = 128_000
+
+        def complete(self, *_args, **_kwargs):
+            raise RuntimeError("programming bug")
+
+    runtime = make_runtime(FailingLLM())
+    runner = TurnRunner(runtime)
+    sink = _sink()
+
+    await _run(runner, sink)
+    events = await _events_until(sink, "turn_failed")
+
+    assert events[-1].error_category == "internal"

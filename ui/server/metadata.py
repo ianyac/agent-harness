@@ -57,16 +57,38 @@ class PreferenceRecord:
 
 
 class MetadataStore:
-    """Persist only metadata that can be rebuilt from harness session files."""
+    """Persist rebuildable metadata through a single-thread-confined connection.
+
+    One manager owns this store and calls every method from the thread that
+    created it. The default sqlite same-thread protection deliberately remains
+    enabled; cross-thread callers require an explicitly synchronized design.
+    """
 
     def __init__(self, path: Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._connection = sqlite3.connect(self.path)
-        self._connection.row_factory = sqlite3.Row
-        self._connection.execute("PRAGMA journal_mode=WAL")
-        self._connection.execute("PRAGMA foreign_keys=ON")
-        self._initialize_schema()
+        self._closed = False
+        try:
+            self._connection.row_factory = sqlite3.Row
+            self._connection.execute("PRAGMA journal_mode=WAL")
+            self._connection.execute("PRAGMA foreign_keys=ON")
+            self._initialize_schema()
+        except Exception:
+            self.close()
+            raise
+
+    def __enter__(self) -> MetadataStore:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        """Close the owned SQLite connection; repeated calls are harmless."""
+        if not self._closed:
+            self._connection.close()
+            self._closed = True
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
@@ -249,9 +271,7 @@ class MetadataStore:
                 ON CONFLICT(session_id) DO UPDATE SET
                     workspace = excluded.workspace,
                     mode = excluded.mode,
-                    context_mode = excluded.context_mode,
-                    updated_at = excluded.updated_at,
-                    last_opened_at = excluded.last_opened_at
+                    context_mode = excluded.context_mode
                 """,
                 (
                     session.session_id,

@@ -69,6 +69,14 @@ def _error_response(status_code: int, error_type: str, message: str) -> JSONResp
     )
 
 
+def _record_cleanup_failure(original: BaseException, cleanup: BaseException) -> None:
+    original.add_note(
+        f"startup cleanup failed: {type(cleanup).__name__}: {cleanup}"
+    )
+    existing = tuple(getattr(original, "cleanup_errors", ()))
+    original.cleanup_errors = (*existing, cleanup)  # type: ignore[attr-defined]
+
+
 def create_app(
     settings: AppSettings,
     llm_factory: Callable[[], LLMClient],
@@ -78,15 +86,29 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         metadata = MetadataStore(settings.metadata_path)
-        manager = SessionManager(
-            metadata,
-            settings.base_workspace,
-            llm_factory,
-            compact_threshold=settings.compact_threshold,
-        )
+        try:
+            manager = SessionManager(
+                metadata,
+                settings.base_workspace,
+                llm_factory,
+                compact_threshold=settings.compact_threshold,
+            )
+        except BaseException as startup_error:
+            try:
+                metadata.close()
+            except BaseException as cleanup_error:
+                _record_cleanup_failure(startup_error, cleanup_error)
+            raise
         app.state.session_manager = manager
         try:
             await manager.discover()
+        except BaseException as startup_error:
+            try:
+                await manager.close()
+            except BaseException as cleanup_error:
+                _record_cleanup_failure(startup_error, cleanup_error)
+            raise
+        try:
             yield
         finally:
             await manager.close()

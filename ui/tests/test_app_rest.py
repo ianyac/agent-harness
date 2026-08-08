@@ -2,6 +2,7 @@ import asyncio
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import shutil
 import warnings
 
 import pytest
@@ -17,7 +18,7 @@ with warnings.catch_warnings():
 
 from server.app import AppSettings, create_app
 from server.metadata import MetadataStore, NewSession
-from server.sessions import SessionManager
+from server.sessions import InvalidWorkspace, SessionManager
 
 
 ORIGIN = "http://testserver"
@@ -529,3 +530,443 @@ def test_lifespan_closes_open_runtimes_and_metadata(
     assert not lock_path.exists()
     with pytest.raises(Exception):
         manager.metadata.get_session(session_id)
+
+
+@pytest.mark.parametrize("linked_parent", ["agent", "sessions"])
+def test_discovery_rejects_symlinked_session_parents_without_external_reads(
+    tmp_path: Path, linked_parent: str
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    external_agent = tmp_path / "external-agent"
+    external_sessions = external_agent / "sessions"
+    external_sessions.mkdir(parents=True)
+    external_session = external_sessions / "outside.jsonl"
+    write_completed_session(external_session, "external-secret")
+    if linked_parent == "agent":
+        (workspace / ".agent").symlink_to(external_agent, target_is_directory=True)
+    else:
+        (workspace / ".agent").mkdir()
+        (workspace / ".agent" / "sessions").symlink_to(
+            external_sessions, target_is_directory=True
+        )
+    original = external_session.read_bytes()
+    settings = AppSettings(
+        metadata_path=tmp_path / "metadata.sqlite3",
+        base_workspace=workspace,
+        launch_secret=SECRET,
+        allowed_origins=frozenset({ORIGIN}),
+    )
+
+    with TestClient(
+        create_app(settings, FakeLLM),
+        base_url=ORIGIN,
+        headers=AUTH_HEADERS,
+    ) as test_client:
+        response = test_client.get("/api/sessions")
+
+    assert response.status_code == 200
+    assert response.json() == []
+    assert external_session.read_bytes() == original
+
+
+@pytest.mark.parametrize(
+    "external_payload",
+    [
+        "NOT SESSION DATA",
+        json.dumps(
+            {
+                "type": "message",
+                "message": {"role": "assistant", "content": "external-secret"},
+            }
+        )
+        + "\n",
+    ],
+)
+def test_transcript_rejects_symlinked_session_file_without_read_or_truncation(
+    tmp_path: Path, external_payload: str
+):
+    workspace = tmp_path / "workspace"
+    sessions_dir = workspace / ".agent" / "sessions"
+    sessions_dir.mkdir(parents=True)
+    external = tmp_path / "external.jsonl"
+    external.write_text(external_payload)
+    (sessions_dir / "linked.jsonl").symlink_to(external)
+    metadata_path = tmp_path / "metadata.sqlite3"
+    with MetadataStore(metadata_path) as metadata:
+        metadata.create_session(NewSession.defaults("linked", workspace))
+    settings = AppSettings(
+        metadata_path=metadata_path,
+        base_workspace=workspace,
+        launch_secret=SECRET,
+        allowed_origins=frozenset({ORIGIN}),
+    )
+
+    with TestClient(
+        create_app(settings, FakeLLM),
+        base_url=ORIGIN,
+        headers=AUTH_HEADERS,
+    ) as test_client:
+        response = test_client.get("/api/sessions/linked/transcript")
+
+    assert response.status_code == 409
+    assert response.json()["error"]["type"] == "session_resume_error"
+    assert "external-secret" not in response.text
+    assert external.read_text() == external_payload
+
+
+def test_transcript_rejects_symlinked_lock_without_overwriting_target(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    session_path = workspace / ".agent" / "sessions" / "locked.jsonl"
+    write_completed_session(session_path, "local")
+    external = tmp_path / "external-lock-target"
+    external.write_text("not-a-pid")
+    session_path.with_suffix(".lock").symlink_to(external)
+    metadata_path = tmp_path / "metadata.sqlite3"
+    with MetadataStore(metadata_path) as metadata:
+        metadata.create_session(NewSession.defaults("locked", workspace))
+    settings = AppSettings(
+        metadata_path=metadata_path,
+        base_workspace=workspace,
+        launch_secret=SECRET,
+        allowed_origins=frozenset({ORIGIN}),
+    )
+
+    with TestClient(
+        create_app(settings, FakeLLM),
+        base_url=ORIGIN,
+        headers=AUTH_HEADERS,
+    ) as test_client:
+        response = test_client.get("/api/sessions/locked/transcript")
+
+    assert response.status_code == 409
+    assert response.json()["error"]["type"] == "session_resume_error"
+    assert external.read_text() == "not-a-pid"
+
+
+def test_runtime_rejects_symlinked_context_artifact_outside_workspace(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    session_path = workspace / ".agent" / "sessions" / "context-link.jsonl"
+    write_completed_session(session_path, "local")
+    external = tmp_path / "external-context-mode"
+    external.write_text("compaction\n")
+    session_path.with_suffix(".context-mode").symlink_to(external)
+    metadata_path = tmp_path / "metadata.sqlite3"
+    with MetadataStore(metadata_path) as metadata:
+        metadata.create_session(NewSession.defaults("context-link", workspace))
+    settings = AppSettings(
+        metadata_path=metadata_path,
+        base_workspace=workspace,
+        launch_secret=SECRET,
+        allowed_origins=frozenset({ORIGIN}),
+    )
+
+    with TestClient(
+        create_app(settings, FakeLLM),
+        base_url=ORIGIN,
+        headers=AUTH_HEADERS,
+    ) as test_client:
+        response = test_client.get("/api/sessions/context-link/safety")
+
+    assert response.status_code == 409
+    assert response.json()["error"]["type"] == "session_resume_error"
+    assert external.read_text() == "compaction\n"
+
+
+def test_lifespan_closes_metadata_and_preserves_startup_error_when_manager_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from server import app as app_module
+
+    calls: list[str] = []
+
+    class FailingCloseMetadata:
+        def __init__(self, _path: Path):
+            calls.append("open")
+
+        def close(self) -> None:
+            calls.append("close")
+            raise RuntimeError("metadata cleanup failed")
+
+    missing_workspace = tmp_path / "missing-workspace"
+    settings = AppSettings(
+        metadata_path=tmp_path / "metadata.sqlite3",
+        base_workspace=missing_workspace,
+        launch_secret=SECRET,
+        allowed_origins=frozenset({ORIGIN}),
+    )
+    monkeypatch.setattr(app_module, "MetadataStore", FailingCloseMetadata)
+
+    with pytest.raises(InvalidWorkspace) as raised:
+        with TestClient(create_app(settings, FakeLLM), base_url=ORIGIN):
+            pass
+
+    assert calls == ["open", "close"]
+    assert "metadata cleanup failed" in "\n".join(raised.value.__notes__)
+
+
+@pytest.mark.parametrize("missing", ["workspace", "session"])
+def test_transcript_revalidates_missing_artifacts_without_recreating_them(
+    tmp_path: Path, missing: str
+):
+    workspace = tmp_path / "workspace"
+    session_path = workspace / ".agent" / "sessions" / "vanished.jsonl"
+    write_completed_session(session_path, "local")
+    metadata_path = tmp_path / "metadata.sqlite3"
+    with MetadataStore(metadata_path) as metadata:
+        metadata.create_session(NewSession.defaults("vanished", workspace))
+    settings = AppSettings(
+        metadata_path=metadata_path,
+        base_workspace=workspace,
+        launch_secret=SECRET,
+        allowed_origins=frozenset({ORIGIN}),
+    )
+
+    with TestClient(
+        create_app(settings, FakeLLM),
+        base_url=ORIGIN,
+        headers=AUTH_HEADERS,
+    ) as test_client:
+        if missing == "workspace":
+            shutil.rmtree(workspace)
+        else:
+            session_path.unlink()
+        response = test_client.get("/api/sessions/vanished/transcript")
+
+    assert response.status_code == 409
+    assert response.json()["error"]["type"] == "session_resume_error"
+    assert "missing" in response.json()["error"]["message"].lower()
+    assert not session_path.with_suffix(".lock").exists()
+    if missing == "workspace":
+        assert not workspace.exists()
+    else:
+        assert not session_path.exists()
+
+
+@pytest.mark.parametrize("missing", ["workspace", "session"])
+def test_transcript_revalidates_missing_artifacts_for_an_open_runtime(
+    client: TestClient, workspace: Path, missing: str
+):
+    session_id = create_session(client, workspace)["session_id"]
+    session_path = workspace / ".agent" / "sessions" / f"{session_id}.jsonl"
+    session_path.touch()
+    if missing == "workspace":
+        shutil.rmtree(workspace)
+    else:
+        session_path.unlink()
+
+    response = client.get(f"/api/sessions/{session_id}/transcript")
+
+    assert response.status_code == 409
+    assert response.json()["error"]["type"] == "session_resume_error"
+    assert "missing" in response.json()["error"]["message"].lower()
+    if missing == "workspace":
+        assert not workspace.exists()
+    else:
+        assert not session_path.exists()
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        PermissionError("unreadable auth access-token-leak"),
+        IsADirectoryError("auth path access-token-leak"),
+        json.JSONDecodeError("access-token-leak", "secret-document", 0),
+        UnicodeDecodeError("utf-8", b"\xff", 0, 1, "access-token-leak"),
+        KeyError("access_token"),
+        TypeError("'NoneType' object is not subscriptable: access-token-leak"),
+        TypeError(
+            "list indices must be integers or slices, not str: access-token-leak"
+        ),
+        RuntimeError(
+            "no codex credentials at access-token-leak — run `codex login` first"
+        ),
+    ],
+)
+def test_every_local_credential_file_failure_is_a_fixed_non_disclosing_409(
+    settings: AppSettings, workspace: Path, failure: Exception
+):
+    def invalid_credentials():
+        raise failure
+
+    with TestClient(
+        create_app(settings, invalid_credentials),
+        base_url=ORIGIN,
+        headers=AUTH_HEADERS,
+    ) as test_client:
+        response = test_client.post(
+            "/api/sessions",
+            json={
+                "workspace": str(workspace),
+                "mode": "default",
+                "context_mode": "compaction",
+                "title": "Blocked",
+            },
+        )
+
+    assert response.status_code == 409
+    assert response.json()["error"] == {
+        "type": "credential_prerequisite",
+        "message": "Codex credentials are required. Run `codex login` and retry.",
+        "command": "codex login",
+    }
+    assert "access-token-leak" not in response.text
+    assert SECRET not in response.text
+    assert not (workspace / ".agent").exists()
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        RuntimeError("codex auth implementation bug access-token-leak"),
+        TypeError("factory implementation bug access-token-leak"),
+        KeyError("unrelated_factory_key"),
+    ],
+)
+def test_unrelated_factory_bugs_are_not_mislabeled_as_credentials(
+    settings: AppSettings, workspace: Path, failure: Exception
+):
+    def broken_factory():
+        raise failure
+
+    with TestClient(
+        create_app(settings, broken_factory),
+        base_url=ORIGIN,
+        headers=AUTH_HEADERS,
+    ) as test_client:
+        with pytest.raises(type(failure), match="access-token-leak|unrelated_factory_key"):
+            test_client.post(
+                "/api/sessions",
+                json={
+                    "workspace": str(workspace),
+                    "mode": "default",
+                    "context_mode": "compaction",
+                    "title": "Bug",
+                },
+            )
+
+    assert not (workspace / ".agent").exists()
+
+
+def test_open_runtime_rolls_back_cache_and_lock_when_metadata_touch_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    workspace = tmp_path / "workspace"
+    session_path = workspace / ".agent" / "sessions" / "touch-fails.jsonl"
+    write_completed_session(session_path, "local")
+    metadata = MetadataStore(tmp_path / "metadata.sqlite3")
+    metadata.create_session(NewSession.defaults("touch-fails", workspace))
+    manager = SessionManager(metadata, workspace, FakeLLM)
+
+    def fail_touch(_session_id: str):
+        raise RuntimeError("metadata touch failed")
+
+    monkeypatch.setattr(metadata, "touch_session", fail_touch)
+
+    async def scenario() -> None:
+        try:
+            with pytest.raises(RuntimeError, match="metadata touch failed"):
+                await manager.open_runtime("touch-fails")
+            assert manager._runtimes == {}
+            assert not session_path.with_suffix(".lock").exists()
+        finally:
+            await manager.close()
+
+    asyncio.run(scenario())
+
+
+def test_open_runtime_preserves_touch_error_when_rollback_close_also_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    metadata = MetadataStore(tmp_path / "metadata.sqlite3")
+    metadata.create_session(NewSession.defaults("touch-cleanup", workspace))
+    manager = SessionManager(metadata, workspace, FakeLLM)
+    runtime = ClosingRuntime(
+        "runtime", [], RuntimeError("runtime cleanup failed")
+    )
+
+    def fail_touch(_session_id: str):
+        raise RuntimeError("metadata touch failed")
+
+    monkeypatch.setattr(manager, "_construct_runtime", lambda _record: runtime)
+    monkeypatch.setattr(metadata, "touch_session", fail_touch)
+
+    async def scenario() -> None:
+        try:
+            with pytest.raises(RuntimeError, match="metadata touch failed") as raised:
+                await manager.open_runtime("touch-cleanup")
+            assert runtime.calls == ["runtime"]
+            assert manager._runtimes == {}
+            assert "runtime cleanup failed" in "\n".join(raised.value.__notes__)
+        finally:
+            runtime.failure = None
+            await manager.close()
+
+    asyncio.run(scenario())
+
+
+def test_manager_operations_reject_with_typed_error_after_close(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    metadata = MetadataStore(tmp_path / "metadata.sqlite3")
+    metadata.create_session(NewSession.defaults("closed", workspace))
+    manager = SessionManager(metadata, workspace, FakeLLM)
+
+    async def scenario() -> None:
+        await manager.close()
+        for operation in (
+            manager.list_sessions,
+            lambda: manager.get_session("closed"),
+            lambda: manager.rename_session("closed", "renamed"),
+        ):
+            with pytest.raises(RuntimeError) as raised:
+                operation()
+            assert type(raised.value).__name__ == "SessionManagerClosed"
+        for operation in (
+            manager.discover,
+            lambda: manager.create_session(
+                workspace=workspace,
+                mode="default",
+                context_mode="compaction",
+                title="",
+            ),
+            lambda: manager.open_runtime("closed"),
+            lambda: manager.transcript("closed"),
+            lambda: manager.archive_session("closed"),
+        ):
+            with pytest.raises(RuntimeError) as raised:
+                await operation()
+            assert type(raised.value).__name__ == "SessionManagerClosed"
+
+    asyncio.run(scenario())
+
+
+def test_close_queued_before_open_and_archive_prevents_post_close_work(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    session_path = workspace / ".agent" / "sessions" / "queued.jsonl"
+    write_completed_session(session_path, "local")
+    metadata = MetadataStore(tmp_path / "metadata.sqlite3")
+    metadata.create_session(NewSession.defaults("queued", workspace))
+    manager = SessionManager(metadata, workspace, FakeLLM)
+
+    async def scenario() -> None:
+        await manager._runtime_lock.acquire()
+        close_task = asyncio.create_task(manager.close())
+        await asyncio.sleep(0)
+        open_task = asyncio.create_task(manager.open_runtime("queued"))
+        await asyncio.sleep(0)
+        archive_task = asyncio.create_task(manager.archive_session("queued"))
+        await asyncio.sleep(0)
+        manager._runtime_lock.release()
+
+        await close_task
+        for task in (open_task, archive_task):
+            with pytest.raises(RuntimeError) as raised:
+                await task
+            assert type(raised.value).__name__ == "SessionManagerClosed"
+        assert manager._runtimes == {}
+        assert not session_path.with_suffix(".lock").exists()
+
+    asyncio.run(scenario())

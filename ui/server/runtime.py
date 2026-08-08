@@ -30,6 +30,8 @@ class RuntimeSessionLease(Protocol):
 
     session_log: SessionLog
 
+    def reconcile_artifacts(self) -> None: ...
+
     def close(self) -> None: ...
 
     def abort(self) -> None: ...
@@ -130,6 +132,12 @@ class HarnessRuntime:
                 requested=config.context_mode,
                 resuming=is_resume,
                 compact_threshold=threshold,
+                artifact_publisher=(
+                    self._session_lease.reconcile_artifacts
+                    if self._session_lease is not None
+                    and hasattr(self._session_lease, "reconcile_artifacts")
+                    else None
+                ),
             )
             self._context_owned = True
             self.sandbox_policy = SandboxPolicy(self.workspace, allow_network=False)

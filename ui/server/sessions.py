@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 import fcntl
 import json
@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import sqlite3
 import stat
 from typing import Callable, cast
 
@@ -27,7 +28,16 @@ _SESSION_COMPANION_SUFFIXES = (
     ".context-mode",
     ".folds.sqlite3",
     ".fold-decisions.jsonl",
+    ".folds.sqlite3-journal",
+    ".folds.sqlite3-wal",
+    ".folds.sqlite3-shm",
     ".lock",
+)
+_STAGED_CONTEXT_SUFFIXES = _SESSION_COMPANION_SUFFIXES[:-1]
+_SQLITE_RECOVERY_SUFFIXES = (
+    ".folds.sqlite3-journal",
+    ".folds.sqlite3-wal",
+    ".folds.sqlite3-shm",
 )
 _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _READ_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -123,6 +133,9 @@ class _OpenedSessionPath:
     def __init__(self, descriptor: int) -> None:
         self._descriptor = descriptor
 
+    def replace_descriptor(self, descriptor: int) -> None:
+        self._descriptor = descriptor
+
     def read_text(self) -> str:
         os.lseek(self._descriptor, 0, os.SEEK_SET)
         chunks: list[bytes] = []
@@ -145,7 +158,12 @@ class _DescriptorSessionLog(SessionLog):
 
     def __init__(self, descriptor: int) -> None:
         self._descriptor = descriptor
-        super().__init__(cast(Path, _OpenedSessionPath(descriptor)))
+        self._opened_path = _OpenedSessionPath(descriptor)
+        super().__init__(cast(Path, self._opened_path))
+
+    def replace_descriptor(self, descriptor: int) -> None:
+        self._descriptor = descriptor
+        self._opened_path.replace_descriptor(descriptor)
 
     def _append(self, payload: str) -> None:
         encoded = payload.encode()
@@ -155,22 +173,39 @@ class _DescriptorSessionLog(SessionLog):
             written += os.write(self._descriptor, encoded[written:])
 
 
+@dataclass
+class _Publication:
+    name: str
+    identity: tuple[int, int]
+    backup_name: str | None = None
+
+
 class _SecureSessionLease:
-    """Stable advisory lock plus a pinned authoritative session descriptor."""
+    """Private live artifacts plus atomic public publication and one lock."""
 
     def __init__(
         self,
         directory_descriptors: tuple[int, int, int],
+        stage_descriptor: int,
+        stage_path: Path,
         session_descriptor: int,
         session_name: str,
+        session_anchor_name: str,
         lock_descriptor: int,
-        created_session_identity: tuple[int, int] | None,
+        lock_name: str,
     ) -> None:
         self._directory_descriptors = list(directory_descriptors)
+        self._stage_descriptor: int | None = stage_descriptor
+        self._stage_path = stage_path
+        self._stage_name = stage_path.name
         self._session_descriptor: int | None = session_descriptor
         self._session_name = session_name
+        self._session_anchor_name = session_anchor_name
         self._lock_descriptor: int | None = lock_descriptor
-        self._created_session_identity = created_session_identity
+        self._lock_name = lock_name
+        self._publications: dict[str, _Publication] = {}
+        self._committed = False
+        self.session_path = stage_path / session_name
         self.session_log = _DescriptorSessionLog(session_descriptor)
 
     @staticmethod
@@ -178,45 +213,373 @@ class _SecureSessionLease:
         opened = os.fstat(descriptor)
         return opened.st_dev, opened.st_ino
 
+    @staticmethod
+    def _descriptor_path(descriptor: int) -> Path:
+        raw = fcntl.fcntl(descriptor, fcntl.F_GETPATH, b"\0" * 1024)
+        return Path(os.fsdecode(raw.split(b"\0", 1)[0]))
+
+    @staticmethod
+    def _copy_descriptor(source: int, destination: int) -> None:
+        os.ftruncate(destination, 0)
+        os.lseek(source, 0, os.SEEK_SET)
+        os.lseek(destination, 0, os.SEEK_SET)
+        while chunk := os.read(source, 64 * 1024):
+            written = 0
+            while written < len(chunk):
+                written += os.write(destination, chunk[written:])
+
     def _close_session(self) -> None:
         if self._session_descriptor is None:
             return
         os.close(self._session_descriptor)
         self._session_descriptor = None
 
-    def _remove_created_session(self) -> None:
-        identity = self._created_session_identity
-        if identity is None:
-            return
-        sessions_descriptor = self._directory_descriptors[-1]
+    @property
+    def _sessions_descriptor(self) -> int:
+        return self._directory_descriptors[-1]
+
+    @property
+    def _owned_stage_descriptor(self) -> int:
+        if self._stage_descriptor is None:
+            raise RuntimeError("session stage is closed")
+        return self._stage_descriptor
+
+    def _private_name(self, purpose: str, name: str) -> str:
+        return f".{purpose}-{Path(name).name}-{secrets.token_hex(8)}"
+
+    def _stage_identity(self, name: str) -> tuple[int, int] | None:
         try:
-            current = os.open(
-                self._session_name,
+            descriptor = os.open(
+                name,
                 _READ_FLAGS,
-                dir_fd=sessions_descriptor,
+                dir_fd=self._owned_stage_descriptor,
             )
         except FileNotFoundError:
-            self._created_session_identity = None
+            return None
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise SessionResumeError("private session artifact is unsafe")
+            return self._identity(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def _backup_public(
+        self,
+        name: str,
+        identity: tuple[int, int],
+    ) -> tuple[str | None, bool]:
+        backup_name = self._private_name("backup", name)
+        try:
+            os.link(
+                name,
+                backup_name,
+                src_dir_fd=self._sessions_descriptor,
+                dst_dir_fd=self._owned_stage_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return None, False
+        except OSError as error:
+            raise SessionResumeError("session artifact publication is unsafe") from error
+        backup = os.stat(
+            backup_name,
+            dir_fd=self._owned_stage_descriptor,
+            follow_symlinks=False,
+        )
+        if stat.S_ISREG(backup.st_mode) and (backup.st_dev, backup.st_ino) == identity:
+            os.unlink(backup_name, dir_fd=self._owned_stage_descriptor)
+            return None, True
+        return backup_name, False
+
+    def _publish_artifact(self, name: str, identity: tuple[int, int]) -> None:
+        backup_name, already_published = self._backup_public(name, identity)
+        if already_published:
+            publication = self._publications.get(name)
+            if publication is None:
+                self._publications[name] = _Publication(name, identity)
+            else:
+                publication.identity = identity
             return
-        except OSError:
-            # The name no longer resolves to the inode this lease created.
-            # Preserve the replacement and relinquish deletion ownership.
-            self._created_session_identity = None
+        publication = _Publication(name, identity, backup_name)
+        self._publications[name] = publication
+        publish_name = self._private_name("publish", name)
+        try:
+            os.link(
+                name,
+                publish_name,
+                src_dir_fd=self._owned_stage_descriptor,
+                dst_dir_fd=self._sessions_descriptor,
+                follow_symlinks=False,
+            )
+            os.replace(
+                publish_name,
+                name,
+                src_dir_fd=self._sessions_descriptor,
+                dst_dir_fd=self._sessions_descriptor,
+            )
+        except BaseException:
+            try:
+                os.unlink(publish_name, dir_fd=self._sessions_descriptor)
+            except OSError:
+                pass
+            raise
+        if self._committed and publication.backup_name is not None:
+            self._discard_backup(publication)
+
+    def _discard_backup(self, publication: _Publication) -> None:
+        if publication.backup_name is None:
             return
         try:
-            if self._identity(current) == identity:
-                os.unlink(self._session_name, dir_fd=sessions_descriptor)
-        finally:
-            os.close(current)
-        self._created_session_identity = None
+            os.unlink(
+                publication.backup_name,
+                dir_fd=self._owned_stage_descriptor,
+            )
+        except FileNotFoundError:
+            publication.backup_name = None
+        except OSError:
+            # The private stage remains owned until close, which retries by
+            # removing every remaining name. Publication is already durable.
+            return
+        else:
+            publication.backup_name = None
+
+    def _publish_initial_session(self) -> None:
+        identity = self._stage_identity(self._session_name)
+        if identity is None:
+            raise SessionResumeError("private session file is missing")
+        try:
+            os.link(
+                self._session_name,
+                self._session_name,
+                src_dir_fd=self._owned_stage_descriptor,
+                dst_dir_fd=self._sessions_descriptor,
+                follow_symlinks=False,
+            )
+        except FileExistsError as error:
+            raise SessionResumeError("generated session id already exists") from error
+        self._publications[self._session_name] = _Publication(
+            self._session_name,
+            identity,
+        )
+
+    def _restore_private(self, private_name: str, public_name: str) -> None:
+        try:
+            os.link(
+                private_name,
+                public_name,
+                src_dir_fd=self._owned_stage_descriptor,
+                dst_dir_fd=self._sessions_descriptor,
+                follow_symlinks=False,
+            )
+        except FileExistsError as error:
+            private = os.stat(
+                private_name,
+                dir_fd=self._owned_stage_descriptor,
+                follow_symlinks=False,
+            )
+            public = os.stat(
+                public_name,
+                dir_fd=self._sessions_descriptor,
+                follow_symlinks=False,
+            )
+            if (private.st_dev, private.st_ino) != (
+                public.st_dev,
+                public.st_ino,
+            ):
+                raise OSError(
+                    f"cannot restore replacement at {public_name}"
+                ) from error
+        os.unlink(private_name, dir_fd=self._owned_stage_descriptor)
+
+    def _rollback_publication(self, publication: _Publication) -> None:
+        capture_name = self._private_name("quarantine", publication.name)
+        try:
+            os.rename(
+                publication.name,
+                capture_name,
+                src_dir_fd=self._sessions_descriptor,
+                dst_dir_fd=self._owned_stage_descriptor,
+            )
+        except FileNotFoundError:
+            capture_name = ""
+        if capture_name:
+            captured = os.stat(
+                capture_name,
+                dir_fd=self._owned_stage_descriptor,
+                follow_symlinks=False,
+            )
+            captured_identity = (captured.st_dev, captured.st_ino)
+            if stat.S_ISREG(captured.st_mode) and captured_identity == publication.identity:
+                os.unlink(capture_name, dir_fd=self._owned_stage_descriptor)
+            else:
+                self._restore_private(capture_name, publication.name)
+                if publication.backup_name is not None:
+                    self._discard_backup(publication)
+                return
+        if publication.backup_name is not None:
+            self._restore_private(publication.backup_name, publication.name)
+
+    def _rollback_publications(self) -> None:
+        errors: list[BaseException] = []
+        for name, publication in reversed(tuple(self._publications.items())):
+            try:
+                self._rollback_publication(publication)
+            except BaseException as error:
+                errors.append(error)
+            else:
+                self._publications.pop(name, None)
+        if errors:
+            raise ExceptionGroup("session publication rollback failed", errors)
+
+    def _restore_lock_name(self) -> None:
+        probe_name = self._private_name("lock-probe", self._lock_name)
+        try:
+            os.link(
+                self._lock_name,
+                probe_name,
+                src_dir_fd=self._sessions_descriptor,
+                dst_dir_fd=self._owned_stage_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            probe = os.stat(
+                probe_name,
+                dir_fd=self._owned_stage_descriptor,
+                follow_symlinks=False,
+            )
+            os.unlink(probe_name, dir_fd=self._owned_stage_descriptor)
+            if stat.S_ISREG(probe.st_mode) and (
+                probe.st_dev,
+                probe.st_ino,
+            ) == self._identity(self._lock_descriptor):
+                return
+        publish_name = self._private_name("lock", self._lock_name)
+        try:
+            os.link(
+                self._lock_name,
+                publish_name,
+                src_dir_fd=self._owned_stage_descriptor,
+                dst_dir_fd=self._sessions_descriptor,
+                follow_symlinks=False,
+            )
+            os.replace(
+                publish_name,
+                self._lock_name,
+                src_dir_fd=self._sessions_descriptor,
+                dst_dir_fd=self._sessions_descriptor,
+            )
+        except FileNotFoundError:
+            return
+        except BaseException:
+            try:
+                os.unlink(publish_name, dir_fd=self._sessions_descriptor)
+            except OSError:
+                pass
+            raise
+
+    def publish(self) -> None:
+        """Atomically expose staged runtime artifacts under documented names."""
+        self._restore_lock_name()
+        session_id = Path(self._session_name).stem
+        names = (
+            self._session_name,
+            f"{session_id}.context-mode",
+            f"{session_id}.folds.sqlite3",
+            f"{session_id}.fold-decisions.jsonl",
+        )
+        for name in names:
+            identity = self._stage_identity(name)
+            if identity is not None:
+                self._publish_artifact(name, identity)
+
+    def reconcile_artifacts(self) -> None:
+        """Atomically publish path-replaced private files to the live log."""
+        if self._session_descriptor is None:
+            raise RuntimeError("session descriptor is closed")
+        pinned_identity = self._identity(self._session_descriptor)
+        staged_identity = self._stage_identity(self._session_name)
+        if staged_identity is None:
+            raise SessionResumeError("private session file is missing")
+        if staged_identity != pinned_identity:
+            replacement = os.open(
+                self._session_name,
+                _READ_WRITE_FLAGS,
+                dir_fd=self._owned_stage_descriptor,
+            )
+            try:
+                if not stat.S_ISREG(os.fstat(replacement).st_mode):
+                    raise SessionResumeError("private session file is unsafe")
+                self._restore_lock_name()
+                self._publish_artifact(self._session_name, staged_identity)
+                os.close(self._session_descriptor)
+                self._session_descriptor = replacement
+                self.session_log.replace_descriptor(replacement)
+                replacement = -1
+                self._replace_session_anchor()
+                self.publish()
+            finally:
+                if replacement >= 0:
+                    os.close(replacement)
+            return
+        self.publish()
+
+    def _replace_session_anchor(self) -> None:
+        anchor_name = self._private_name("anchor", self._session_name)
+        try:
+            os.link(
+                self._session_name,
+                anchor_name,
+                src_dir_fd=self._owned_stage_descriptor,
+                dst_dir_fd=self._owned_stage_descriptor,
+                follow_symlinks=False,
+            )
+            os.replace(
+                anchor_name,
+                self._session_anchor_name,
+                src_dir_fd=self._owned_stage_descriptor,
+                dst_dir_fd=self._owned_stage_descriptor,
+            )
+        except BaseException:
+            try:
+                os.unlink(anchor_name, dir_fd=self._owned_stage_descriptor)
+            except OSError:
+                pass
+            raise
+
+    def commit(self) -> None:
+        """Finalize publication; later aborts become ordinary closes."""
+        self._committed = True
+        for publication in self._publications.values():
+            self._discard_backup(publication)
 
     def _release_lock(self) -> None:
         if self._lock_descriptor is None:
             return
+        self._restore_lock_name()
         os.ftruncate(self._lock_descriptor, 0)
         os.lseek(self._lock_descriptor, 0, os.SEEK_SET)
         os.close(self._lock_descriptor)
         self._lock_descriptor = None
+
+    def _remove_stage(self) -> None:
+        if self._stage_descriptor is None:
+            return
+        errors: list[BaseException] = []
+        for name in os.listdir(self._stage_descriptor):
+            try:
+                os.unlink(name, dir_fd=self._stage_descriptor)
+            except BaseException as error:
+                errors.append(error)
+        if errors:
+            raise ExceptionGroup("private session stage cleanup failed", errors)
+        os.close(self._stage_descriptor)
+        self._stage_descriptor = None
+        try:
+            os.rmdir(self._stage_name, dir_fd=self._sessions_descriptor)
+        except FileNotFoundError:
+            pass
 
     def _close_directories(self) -> None:
         while self._directory_descriptors:
@@ -225,14 +588,29 @@ class _SecureSessionLease:
             self._directory_descriptors.pop()
 
     def close(self) -> None:
+        if (
+            self._committed
+            and self._stage_descriptor is not None
+            and self._lock_descriptor is not None
+        ):
+            self.publish()
         self._close_session()
         self._release_lock()
+        self._remove_stage()
         self._close_directories()
 
     def abort(self) -> None:
+        if (
+            self._committed
+            and self._stage_descriptor is not None
+            and self._lock_descriptor is not None
+        ):
+            self.publish()
         self._close_session()
-        self._remove_created_session()
+        if not self._committed:
+            self._rollback_publications()
         self._release_lock()
+        self._remove_stage()
         self._close_directories()
 
 
@@ -470,6 +848,219 @@ class SessionManager:
             raise
 
     @classmethod
+    def _regular_identity_at(
+        cls,
+        directory_descriptor: int,
+        name: str,
+    ) -> tuple[int, int] | None:
+        try:
+            descriptor = os.open(
+                name,
+                _READ_FLAGS,
+                dir_fd=directory_descriptor,
+            )
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            raise SessionResumeError("stale runtime stage is unsafe") from error
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise SessionResumeError("stale runtime stage is unsafe")
+            return cls._identity(descriptor)
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
+    def _publish_stale_artifact(
+        sessions_descriptor: int,
+        stage_descriptor: int,
+        name: str,
+    ) -> None:
+        publish_name = f".recover-{Path(name).name}-{secrets.token_hex(8)}"
+        try:
+            os.link(
+                name,
+                publish_name,
+                src_dir_fd=stage_descriptor,
+                dst_dir_fd=sessions_descriptor,
+                follow_symlinks=False,
+            )
+            os.replace(
+                publish_name,
+                name,
+                src_dir_fd=sessions_descriptor,
+                dst_dir_fd=sessions_descriptor,
+            )
+        except BaseException:
+            try:
+                os.unlink(publish_name, dir_fd=sessions_descriptor)
+            except OSError:
+                pass
+            raise
+
+    @classmethod
+    def _recover_stale_stage(
+        cls,
+        sessions_descriptor: int,
+        lock_descriptor: int,
+        session_id: str,
+        stage_name: str,
+    ) -> None:
+        try:
+            stage_descriptor = os.open(
+                stage_name,
+                _DIRECTORY_FLAGS,
+                dir_fd=sessions_descriptor,
+            )
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            raise SessionResumeError("stale runtime stage is unsafe") from error
+
+        remove_stage = False
+        primary: BaseException | None = None
+        try:
+            lock_name = f"{session_id}.lock"
+            lock_identity = cls._regular_identity_at(
+                stage_descriptor,
+                lock_name,
+            )
+            if lock_identity == cls._identity(lock_descriptor):
+                remove_stage = True
+
+                session_name = f"{session_id}.jsonl"
+                staged_session_identity = cls._regular_identity_at(
+                    stage_descriptor,
+                    session_name,
+                )
+                anchor_identity = cls._regular_identity_at(
+                    stage_descriptor,
+                    ".session-anchor",
+                )
+                public_session_identity = cls._regular_identity_at(
+                    sessions_descriptor,
+                    session_name,
+                )
+                if (
+                    staged_session_identity is not None
+                    and anchor_identity is not None
+                    and staged_session_identity != anchor_identity
+                    and public_session_identity == anchor_identity
+                ):
+                    cls._publish_stale_artifact(
+                        sessions_descriptor,
+                        stage_descriptor,
+                        session_name,
+                    )
+
+                ledger_name = f"{session_id}.folds.sqlite3"
+                recovery_names = tuple(
+                    f"{session_id}{suffix}"
+                    for suffix in _SQLITE_RECOVERY_SUFFIXES
+                )
+                recovery_identities = tuple(
+                    cls._regular_identity_at(stage_descriptor, name)
+                    for name in recovery_names
+                )
+                has_recovery_file = any(
+                    identity is not None for identity in recovery_identities
+                )
+                if has_recovery_file:
+                    staged_identity = cls._regular_identity_at(
+                        stage_descriptor,
+                        ledger_name,
+                    )
+                    public_identity = cls._regular_identity_at(
+                        sessions_descriptor,
+                        ledger_name,
+                    )
+                    if (
+                        staged_identity is not None
+                        and staged_identity == public_identity
+                    ):
+                        stage_path = _SecureSessionLease._descriptor_path(
+                            stage_descriptor
+                        )
+                        try:
+                            connection = sqlite3.connect(stage_path / ledger_name)
+                            try:
+                                connection.execute(
+                                    "PRAGMA schema_version"
+                                ).fetchone()
+                            finally:
+                                connection.close()
+                        except sqlite3.Error as error:
+                            raise SessionResumeError(
+                                "cannot recover folding ledger after a crash"
+                            ) from error
+
+                cleanup_errors: list[BaseException] = []
+                for name in os.listdir(stage_descriptor):
+                    try:
+                        os.unlink(name, dir_fd=stage_descriptor)
+                    except BaseException as error:
+                        cleanup_errors.append(error)
+                if cleanup_errors:
+                    raise SessionResumeError(
+                        "cannot clean stale runtime stage"
+                    ) from ExceptionGroup(
+                        "stale runtime stage cleanup failed",
+                        cleanup_errors,
+                    )
+        except BaseException as error:
+            primary = error
+
+        try:
+            os.close(stage_descriptor)
+        except BaseException as cleanup_error:
+            if primary is None:
+                raise
+            primary.add_note(
+                "stale stage descriptor cleanup failed: "
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
+            existing = tuple(getattr(primary, "cleanup_errors", ()))
+            primary.cleanup_errors = (  # type: ignore[attr-defined]
+                *existing,
+                cleanup_error,
+            )
+        if primary is not None:
+            raise primary
+        if remove_stage:
+            try:
+                os.rmdir(stage_name, dir_fd=sessions_descriptor)
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                raise SessionResumeError(
+                    "cannot clean stale runtime stage"
+                ) from error
+
+    @classmethod
+    def _recover_stale_stages(
+        cls,
+        sessions_descriptor: int,
+        lock_descriptor: int,
+        session_id: str,
+    ) -> None:
+        prefix = f".runtime-{session_id}-"
+        try:
+            candidates = sorted(
+                name
+                for name in os.listdir(sessions_descriptor)
+                if name.startswith(prefix)
+            )
+        except OSError as error:
+            raise SessionResumeError("cannot inspect stale runtime stages") from error
+        for stage_name in candidates:
+            cls._recover_stale_stage(
+                sessions_descriptor,
+                lock_descriptor,
+                session_id,
+                stage_name,
+            )
+
+    @classmethod
     def _acquire_session_lease(
         cls,
         workspace: Path,
@@ -480,55 +1071,217 @@ class SessionManager:
         directory_descriptors = cls._open_session_directory_descriptors(workspace)
         sessions_descriptor = directory_descriptors[-1]
         lock_descriptor: int | None = None
+        stage_descriptor: int | None = None
+        stage_name: str | None = None
+        stage_created = False
         session_descriptor: int | None = None
-        created_identity: tuple[int, int] | None = None
+        source_descriptor: int | None = None
+        staged_descriptor: int | None = None
+        cleanup_errors: list[BaseException] = []
         try:
             lock_descriptor = cls._acquire_secure_lock(
                 sessions_descriptor, session_id
             )
-            flags = (
-                _CREATE_READ_WRITE_FLAGS
-                if create_session
-                else _READ_WRITE_FLAGS
+            cls._recover_stale_stages(
+                sessions_descriptor,
+                lock_descriptor,
+                session_id,
             )
-            try:
+            lock_name = f"{session_id}.lock"
+            stage_name = f".runtime-{session_id}-{secrets.token_hex(8)}"
+            os.mkdir(stage_name, 0o700, dir_fd=sessions_descriptor)
+            stage_created = True
+            stage_descriptor = os.open(
+                stage_name,
+                _DIRECTORY_FLAGS,
+                dir_fd=sessions_descriptor,
+            )
+            stage_path = _SecureSessionLease._descriptor_path(stage_descriptor)
+            os.link(
+                lock_name,
+                lock_name,
+                src_dir_fd=sessions_descriptor,
+                dst_dir_fd=stage_descriptor,
+                follow_symlinks=False,
+            )
+            lock_anchor = os.stat(
+                lock_name,
+                dir_fd=stage_descriptor,
+                follow_symlinks=False,
+            )
+            if (lock_anchor.st_dev, lock_anchor.st_ino) != cls._identity(
+                lock_descriptor
+            ):
+                raise SessionResumeError("session lock changed during acquisition")
+
+            session_name = f"{session_id}.jsonl"
+            if create_session:
+                try:
+                    os.stat(
+                        session_name,
+                        dir_fd=sessions_descriptor,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise SessionResumeError("generated session id already exists")
                 session_descriptor = os.open(
-                    f"{session_id}.jsonl",
-                    flags,
+                    session_name,
+                    _CREATE_READ_WRITE_FLAGS,
                     0o600,
-                    dir_fd=sessions_descriptor,
+                    dir_fd=stage_descriptor,
                 )
-            except FileExistsError as error:
-                raise SessionResumeError(
-                    "generated session id already exists"
-                ) from error
-            except OSError as error:
-                raise SessionResumeError(
-                    "session file is missing or unsafe"
-                ) from error
+            else:
+                try:
+                    source_descriptor = os.open(
+                        session_name,
+                        _READ_FLAGS,
+                        dir_fd=sessions_descriptor,
+                    )
+                except OSError as error:
+                    raise SessionResumeError(
+                        "session file is missing or unsafe"
+                    ) from error
+                if not stat.S_ISREG(os.fstat(source_descriptor).st_mode):
+                    raise SessionResumeError("session file is unsafe")
+                session_descriptor = os.open(
+                    session_name,
+                    _CREATE_READ_WRITE_FLAGS,
+                    0o600,
+                    dir_fd=stage_descriptor,
+                )
+                _SecureSessionLease._copy_descriptor(
+                    source_descriptor,
+                    session_descriptor,
+                )
+                os.close(source_descriptor)
+                source_descriptor = None
             if not stat.S_ISREG(os.fstat(session_descriptor).st_mode):
                 raise SessionResumeError("session file is unsafe")
-            if create_session:
-                created_identity = cls._identity(session_descriptor)
+            session_anchor_name = ".session-anchor"
+            os.link(
+                session_name,
+                session_anchor_name,
+                src_dir_fd=stage_descriptor,
+                dst_dir_fd=stage_descriptor,
+                follow_symlinks=False,
+            )
+
+            for suffix in _STAGED_CONTEXT_SUFFIXES:
+                name = f"{session_id}{suffix}"
+                try:
+                    source_descriptor = os.open(
+                        name,
+                        _READ_FLAGS,
+                        dir_fd=sessions_descriptor,
+                    )
+                except FileNotFoundError:
+                    continue
+                except OSError as error:
+                    raise SessionResumeError("session artifact is unsafe") from error
+                if not stat.S_ISREG(os.fstat(source_descriptor).st_mode):
+                    raise SessionResumeError("session artifact is unsafe")
+                staged_descriptor = os.open(
+                    name,
+                    _CREATE_READ_WRITE_FLAGS,
+                    0o600,
+                    dir_fd=stage_descriptor,
+                )
+                _SecureSessionLease._copy_descriptor(
+                    source_descriptor,
+                    staged_descriptor,
+                )
+                os.close(staged_descriptor)
+                staged_descriptor = None
+                os.close(source_descriptor)
+                source_descriptor = None
+
             lease = _SecureSessionLease(
                 directory_descriptors,
+                stage_descriptor,
+                stage_path,
                 session_descriptor,
-                f"{session_id}.jsonl",
+                session_name,
+                session_anchor_name,
                 lock_descriptor,
-                created_identity,
+                lock_name,
             )
+            if create_session:
+                lease._publish_initial_session()
             session_descriptor = None
             lock_descriptor = None
+            stage_descriptor = None
             return lease
-        except BaseException:
+        except BaseException as primary:
+            if staged_descriptor is not None:
+                try:
+                    os.close(staged_descriptor)
+                except BaseException as error:
+                    cleanup_errors.append(error)
+            if source_descriptor is not None:
+                try:
+                    os.close(source_descriptor)
+                except BaseException as error:
+                    cleanup_errors.append(error)
             if session_descriptor is not None:
-                os.close(session_descriptor)
+                try:
+                    os.close(session_descriptor)
+                except BaseException as error:
+                    cleanup_errors.append(error)
+            if stage_descriptor is not None:
+                staged_names: list[str] | None = None
+                for _attempt in range(2):
+                    try:
+                        staged_names = os.listdir(stage_descriptor)
+                    except BaseException as error:
+                        cleanup_errors.append(error)
+                        continue
+                    break
+                if staged_names is not None:
+                    for name in staged_names:
+                        try:
+                            os.unlink(name, dir_fd=stage_descriptor)
+                        except BaseException as error:
+                            cleanup_errors.append(error)
+                try:
+                    os.close(stage_descriptor)
+                except BaseException as error:
+                    cleanup_errors.append(error)
+            if stage_created and stage_name is not None:
+                try:
+                    os.rmdir(stage_name, dir_fd=sessions_descriptor)
+                except BaseException as error:
+                    cleanup_errors.append(error)
             if lock_descriptor is not None:
                 try:
                     os.ftruncate(lock_descriptor, 0)
-                finally:
+                except BaseException as error:
+                    cleanup_errors.append(error)
+                    try:
+                        os.ftruncate(lock_descriptor, 0)
+                    except BaseException:
+                        pass
+                try:
                     os.close(lock_descriptor)
-            cls._close_descriptors(directory_descriptors)
+                except BaseException as error:
+                    cleanup_errors.append(error)
+            for descriptor in reversed(directory_descriptors):
+                try:
+                    os.close(descriptor)
+                except BaseException as error:
+                    cleanup_errors.append(error)
+            if cleanup_errors:
+                primary.add_note(
+                    "lease acquisition cleanup incomplete: "
+                    + "; ".join(
+                        f"{type(error).__name__}: {error}"
+                        for error in cleanup_errors
+                    )
+                )
+                primary.cleanup_errors = tuple(  # type: ignore[attr-defined]
+                    cleanup_errors
+                )
             raise
 
     @classmethod
@@ -541,22 +1294,70 @@ class SessionManager:
             create_session=False,
         )
         try:
-            return lease.session_log.load()
-        finally:
+            messages = lease.session_log.load()
+            lease.publish()
+            lease.commit()
             lease.close()
+            return messages
+        except BaseException as primary:
+            try:
+                lease.abort()
+            except BaseException as cleanup_error:
+                primary.add_note(
+                    "transcript cleanup failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+                existing = tuple(getattr(primary, "cleanup_errors", ()))
+                primary.cleanup_errors = (  # type: ignore[attr-defined]
+                    *existing,
+                    cleanup_error,
+                )
+            raise
 
-    @staticmethod
-    def _context_mode_for_discovery(session_path: Path) -> str:
-        mode_path = session_path.with_suffix(".context-mode")
+    @classmethod
+    def _context_mode_for_discovery(
+        cls,
+        workspace: Path,
+        session_id: str,
+    ) -> str:
+        descriptors = cls._open_session_directory_descriptors(workspace)
+        sessions_descriptor = descriptors[-1]
+        mode_descriptor: int | None = None
+        ledger_descriptor: int | None = None
         try:
-            stored = mode_path.read_text().strip()
-        except FileNotFoundError:
-            stored = ""
-        except OSError:
-            stored = ""
-        if stored == "folding" or session_path.with_suffix(".folds.sqlite3").exists():
-            return "folding"
-        return "compaction"
+            try:
+                mode_descriptor = os.open(
+                    f"{session_id}.context-mode",
+                    _READ_FLAGS,
+                    dir_fd=sessions_descriptor,
+                )
+            except OSError:
+                stored = ""
+            else:
+                if not stat.S_ISREG(os.fstat(mode_descriptor).st_mode):
+                    stored = ""
+                else:
+                    try:
+                        stored = os.read(mode_descriptor, 64).decode().strip()
+                    except UnicodeError:
+                        stored = ""
+            try:
+                ledger_descriptor = os.open(
+                    f"{session_id}.folds.sqlite3",
+                    _READ_FLAGS,
+                    dir_fd=sessions_descriptor,
+                )
+            except OSError:
+                has_ledger = False
+            else:
+                has_ledger = stat.S_ISREG(os.fstat(ledger_descriptor).st_mode)
+            return "folding" if stored == "folding" or has_ledger else "compaction"
+        finally:
+            if mode_descriptor is not None:
+                os.close(mode_descriptor)
+            if ledger_descriptor is not None:
+                os.close(ledger_descriptor)
+            cls._close_descriptors(descriptors)
 
     def _required_record(
         self, session_id: object, *, include_archived: bool = False
@@ -612,7 +1413,10 @@ class SessionManager:
                             workspace=defaults.workspace,
                             title=defaults.title,
                             mode=defaults.mode,
-                            context_mode=self._context_mode_for_discovery(candidate),
+                            context_mode=self._context_mode_for_discovery(
+                                workspace,
+                                session_id,
+                            ),
                         )
                     )
                     known_ids.add(session_id)
@@ -641,7 +1445,6 @@ class SessionManager:
     def _instantiate_runtime(
         config: RuntimeConfig,
         llm: LLMClient,
-        session_path: Path,
         session_lease: _SecureSessionLease,
         *,
         resuming: bool,
@@ -650,7 +1453,7 @@ class SessionManager:
             return HarnessRuntime(
                 config,
                 llm,
-                session_path,
+                session_lease.session_path,
                 resuming=resuming,
                 session_lease=session_lease,
             )
@@ -692,7 +1495,6 @@ class SessionManager:
         return self._instantiate_runtime(
             config,
             llm,
-            session_path,
             lease,
             resuming=True,
         )
@@ -718,10 +1520,14 @@ class SessionManager:
         return self._instantiate_runtime(
             config,
             llm,
-            session_path,
             lease,
             resuming=False,
         )
+
+    @staticmethod
+    def _secure_runtime_lease(runtime: HarnessRuntime) -> _SecureSessionLease | None:
+        lease = getattr(runtime, "_session_lease", None)
+        return lease if isinstance(lease, _SecureSessionLease) else None
 
     async def create_session(
         self,
@@ -753,11 +1559,16 @@ class SessionManager:
             # before HarnessRuntime opens any session artifacts.
             self._runtime_config(provisional)
             runtime = self._construct_new_runtime(provisional)
+            lease = self._secure_runtime_lease(runtime)
             try:
+                if lease is not None:
+                    lease.publish()
                 record = self.metadata.create_session(provisional)
             except BaseException as error:
                 self._abort_after_failure(runtime, error)
                 raise
+            if lease is not None:
+                lease.commit()
             self._runtimes[session_id] = runtime
             return record
 
@@ -775,11 +1586,16 @@ class SessionManager:
                 )
                 return existing
             runtime = self._construct_runtime(record)
+            lease = self._secure_runtime_lease(runtime)
             try:
+                if lease is not None:
+                    lease.publish()
                 self.metadata.touch_session(record.session_id)
             except BaseException as error:
                 self._abort_after_failure(runtime, error)
                 raise
+            if lease is not None:
+                lease.commit()
             self._runtimes[record.session_id] = runtime
             return runtime
 

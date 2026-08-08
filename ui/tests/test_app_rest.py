@@ -1,6 +1,7 @@
 import asyncio
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 import shutil
 import warnings
@@ -409,6 +410,52 @@ def test_discovery_scans_only_base_and_metadata_known_workspaces_and_ignores_fol
     }
     assert "secret-session" not in {row["session_id"] for row in rows}
     assert all("fold-decisions" not in row["session_id"] for row in rows)
+
+
+def test_discovery_does_not_follow_context_companion_swapped_after_path_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    workspace = tmp_path / "workspace"
+    session_path = workspace / ".agent" / "sessions" / "discover-swap.jsonl"
+    write_completed_session(session_path, "local")
+    mode_path = session_path.with_suffix(".context-mode")
+    mode_path.write_text("compaction\n")
+    external_mode = tmp_path / "external.context-mode"
+    external_mode.write_text("folding\n")
+    external_before = external_mode.read_bytes()
+    settings = AppSettings(
+        metadata_path=tmp_path / "metadata.sqlite3",
+        base_workspace=workspace,
+        launch_secret=SECRET,
+        allowed_origins=frozenset({ORIGIN}),
+    )
+    from server import sessions as sessions_module
+
+    original_safe_path = sessions_module.SessionManager._safe_session_path
+
+    def safe_then_swap(cls, *args, **kwargs):
+        safe_path = original_safe_path(*args, **kwargs)
+        if safe_path == session_path and not mode_path.is_symlink():
+            mode_path.unlink()
+            mode_path.symlink_to(external_mode)
+        return safe_path
+
+    monkeypatch.setattr(
+        sessions_module.SessionManager,
+        "_safe_session_path",
+        classmethod(safe_then_swap),
+    )
+
+    with TestClient(
+        create_app(settings, FakeLLM),
+        base_url=ORIGIN,
+        headers=AUTH_HEADERS,
+    ) as test_client:
+        rows = test_client.get("/api/sessions").json()
+
+    assert rows[0]["session_id"] == "discover-swap"
+    assert rows[0]["context_mode"] == "compaction"
+    assert external_mode.read_bytes() == external_before
 
 
 def test_transcript_uses_session_log_while_the_session_lock_is_held(
@@ -927,6 +974,241 @@ def test_runtime_creation_uses_pinned_session_and_lock_across_boundary_swap(
     assert external_lock.read_bytes() == lock_before
 
 
+def test_runtime_context_mode_uses_private_stage_across_boundary_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    external_mode = tmp_path / "external.context-mode"
+    external_mode.write_text("compaction")
+    external_before = external_mode.read_bytes()
+    session_id = "context-swap"
+    session_path = workspace / ".agent" / "sessions" / f"{session_id}.jsonl"
+    mode_path = session_path.with_suffix(".context-mode")
+    settings = AppSettings(
+        metadata_path=tmp_path / "metadata.sqlite3",
+        base_workspace=workspace,
+        launch_secret=SECRET,
+        allowed_origins=frozenset({ORIGIN}),
+    )
+    from server import sessions as sessions_module
+
+    monkeypatch.setattr(
+        sessions_module.SessionManager,
+        "_new_session_id",
+        staticmethod(lambda: session_id),
+    )
+    original_init = sessions_module.HarnessRuntime.__init__
+
+    def swap_then_initialize(runtime, *args, **kwargs):
+        mode_path.symlink_to(external_mode)
+        return original_init(runtime, *args, **kwargs)
+
+    monkeypatch.setattr(
+        sessions_module.HarnessRuntime,
+        "__init__",
+        swap_then_initialize,
+    )
+
+    with TestClient(
+        create_app(settings, FakeLLM),
+        base_url=ORIGIN,
+        headers=AUTH_HEADERS,
+    ) as test_client:
+        response = test_client.post(
+            "/api/sessions",
+            json={
+                "workspace": str(workspace),
+                "mode": "default",
+                "context_mode": "compaction",
+                "title": "Context swap",
+            },
+        )
+
+    assert response.status_code == 201, response.text
+    assert external_mode.read_bytes() == external_before
+    assert not mode_path.is_symlink()
+    assert mode_path.read_text() == "compaction\n"
+
+
+def test_runtime_folding_companions_use_private_stages_across_boundary_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    session_id = "folding-swap"
+    session_path = workspace / ".agent" / "sessions" / f"{session_id}.jsonl"
+    external_mode = tmp_path / "external.context-mode"
+    external_ledger = tmp_path / "external.folds.sqlite3"
+    external_decisions = tmp_path / "external.fold-decisions.jsonl"
+    external_mode.write_text("folding")
+    external_ledger.write_bytes(b"")
+    external_decisions.write_text("external decisions\n")
+    external_before = {
+        external_mode: external_mode.read_bytes(),
+        external_ledger: external_ledger.read_bytes(),
+        external_decisions: external_decisions.read_bytes(),
+    }
+    public_artifacts = {
+        session_path.with_suffix(".context-mode"): external_mode,
+        session_path.with_suffix(".folds.sqlite3"): external_ledger,
+        session_path.with_suffix(".fold-decisions.jsonl"): external_decisions,
+    }
+    settings = AppSettings(
+        metadata_path=tmp_path / "metadata.sqlite3",
+        base_workspace=workspace,
+        launch_secret=SECRET,
+        allowed_origins=frozenset({ORIGIN}),
+    )
+    from server import sessions as sessions_module
+
+    monkeypatch.setattr(
+        sessions_module.SessionManager,
+        "_new_session_id",
+        staticmethod(lambda: session_id),
+    )
+    original_init = sessions_module.HarnessRuntime.__init__
+
+    def swap_then_initialize(runtime, *args, **kwargs):
+        for public, external in public_artifacts.items():
+            public.symlink_to(external)
+        return original_init(runtime, *args, **kwargs)
+
+    monkeypatch.setattr(
+        sessions_module.HarnessRuntime,
+        "__init__",
+        swap_then_initialize,
+    )
+
+    with TestClient(
+        create_app(settings, FakeLLM),
+        base_url=ORIGIN,
+        headers=AUTH_HEADERS,
+    ) as test_client:
+        response = test_client.post(
+            "/api/sessions",
+            json={
+                "workspace": str(workspace),
+                "mode": "default",
+                "context_mode": "folding",
+                "title": "Folding swap",
+            },
+        )
+
+    assert response.status_code == 201, response.text
+    for external, before in external_before.items():
+        assert external.read_bytes() == before
+    for public in public_artifacts:
+        assert public.is_file()
+        assert not public.is_symlink()
+
+
+def test_folding_purge_keeps_public_and_live_session_log_on_one_inode(
+    tmp_path: Path,
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    metadata = MetadataStore(tmp_path / "metadata.sqlite3")
+    manager = SessionManager(metadata, workspace, FakeLLM)
+    secret = "delete this mounted payload"
+    messages = [
+        {"role": "user", "content": "inspect"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_0",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": json.dumps({"path": "a.py"}),
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_0", "content": secret},
+        {"role": "assistant", "content": "done"},
+    ]
+
+    async def scenario() -> None:
+        created = await manager.create_session(
+            workspace=workspace,
+            mode="default",
+            context_mode="folding",
+            title="Folding purge",
+        )
+        session_id = created.session_id
+        runtime = manager._runtimes[session_id]
+        session_path = (
+            workspace / ".agent" / "sessions" / f"{session_id}.jsonl"
+        )
+        runtime.messages = messages
+        runtime.session_log.record_turn(messages)
+        runtime.folding.sync(messages, runtime.tools)
+        before_purge_inode = session_path.stat().st_ino
+
+        runtime.folding.delete("m2.r0")
+
+        assert secret not in session_path.read_text()
+        assert session_path.stat().st_ino != before_purge_inode
+        assert session_path.stat().st_ino == os.fstat(
+            runtime.session_log._descriptor
+        ).st_ino
+        runtime.messages.append({"role": "assistant", "content": "after purge"})
+        runtime.session_log.record_turn(runtime.messages)
+        persisted = session_path.read_text()
+        assert secret not in persisted
+        assert "after purge" in persisted
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        asyncio.run(manager.close())
+
+
+def test_committed_runtime_republishes_live_log_when_public_name_is_replaced(
+    tmp_path: Path,
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    metadata = MetadataStore(tmp_path / "metadata.sqlite3")
+    manager = SessionManager(metadata, workspace, FakeLLM)
+    external = tmp_path / "external.jsonl"
+    external.write_text("external bytes stay exact\n")
+
+    async def scenario() -> None:
+        created = await manager.create_session(
+            workspace=workspace,
+            mode="default",
+            context_mode="compaction",
+            title="Close reconciliation",
+        )
+        runtime = manager._runtimes[created.session_id]
+        session_path = (
+            workspace
+            / ".agent"
+            / "sessions"
+            / f"{created.session_id}.jsonl"
+        )
+        session_path.unlink()
+        session_path.symlink_to(external)
+        runtime.messages = [
+            {"role": "user", "content": "persist me"},
+            {"role": "assistant", "content": "persisted"},
+        ]
+        runtime.session_log.record_turn(runtime.messages)
+
+        await manager.close()
+
+        assert session_path.is_file()
+        assert not session_path.is_symlink()
+        assert "persist me" in session_path.read_text()
+        assert external.read_text() == "external bytes stay exact\n"
+
+    asyncio.run(scenario())
+
+
 def test_secure_runtime_lock_has_one_owner_and_keeps_a_stable_inode(tmp_path: Path):
     workspace = tmp_path / "workspace"
     session_path = workspace / ".agent" / "sessions" / "shared.jsonl"
@@ -1024,6 +1306,295 @@ def test_secure_session_lease_release_is_retryable(
 
     assert lock_path.exists()
     assert lock_path.read_text() == ""
+
+
+def test_session_lease_commit_defers_private_backup_cleanup_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    workspace = tmp_path / "workspace"
+    session_path = workspace / ".agent" / "sessions" / "commit.jsonl"
+    write_completed_session(session_path, "local")
+    from server import sessions as sessions_module
+
+    lease = SessionManager._acquire_session_lease(
+        workspace,
+        "commit",
+        create_session=False,
+    )
+    lease.publish()
+    backup_name = lease._publications["commit.jsonl"].backup_name
+    assert backup_name is not None
+    original_unlink = sessions_module.os.unlink
+    failed = False
+
+    def fail_backup_cleanup_once(path, *args, **kwargs):
+        nonlocal failed
+        if path == backup_name and not failed:
+            failed = True
+            raise OSError("backup cleanup interrupted")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(sessions_module.os, "unlink", fail_backup_cleanup_once)
+
+    lease.commit()
+    lease.close()
+
+    assert session_path.exists()
+    assert "local" in session_path.read_text()
+
+
+def test_repeated_session_publication_keeps_original_abort_backup(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    session_path = workspace / ".agent" / "sessions" / "repeat.jsonl"
+    original = json.dumps(
+        {"type": "message", "message": {"role": "user", "content": "original"}}
+    ) + "\n"
+    session_path.parent.mkdir(parents=True)
+    session_path.write_text(original)
+
+    lease = SessionManager._acquire_session_lease(
+        workspace,
+        "repeat",
+        create_session=False,
+    )
+    lease.publish()
+    lease.publish()
+    lease.abort()
+
+    assert session_path.read_text() == original
+
+
+def test_session_lease_recovers_private_sqlite_journal_from_stale_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    workspace = tmp_path / "workspace"
+    session_id = "crashed"
+    session_path = workspace / ".agent" / "sessions" / f"{session_id}.jsonl"
+    write_completed_session(session_path, "local")
+    sessions_dir = session_path.parent
+    lock_path = session_path.with_suffix(".lock")
+    lock_path.touch()
+    ledger_path = session_path.with_suffix(".folds.sqlite3")
+
+    import sqlite3
+
+    connection = sqlite3.connect(ledger_path)
+    connection.execute("CREATE TABLE durable (value TEXT NOT NULL)")
+    connection.execute("INSERT INTO durable VALUES ('before crash')")
+    connection.commit()
+    connection.close()
+
+    stale_stage = sessions_dir / f".runtime-{session_id}-stale"
+    stale_stage.mkdir(mode=0o700)
+    (stale_stage / lock_path.name).hardlink_to(lock_path)
+    (stale_stage / ledger_path.name).hardlink_to(ledger_path)
+    (stale_stage / f"{ledger_path.name}-journal").write_bytes(b"")
+
+    from server import sessions as sessions_module
+
+    original_connect = sessions_module.sqlite3.connect
+    recovered_paths: list[Path] = []
+
+    def record_connect(path, *args, **kwargs):
+        recovered_paths.append(Path(path))
+        return original_connect(path, *args, **kwargs)
+
+    monkeypatch.setattr(sessions_module.sqlite3, "connect", record_connect)
+
+    lease = SessionManager._acquire_session_lease(
+        workspace,
+        session_id,
+        create_session=False,
+    )
+    lease.abort()
+
+    assert recovered_paths == [stale_stage / ledger_path.name]
+    assert not stale_stage.exists()
+    verification = sqlite3.connect(ledger_path)
+    try:
+        assert verification.execute(
+            "SELECT value FROM durable"
+        ).fetchone() == ("before crash",)
+    finally:
+        verification.close()
+
+
+def test_session_lease_recovers_atomic_purge_from_stale_stage(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    session_id = "purge-crash"
+    session_path = workspace / ".agent" / "sessions" / f"{session_id}.jsonl"
+    write_completed_session(session_path, "secret before purge")
+    original_inode = session_path.stat().st_ino
+    sessions_dir = session_path.parent
+    lock_path = session_path.with_suffix(".lock")
+    lock_path.touch()
+
+    stale_stage = sessions_dir / f".runtime-{session_id}-stale"
+    stale_stage.mkdir(mode=0o700)
+    (stale_stage / lock_path.name).hardlink_to(lock_path)
+    (stale_stage / ".session-anchor").hardlink_to(session_path)
+    sanitized = json.dumps(
+        {
+            "type": "message",
+            "message": {"role": "assistant", "content": "purged"},
+        }
+    ) + "\n"
+    (stale_stage / session_path.name).write_text(sanitized)
+
+    lease = SessionManager._acquire_session_lease(
+        workspace,
+        session_id,
+        create_session=False,
+    )
+    lease.abort()
+
+    assert session_path.read_text() == sanitized
+    assert session_path.stat().st_ino != original_inode
+    assert not stale_stage.exists()
+
+
+def test_session_lease_abort_retries_transient_created_artifact_capture_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    workspace = tmp_path / "workspace"
+    sessions_dir = workspace / ".agent" / "sessions"
+    sessions_dir.mkdir(parents=True)
+    session_id = "abort-retry"
+    session_name = f"{session_id}.jsonl"
+    session_path = sessions_dir / session_name
+    from server import sessions as sessions_module
+
+    lease = SessionManager._acquire_session_lease(
+        workspace,
+        session_id,
+        create_session=True,
+    )
+    original_rename = sessions_module.os.rename
+    failed = False
+
+    def fail_owned_capture_once(source, destination, *args, **kwargs):
+        nonlocal failed
+        if source == session_name and not failed:
+            failed = True
+            raise OSError("transient created artifact capture failure")
+        return original_rename(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(sessions_module.os, "rename", fail_owned_capture_once)
+
+    with pytest.raises(ExceptionGroup, match="publication rollback") as raised:
+        lease.abort()
+    assert any(
+        "transient created artifact capture failure" in str(error)
+        for error in raised.value.exceptions
+    )
+    assert session_path.exists()
+
+    lease.abort()
+
+    assert not session_path.exists()
+    replacement = SessionManager._acquire_session_lease(
+        workspace,
+        session_id,
+        create_session=True,
+    )
+    replacement.abort()
+
+
+def test_partial_lease_acquisition_preserves_primary_and_closes_all_descriptors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    workspace = tmp_path / "workspace"
+    sessions_dir = workspace / ".agent" / "sessions"
+    sessions_dir.mkdir(parents=True)
+    from server import sessions as sessions_module
+
+    original_open = sessions_module.os.open
+    original_ftruncate = sessions_module.os.ftruncate
+    original_listdir = sessions_module.os.listdir
+    opened_directories: list[int] = []
+    lock_descriptor: int | None = None
+    lock_truncations = 0
+    stage_descriptor: int | None = None
+    stage_listings = 0
+
+    def record_open(path, flags, *args, **kwargs):
+        nonlocal lock_descriptor, stage_descriptor
+        descriptor = original_open(path, flags, *args, **kwargs)
+        if flags & sessions_module.os.O_DIRECTORY:
+            opened_directories.append(descriptor)
+            if str(path).startswith(".runtime-missing-"):
+                stage_descriptor = descriptor
+        if path == "missing.lock":
+            lock_descriptor = descriptor
+        return descriptor
+
+    def fail_lock_cleanup(descriptor: int, length: int):
+        nonlocal lock_truncations
+        if descriptor == lock_descriptor:
+            lock_truncations += 1
+            if lock_truncations == 2:
+                raise OSError("lock cleanup interrupted")
+        return original_ftruncate(descriptor, length)
+
+    def fail_stage_listing_once(descriptor):
+        nonlocal stage_listings
+        if descriptor == stage_descriptor:
+            stage_listings += 1
+            if stage_listings == 1:
+                raise OSError("stage listing interrupted")
+        return original_listdir(descriptor)
+
+    monkeypatch.setattr(sessions_module.os, "open", record_open)
+    monkeypatch.setattr(sessions_module.os, "ftruncate", fail_lock_cleanup)
+    monkeypatch.setattr(sessions_module.os, "listdir", fail_stage_listing_once)
+
+    with pytest.raises(RuntimeError, match="session file is missing or unsafe") as raised:
+        SessionManager._acquire_session_lease(
+            workspace,
+            "missing",
+            create_session=False,
+        )
+
+    notes = "\n".join(getattr(raised.value, "__notes__", ()))
+    assert "lock cleanup interrupted" in notes
+    assert "stage listing interrupted" in notes
+    assert any(
+        "lock cleanup interrupted" in str(error)
+        for error in getattr(raised.value, "cleanup_errors", ())
+    )
+    for descriptor in opened_directories:
+        with pytest.raises(OSError):
+            sessions_module.os.fstat(descriptor)
+    assert not any(path.name.startswith(".runtime-missing-") for path in sessions_dir.iterdir())
+
+
+def test_transcript_preserves_load_error_when_abort_cleanup_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    class FailingLog:
+        def load(self):
+            raise ValueError("invalid transcript payload")
+
+    class FailingLease:
+        session_log = FailingLog()
+
+        def abort(self):
+            raise OSError("transcript cleanup interrupted")
+
+    monkeypatch.setattr(
+        SessionManager,
+        "_acquire_session_lease",
+        classmethod(lambda cls, *args, **kwargs: FailingLease()),
+    )
+
+    with pytest.raises(ValueError, match="invalid transcript payload") as raised:
+        SessionManager._load_verified_transcript(workspace, "broken")
+
+    notes = "\n".join(getattr(raised.value, "__notes__", ()))
+    assert "transcript cleanup interrupted" in notes
 
 
 def test_new_empty_transcript_is_authoritative_then_deletion_is_a_conflict(

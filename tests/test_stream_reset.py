@@ -320,6 +320,69 @@ def test_adapter_resets_immediately_before_retrying_an_attempt_that_streamed_tex
     assert events == ["attempt", "text:stale", "reset", "attempt", "text:fresh"]
 
 
+def test_adapter_isolates_text_state_across_a_mixed_multi_retry_sequence(
+    adapter, monkeypatch
+):
+    events = []
+    _install_stream(
+        monkeypatch,
+        [
+            _StreamResponse([_delta("first"), httpx.ReadError("lost 1")]),
+            _StreamResponse([_delta(""), httpx.ReadError("lost 2")]),
+            _StreamResponse([_delta("third"), httpx.ReadError("lost 3")]),
+            _StreamResponse([_delta("final"), _completed("final")]),
+        ],
+        events,
+    )
+
+    reply = adapter.complete(
+        [],
+        on_text_delta=lambda text: events.append(f"text:{text}"),
+        on_stream_reset=lambda: events.append("reset"),
+    )
+
+    assert reply == {"role": "assistant", "content": "final"}
+    assert events == [
+        "attempt",
+        "text:first",
+        "reset",
+        "attempt",
+        "attempt",
+        "text:third",
+        "reset",
+        "attempt",
+        "text:final",
+    ]
+
+
+def test_adapter_starts_each_complete_call_with_clean_stream_reset_state(
+    adapter, monkeypatch
+):
+    events = []
+    client = _install_stream(
+        monkeypatch,
+        [
+            _StreamResponse([_delta("first"), _completed("first")]),
+            _StreamResponse([_delta("second"), _completed("second")]),
+        ],
+        events,
+    )
+    on_text_delta = lambda text: events.append(f"text:{text}")
+    on_stream_reset = lambda: events.append("reset")
+
+    first = adapter.complete(
+        [], on_text_delta=on_text_delta, on_stream_reset=on_stream_reset
+    )
+    second = adapter.complete(
+        [], on_text_delta=on_text_delta, on_stream_reset=on_stream_reset
+    )
+
+    assert first == {"role": "assistant", "content": "first"}
+    assert second == {"role": "assistant", "content": "second"}
+    assert client.attempts == 2
+    assert events == ["attempt", "text:first", "attempt", "text:second"]
+
+
 def test_adapter_does_not_reset_on_the_first_attempt(adapter, monkeypatch):
     resets = []
     _install_stream(

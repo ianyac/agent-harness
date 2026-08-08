@@ -11,7 +11,14 @@ from server.registry import build_registry
 class FakeLLM:
     context_window = 10_000
 
-    def complete(self, messages, tools=None, system=None, on_text_delta=None, projection_hash=None):
+    def complete(
+        self,
+        messages,
+        tools=None,
+        system=None,
+        on_text_delta=None,
+        projection_hash=None,
+    ):
         return {"role": "assistant", "content": "done"}
 
 
@@ -20,6 +27,15 @@ class FakeSearch:
 
     def search(self, query: str, count: int = 5) -> list[dict]:
         return []
+
+
+class CapturingLLM(FakeLLM):
+    def __init__(self):
+        self.calls: list[dict] = []
+
+    def complete(self, messages, tools=None, system=None, on_text_delta=None, projection_hash=None):
+        self.calls.append({"messages": messages, "tools": tools, "system": system})
+        return {"role": "assistant", "content": "done"}
 
 
 @pytest.fixture
@@ -111,3 +127,74 @@ def test_exit_plan_mode_uses_the_runtime_plan_reviewer_signature(
     assert reviewed == ["one plan"]
     assert result.endswith("Feedback: add tests")
     assert policy.mode == "plan"
+
+
+def test_agent_derives_an_honest_subagent_skill_menu_without_folding_controls(
+    tmp_path: Path,
+):
+    write_skills(tmp_path)
+    llm = CapturingLLM()
+    policy = PermissionPolicy("default")
+    folding = FoldingContext(
+        tmp_path / "s.folds.sqlite3",
+        session_id="s",
+        decision_log_path=tmp_path / "s.fold-decisions.jsonl",
+        session_log_path=tmp_path / "s.jsonl",
+    )
+    try:
+        tools, _ = build_registry(
+            workspace=tmp_path,
+            llm=llm,
+            policy=policy,
+            sandbox=NoSandbox(),
+            context=folding,
+            compact_threshold=None,
+            plan_reviewer=lambda plan: (False, ""),
+        )
+
+        assert tools["agent"].execute(task="inspect") == "done"
+
+        offered = {
+            definition["function"]["name"] for definition in llm.calls[0]["tools"]
+        }
+        system = llm.calls[0]["system"]
+        assert "skill" in offered
+        assert "fold" not in offered
+        assert "unfold" not in offered
+        assert "plain: plain" in system
+        assert "command: command" not in system
+        assert "Workspace hygiene" not in system
+    finally:
+        folding.close()
+
+
+def test_fork_skill_derives_prompt_from_its_actual_restricted_registry(tmp_path: Path):
+    skills_dir = tmp_path / "skills"
+    skills_dir.mkdir()
+    (skills_dir / "plain.md").write_text(
+        "---\nname: plain\ndescription: plain\n---\nRead this guidance."
+    )
+    (skills_dir / "fork.md").write_text(
+        "---\nname: forked\ndescription: delegated\ncontext: fork\n"
+        "allowed-tools: read_file skill\n---\nInspect the workspace."
+    )
+    llm = CapturingLLM()
+    tools, _ = build_registry(
+        workspace=tmp_path,
+        llm=llm,
+        policy=PermissionPolicy("default"),
+        sandbox=NoSandbox(),
+        context=None,
+        compact_threshold=8_000,
+        plan_reviewer=lambda plan: (False, ""),
+    )
+
+    assert tools["skill"].execute(name="forked") == "done"
+
+    offered = {
+        definition["function"]["name"] for definition in llm.calls[0]["tools"]
+    }
+    system = llm.calls[0]["system"]
+    assert offered == {"read_file", "skill"}
+    assert "plain: plain" in system
+    assert "forked: delegated" not in system

@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from server.context_mode import prepare_context_mode
+from server.context_mode import PreparedContext, prepare_context_mode
 
 
 def test_folding_session_cannot_resume_without_ledger(tmp_path: Path):
@@ -84,3 +84,45 @@ def test_folding_rejects_compact_threshold_and_compaction_preserves_it(tmp_path:
         "compaction\n"
     )
     prepared.close()
+
+
+def test_prepared_context_retries_only_a_still_owned_folding_resource():
+    class CloseOnce:
+        def __init__(self):
+            self.calls = 0
+
+        def close(self):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("close failed")
+
+    folding = CloseOnce()
+    prepared = PreparedContext("folding", None, folding)  # type: ignore[arg-type]
+
+    with pytest.raises(RuntimeError, match="close failed"):
+        prepared.close()
+    prepared.close()
+    prepared.close()
+
+    assert folding.calls == 2
+
+
+def test_failed_context_mode_write_removes_a_new_partial_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    session = tmp_path / "s.jsonl"
+    mode_path = session.with_suffix(".context-mode")
+    original_write = Path.write_text
+
+    def fail_after_write(path: Path, text: str, *args, **kwargs):
+        if path == mode_path:
+            original_write(path, text[:1], *args, **kwargs)
+            raise OSError("disk full")
+        return original_write(path, text, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", fail_after_write)
+
+    with pytest.raises(ValueError, match="cannot persist context mode"):
+        prepare_context_mode(session, requested="compaction", resuming=False)
+
+    assert not mode_path.exists()

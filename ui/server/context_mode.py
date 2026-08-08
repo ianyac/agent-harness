@@ -28,24 +28,33 @@ class PreparedContext:
     mode: str
     compact_threshold: int | None
     folding: FoldingContext | None = None
-    _closed: bool = field(default=False, init=False, repr=False)
+    _created_paths: list[Path] = field(default_factory=list, repr=False)
+    _folding_owned: bool = field(default=False, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._folding_owned = self.folding is not None
 
     def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        if self.folding is not None:
+        if self._folding_owned and self.folding is not None:
             self.folding.close()
+            self._folding_owned = False
+
+    def rollback(self) -> None:
+        """Release resources and remove only artifacts this attempt created."""
+        self.close()
+        for path in reversed(self._created_paths.copy()):
+            path.unlink(missing_ok=True)
+            self._created_paths.remove(path)
 
 
-def prepare_context_mode(
+def resolve_context_mode(
     session_path: Path,
     *,
     requested: str | None,
     resuming: bool,
     compact_threshold: int | None = None,
-) -> PreparedContext:
-    """Select and open the documented context artifacts for one session."""
+) -> str:
+    """Resolve context ownership from durable artifacts without mutating them."""
     session_path = Path(session_path)
     if requested not in (None, *CONTEXT_MODES):
         raise ValueError(f"invalid requested context mode: {requested!r}")
@@ -93,22 +102,75 @@ def prepare_context_mode(
 
     if selected == "folding" and compact_threshold is not None:
         raise ValueError("context folding cannot be combined with a compact threshold")
+    return selected
+
+
+def prepare_context_mode(
+    session_path: Path,
+    *,
+    requested: str | None,
+    resuming: bool,
+    compact_threshold: int | None = None,
+) -> PreparedContext:
+    """Select and open the documented context artifacts for one session."""
+    session_path = Path(session_path)
+    selected = resolve_context_mode(
+        session_path,
+        requested=requested,
+        resuming=resuming,
+        compact_threshold=compact_threshold,
+    )
+    mode_path = session_path.with_suffix(".context-mode")
+    ledger = session_path.with_suffix(".folds.sqlite3")
+    decision_log = session_path.with_suffix(".fold-decisions.jsonl")
+    candidates = [mode_path]
+    if selected == "folding":
+        candidates.extend([ledger, decision_log])
+    created = [path for path in candidates if not path.exists()]
 
     try:
         mode_path.parent.mkdir(parents=True, exist_ok=True)
         mode_path.write_text(selected + "\n")
     except OSError as error:
-        raise ValueError(
+        failure = ValueError(
             f"cannot persist context mode for {session_path.name}: {error}"
-        ) from error
+        )
+        cleanup_errors = []
+        for path in reversed(created):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+        if cleanup_errors:
+            failure.add_note(
+                "artifact cleanup incomplete: "
+                + "; ".join(str(item) for item in cleanup_errors)
+            )
+            failure.cleanup_errors = tuple(cleanup_errors)  # type: ignore[attr-defined]
+        raise failure from error
 
     if selected == "compaction":
-        return PreparedContext(selected, compact_threshold)
+        return PreparedContext(selected, compact_threshold, _created_paths=created)
 
-    folding = FoldingContext(
-        ledger,
-        session_id=session_path.stem,
-        decision_log_path=session_path.with_suffix(".fold-decisions.jsonl"),
-        session_log_path=session_path,
-    )
-    return PreparedContext(selected, None, folding)
+    try:
+        folding = FoldingContext(
+            ledger,
+            session_id=session_path.stem,
+            decision_log_path=decision_log,
+            session_log_path=session_path,
+        )
+    except BaseException as error:
+        cleanup_errors = []
+        for path in reversed(created):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+        if cleanup_errors:
+            error.add_note(
+                "artifact cleanup incomplete: "
+                + "; ".join(str(item) for item in cleanup_errors)
+            )
+            error.cleanup_errors = tuple(cleanup_errors)  # type: ignore[attr-defined]
+        raise
+    return PreparedContext(selected, None, folding, _created_paths=created)

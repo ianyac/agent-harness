@@ -14,7 +14,13 @@ from harness.prompts import (
     build_system_prompt,
 )
 from harness.sandbox import Sandbox
-from harness.skills import Skill, discover, skill_tool, skills_section
+from harness.skills import (
+    Skill,
+    discover,
+    has_cmd_blocks,
+    skill_tool,
+    skills_section,
+)
 from harness.tools.agent import agent_tool, run_subagent
 from harness.tools.bash import bash_tool
 from harness.tools.base import Tool
@@ -36,13 +42,13 @@ def _system_prompt(
     workspace: Path,
     skills: list[Skill],
     policy: PermissionPolicy,
-    context: FoldingContext | None,
+    tools: dict[str, Tool],
     *,
     subagent: bool = False,
 ) -> str:
     section = skills_section(skills)
     extra = [section] if section is not None else []
-    if context is not None:
+    if {"fold", "unfold"} <= tools.keys():
         extra.append(WORKSPACE_HYGIENE)
     if policy.mode == "plan":
         extra.append(PLAN_MODE_SUBAGENT if subagent else PLAN_MODE)
@@ -67,8 +73,30 @@ def build_system(runtime: "HarnessRuntime") -> str:
         runtime.workspace,
         runtime.skills,
         runtime.policy,
-        runtime.folding,
+        runtime.tools,
     )
+
+
+def _subagent_registry(
+    offered: dict[str, Tool],
+    skills: list[Skill],
+) -> tuple[dict[str, Tool], dict[str, Tool], list[Skill]]:
+    """Mirror the public agent derivation so prompts describe effective tools."""
+    effective = {
+        name: tool
+        for name, tool in offered.items()
+        if not tool.spawns_subagents and tool.inheritable
+    }
+    usable_skills = [
+        skill for skill in skills if not skill.fork and not has_cmd_blocks(skill.body)
+    ]
+    substitutions: dict[str, Tool] = {}
+    if "skill" in offered and usable_skills:
+        replacement = skill_tool(usable_skills)
+        substitutions["skill"] = replacement
+        effective["skill"] = replacement
+    prompt_skills = usable_skills if "skill" in effective else []
+    return effective, substitutions, prompt_skills
 
 
 def build_registry(
@@ -108,12 +136,8 @@ def build_registry(
         tools["fold"] = fold_tool(context)
         tools["unfold"] = unfold_tool(context)
 
-    def subagent_system() -> str:
-        return _system_prompt(
-            workspace, skills, policy, context, subagent=True
-        )
-
     if skills:
+
         def fork_run(
             task: str,
             _model: str | None,
@@ -122,18 +146,47 @@ def build_registry(
             offered = (
                 tools
                 if allowed_tools is None
-                else {name: tool for name, tool in tools.items() if name in allowed_tools}
+                else {
+                    name: tool
+                    for name, tool in tools.items()
+                    if name in allowed_tools
+                }
             )
+            effective, substitutions, prompt_skills = _subagent_registry(
+                offered, skills
+            )
+
+            def fork_system() -> str:
+                return _system_prompt(
+                    workspace,
+                    prompt_skills,
+                    policy,
+                    effective,
+                    subagent=True,
+                )
+
             return run_subagent(
                 task,
                 llm,
                 offered,
                 policy=policy,
-                system=subagent_system,
+                system=fork_system,
                 compact_threshold=compact_threshold,
+                substitutions=substitutions,
             )
 
         tools["skill"] = skill_tool(skills, run=None, fork_run=fork_run)
+
+    effective, substitutions, prompt_skills = _subagent_registry(tools, skills)
+
+    def subagent_system() -> str:
+        return _system_prompt(
+            workspace,
+            prompt_skills,
+            policy,
+            effective,
+            subagent=True,
+        )
 
     tools["agent"] = agent_tool(
         llm,
@@ -141,6 +194,7 @@ def build_registry(
         policy=policy,
         system=subagent_system,
         compact_threshold=compact_threshold,
+        substitutions=substitutions,
     )
     tools["exit_plan_mode"] = exit_plan_mode_tool(policy, plan_reviewer)
     return tools, skills

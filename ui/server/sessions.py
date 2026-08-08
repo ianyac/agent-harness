@@ -6,6 +6,7 @@ import asyncio
 import copy
 from dataclasses import asdict
 from datetime import UTC, datetime
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -31,8 +32,11 @@ _SESSION_COMPANION_SUFFIXES = (
 _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _READ_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
 _READ_WRITE_FLAGS = os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC
-_CREATE_FLAGS = (
-    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+_LOCK_FLAGS = (
+    os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC
+)
+_CREATE_READ_WRITE_FLAGS = (
+    os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
 )
 _CREDENTIAL_MESSAGE = "Codex credentials are required. Run `codex login` and retry."
 
@@ -134,6 +138,102 @@ class _OpenedSessionPath:
         while written < len(payload):
             written += os.write(self._descriptor, payload[written:])
         return written
+
+
+class _DescriptorSessionLog(SessionLog):
+    """SessionLog whose reads, healing, and appends stay on one opened inode."""
+
+    def __init__(self, descriptor: int) -> None:
+        self._descriptor = descriptor
+        super().__init__(cast(Path, _OpenedSessionPath(descriptor)))
+
+    def _append(self, payload: str) -> None:
+        encoded = payload.encode()
+        os.lseek(self._descriptor, 0, os.SEEK_END)
+        written = 0
+        while written < len(encoded):
+            written += os.write(self._descriptor, encoded[written:])
+
+
+class _SecureSessionLease:
+    """Stable advisory lock plus a pinned authoritative session descriptor."""
+
+    def __init__(
+        self,
+        directory_descriptors: tuple[int, int, int],
+        session_descriptor: int,
+        session_name: str,
+        lock_descriptor: int,
+        created_session_identity: tuple[int, int] | None,
+    ) -> None:
+        self._directory_descriptors = list(directory_descriptors)
+        self._session_descriptor: int | None = session_descriptor
+        self._session_name = session_name
+        self._lock_descriptor: int | None = lock_descriptor
+        self._created_session_identity = created_session_identity
+        self.session_log = _DescriptorSessionLog(session_descriptor)
+
+    @staticmethod
+    def _identity(descriptor: int) -> tuple[int, int]:
+        opened = os.fstat(descriptor)
+        return opened.st_dev, opened.st_ino
+
+    def _close_session(self) -> None:
+        if self._session_descriptor is None:
+            return
+        os.close(self._session_descriptor)
+        self._session_descriptor = None
+
+    def _remove_created_session(self) -> None:
+        identity = self._created_session_identity
+        if identity is None:
+            return
+        sessions_descriptor = self._directory_descriptors[-1]
+        try:
+            current = os.open(
+                self._session_name,
+                _READ_FLAGS,
+                dir_fd=sessions_descriptor,
+            )
+        except FileNotFoundError:
+            self._created_session_identity = None
+            return
+        except OSError:
+            # The name no longer resolves to the inode this lease created.
+            # Preserve the replacement and relinquish deletion ownership.
+            self._created_session_identity = None
+            return
+        try:
+            if self._identity(current) == identity:
+                os.unlink(self._session_name, dir_fd=sessions_descriptor)
+        finally:
+            os.close(current)
+        self._created_session_identity = None
+
+    def _release_lock(self) -> None:
+        if self._lock_descriptor is None:
+            return
+        os.ftruncate(self._lock_descriptor, 0)
+        os.lseek(self._lock_descriptor, 0, os.SEEK_SET)
+        os.close(self._lock_descriptor)
+        self._lock_descriptor = None
+
+    def _close_directories(self) -> None:
+        while self._directory_descriptors:
+            descriptor = self._directory_descriptors[-1]
+            os.close(descriptor)
+            self._directory_descriptors.pop()
+
+    def close(self) -> None:
+        self._close_session()
+        self._release_lock()
+        self._close_directories()
+
+    def abort(self) -> None:
+        self._close_session()
+        self._remove_created_session()
+        self._release_lock()
+        self._close_directories()
 
 
 def validate_session_id(session_id: object) -> str:
@@ -333,217 +433,117 @@ class SessionManager:
         return True
 
     @classmethod
-    def _acquire_secure_lock(
-        cls, sessions_descriptor: int, session_id: str
-    ) -> tuple[int, tuple[int, int]]:
-        lock_name = f"{session_id}.lock"
-        for _attempt in range(4):
-            try:
-                descriptor = os.open(
-                    lock_name,
-                    _CREATE_FLAGS,
-                    0o600,
-                    dir_fd=sessions_descriptor,
-                )
-            except FileExistsError:
-                try:
-                    existing = os.open(
-                        lock_name,
-                        _READ_FLAGS,
-                        dir_fd=sessions_descriptor,
-                    )
-                except FileNotFoundError:
-                    continue
-                except OSError as error:
-                    raise SessionResumeError("session lock is unsafe") from error
-                try:
-                    if not stat.S_ISREG(os.fstat(existing).st_mode):
-                        raise SessionResumeError("session lock is unsafe")
-                    raw_holder = os.read(existing, 128).decode().strip()
-                    try:
-                        holder = int(raw_holder)
-                    except ValueError:
-                        holder = None
-                finally:
-                    os.close(existing)
-                if holder is not None and cls._pid_alive(holder):
-                    raise SessionResumeError("session is already in use")
-                try:
-                    os.unlink(lock_name, dir_fd=sessions_descriptor)
-                except FileNotFoundError:
-                    pass
-                continue
-            except OSError as error:
-                raise SessionResumeError("session lock is unsafe") from error
-            try:
-                os.write(descriptor, str(os.getpid()).encode())
-                return descriptor, cls._identity(descriptor)
-            except BaseException:
-                os.close(descriptor)
-                try:
-                    os.unlink(lock_name, dir_fd=sessions_descriptor)
-                except OSError:
-                    pass
-                raise
-        raise SessionResumeError("cannot acquire session lock")
-
-    @classmethod
-    def _release_secure_lock(
-        cls,
-        sessions_descriptor: int,
-        session_id: str,
-        lock_descriptor: int,
-        identity: tuple[int, int],
-    ) -> None:
-        lock_name = f"{session_id}.lock"
-        try:
-            try:
-                current = os.open(
-                    lock_name,
-                    _READ_FLAGS,
-                    dir_fd=sessions_descriptor,
-                )
-            except (FileNotFoundError, OSError):
-                return
-            try:
-                if cls._identity(current) == identity:
-                    os.unlink(lock_name, dir_fd=sessions_descriptor)
-            finally:
-                os.close(current)
-        finally:
-            os.close(lock_descriptor)
-
-    @classmethod
-    def _open_verified_session(
-        cls, sessions_descriptor: int, session_id: str
-    ) -> int:
+    def _acquire_secure_lock(cls, sessions_descriptor: int, session_id: str) -> int:
         try:
             descriptor = os.open(
-                f"{session_id}.jsonl",
-                _READ_WRITE_FLAGS,
+                f"{session_id}.lock",
+                _LOCK_FLAGS,
+                0o600,
                 dir_fd=sessions_descriptor,
             )
         except OSError as error:
-            raise SessionResumeError("session file is missing or unsafe") from error
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise SessionResumeError("session lock is unsafe") from error
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise SessionResumeError("session lock is unsafe")
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise SessionResumeError("session is already in use") from error
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            raw_holder = os.read(descriptor, 128).decode().strip()
+            try:
+                holder = int(raw_holder)
+            except ValueError:
+                holder = None
+            if holder is not None and cls._pid_alive(holder):
+                raise SessionResumeError("session is already in use")
+            payload = str(os.getpid()).encode()
+            os.ftruncate(descriptor, 0)
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            written = 0
+            while written < len(payload):
+                written += os.write(descriptor, payload[written:])
+            return descriptor
+        except BaseException:
             os.close(descriptor)
-            raise SessionResumeError("session file is unsafe")
-        return descriptor
+            raise
 
     @classmethod
-    def _load_verified_transcript(
-        cls, workspace: Path, session_id: str
-    ) -> list[dict]:
+    def _acquire_session_lease(
+        cls,
+        workspace: Path,
+        session_id: str,
+        *,
+        create_session: bool,
+    ) -> _SecureSessionLease:
         directory_descriptors = cls._open_session_directory_descriptors(workspace)
         sessions_descriptor = directory_descriptors[-1]
         lock_descriptor: int | None = None
-        lock_identity: tuple[int, int] | None = None
         session_descriptor: int | None = None
+        created_identity: tuple[int, int] | None = None
         try:
-            lock_descriptor, lock_identity = cls._acquire_secure_lock(
+            lock_descriptor = cls._acquire_secure_lock(
                 sessions_descriptor, session_id
             )
-            session_descriptor = cls._open_verified_session(
-                sessions_descriptor, session_id
+            flags = (
+                _CREATE_READ_WRITE_FLAGS
+                if create_session
+                else _READ_WRITE_FLAGS
             )
-            path_proxy = _OpenedSessionPath(session_descriptor)
-            return SessionLog(cast(Path, path_proxy)).load()
-        finally:
-            if session_descriptor is not None:
-                os.close(session_descriptor)
             try:
-                if lock_descriptor is not None and lock_identity is not None:
-                    cls._release_secure_lock(
-                        sessions_descriptor,
-                        session_id,
-                        lock_descriptor,
-                        lock_identity,
-                    )
-            finally:
-                cls._close_descriptors(directory_descriptors)
-
-    @classmethod
-    def _create_empty_session_artifact(
-        cls, workspace: Path, session_id: str
-    ) -> tuple[int, int]:
-        directory_descriptors = cls._open_session_directory_descriptors(workspace)
-        try:
-            try:
-                descriptor = os.open(
+                session_descriptor = os.open(
                     f"{session_id}.jsonl",
-                    _CREATE_FLAGS,
+                    flags,
                     0o600,
-                    dir_fd=directory_descriptors[-1],
+                    dir_fd=sessions_descriptor,
                 )
             except FileExistsError as error:
                 raise SessionResumeError(
                     "generated session id already exists"
                 ) from error
             except OSError as error:
-                raise SessionResumeError("cannot create session file") from error
-            try:
-                return cls._identity(descriptor)
-            finally:
-                os.close(descriptor)
-        finally:
+                raise SessionResumeError(
+                    "session file is missing or unsafe"
+                ) from error
+            if not stat.S_ISREG(os.fstat(session_descriptor).st_mode):
+                raise SessionResumeError("session file is unsafe")
+            if create_session:
+                created_identity = cls._identity(session_descriptor)
+            lease = _SecureSessionLease(
+                directory_descriptors,
+                session_descriptor,
+                f"{session_id}.jsonl",
+                lock_descriptor,
+                created_identity,
+            )
+            session_descriptor = None
+            lock_descriptor = None
+            return lease
+        except BaseException:
+            if session_descriptor is not None:
+                os.close(session_descriptor)
+            if lock_descriptor is not None:
+                try:
+                    os.ftruncate(lock_descriptor, 0)
+                finally:
+                    os.close(lock_descriptor)
             cls._close_descriptors(directory_descriptors)
+            raise
 
     @classmethod
-    def _session_artifact_identities(
+    def _load_verified_transcript(
         cls, workspace: Path, session_id: str
-    ) -> dict[str, tuple[int, int]]:
-        directory_descriptors = cls._open_session_directory_descriptors(workspace)
-        names = (
-            f"{session_id}.jsonl",
-            f"{session_id}.context-mode",
-            f"{session_id}.folds.sqlite3",
-            f"{session_id}.fold-decisions.jsonl",
+    ) -> list[dict]:
+        lease = cls._acquire_session_lease(
+            workspace,
+            session_id,
+            create_session=False,
         )
-        identities: dict[str, tuple[int, int]] = {}
         try:
-            for name in names:
-                try:
-                    descriptor = os.open(
-                        name,
-                        _READ_FLAGS,
-                        dir_fd=directory_descriptors[-1],
-                    )
-                except FileNotFoundError:
-                    continue
-                try:
-                    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-                        raise SessionResumeError("session artifact is unsafe")
-                    identities[name] = cls._identity(descriptor)
-                finally:
-                    os.close(descriptor)
-            return identities
+            return lease.session_log.load()
         finally:
-            cls._close_descriptors(directory_descriptors)
-
-    @classmethod
-    def _remove_session_artifacts_if_identity(
-        cls,
-        workspace: Path,
-        identities: dict[str, tuple[int, int]],
-    ) -> None:
-        directory_descriptors = cls._open_session_directory_descriptors(workspace)
-        try:
-            for name, identity in identities.items():
-                try:
-                    descriptor = os.open(
-                        name,
-                        _READ_FLAGS,
-                        dir_fd=directory_descriptors[-1],
-                    )
-                except FileNotFoundError:
-                    continue
-                try:
-                    if cls._identity(descriptor) == identity:
-                        os.unlink(name, dir_fd=directory_descriptors[-1])
-                finally:
-                    os.close(descriptor)
-        finally:
-            cls._close_descriptors(directory_descriptors)
+            lease.close()
 
     @staticmethod
     def _context_mode_for_discovery(session_path: Path) -> str:
@@ -642,6 +642,7 @@ class SessionManager:
         config: RuntimeConfig,
         llm: LLMClient,
         session_path: Path,
+        session_lease: _SecureSessionLease,
         *,
         resuming: bool,
     ) -> HarnessRuntime:
@@ -651,8 +652,24 @@ class SessionManager:
                 llm,
                 session_path,
                 resuming=resuming,
+                session_lease=session_lease,
             )
         except (RuntimeError, ValueError, OSError) as error:
+            cleanup = getattr(error, "runtime_abort", session_lease.abort)
+            cleanup_errors: list[BaseException] = []
+            for _attempt in range(2):
+                try:
+                    cleanup()
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+                    continue
+                break
+            else:
+                cleanup_error = cleanup_errors[-1]
+                error.add_note(
+                    "runtime construction cleanup failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
             raise SessionResumeError(str(error)) from None
 
     def _construct_runtime(
@@ -667,16 +684,22 @@ class SessionManager:
             require_file=True,
             create_parents=False,
         )
+        lease = self._acquire_session_lease(
+            record.workspace,
+            record.session_id,
+            create_session=False,
+        )
         return self._instantiate_runtime(
             config,
             llm,
             session_path,
+            lease,
             resuming=True,
         )
 
     def _construct_new_runtime(
         self, record: NewSession
-    ) -> tuple[HarnessRuntime, dict[str, tuple[int, int]]]:
+    ) -> HarnessRuntime:
         config = self._runtime_config(record)
         llm = self._build_llm()
         session_path = self._safe_session_path(
@@ -687,29 +710,18 @@ class SessionManager:
         )
         if session_path.exists():
             raise SessionResumeError("generated session id already exists")
-        identity = self._create_empty_session_artifact(
-            record.workspace, record.session_id
+        lease = self._acquire_session_lease(
+            record.workspace,
+            record.session_id,
+            create_session=True,
         )
-        created = {f"{record.session_id}.jsonl": identity}
-        try:
-            runtime = self._instantiate_runtime(
-                config,
-                llm,
-                session_path,
-                resuming=False,
-            )
-        except BaseException as error:
-            self._remove_artifacts_after_failure(record, created, error)
-            raise
-        try:
-            created = self._session_artifact_identities(
-                record.workspace, record.session_id
-            )
-        except BaseException as error:
-            self._close_after_failure(runtime, error)
-            self._remove_artifacts_after_failure(record, created, error)
-            raise
-        return runtime, created
+        return self._instantiate_runtime(
+            config,
+            llm,
+            session_path,
+            lease,
+            resuming=False,
+        )
 
     async def create_session(
         self,
@@ -740,14 +752,11 @@ class SessionManager:
             # The public RuntimeConfig contract validates constructible modes
             # before HarnessRuntime opens any session artifacts.
             self._runtime_config(provisional)
-            runtime, created_identity = self._construct_new_runtime(provisional)
+            runtime = self._construct_new_runtime(provisional)
             try:
                 record = self.metadata.create_session(provisional)
             except BaseException as error:
-                self._close_after_failure(runtime, error)
-                self._remove_artifacts_after_failure(
-                    provisional, created_identity, error
-                )
+                self._abort_after_failure(runtime, error)
                 raise
             self._runtimes[session_id] = runtime
             return record
@@ -769,7 +778,7 @@ class SessionManager:
             try:
                 self.metadata.touch_session(record.session_id)
             except BaseException as error:
-                self._close_after_failure(runtime, error)
+                self._abort_after_failure(runtime, error)
                 raise
             self._runtimes[record.session_id] = runtime
             return runtime
@@ -819,37 +828,29 @@ class SessionManager:
             self.metadata.archive_session(record.session_id)
 
     @staticmethod
-    def _close_after_failure(runtime: HarnessRuntime, original: BaseException) -> None:
-        try:
-            runtime.close()
-        except BaseException as cleanup_error:
-            original.add_note(
-                "runtime cleanup failed: "
-                f"{type(cleanup_error).__name__}: {cleanup_error}"
-            )
-            original.cleanup_errors = (cleanup_error,)  # type: ignore[attr-defined]
-
-    @classmethod
-    def _remove_artifacts_after_failure(
-        cls,
-        record: NewSession,
-        identities: dict[str, tuple[int, int]],
+    def _abort_after_failure(
+        runtime: HarnessRuntime,
         original: BaseException,
     ) -> None:
-        try:
-            cls._remove_session_artifacts_if_identity(
-                record.workspace, identities
-            )
-        except BaseException as cleanup_error:
+        cleanup_errors: list[BaseException] = []
+        operation = getattr(runtime, "abort", runtime.close)
+        for _attempt in range(2):
+            try:
+                operation()
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+                continue
+            return
+        for cleanup_error in cleanup_errors:
             original.add_note(
-                "session artifact cleanup failed: "
+                "runtime abort failed: "
                 f"{type(cleanup_error).__name__}: {cleanup_error}"
             )
-            existing = tuple(getattr(original, "cleanup_errors", ()))
-            original.cleanup_errors = (  # type: ignore[attr-defined]
-                *existing,
-                cleanup_error,
-            )
+        existing = tuple(getattr(original, "cleanup_errors", ()))
+        original.cleanup_errors = (  # type: ignore[attr-defined]
+            *existing,
+            *cleanup_errors,
+        )
 
     async def close(self) -> None:
         errors: list[Exception] = []

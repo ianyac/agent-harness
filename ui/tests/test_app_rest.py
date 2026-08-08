@@ -90,6 +90,12 @@ def write_completed_session(path: Path, content: str = "hello") -> None:
     )
 
 
+def assert_session_unlocked(session_path: Path) -> None:
+    lock_path = session_path.with_suffix(".lock")
+    assert lock_path.is_file()
+    assert lock_path.read_text() == ""
+
+
 def valid_credential_file(tmp_path: Path) -> Path:
     path = tmp_path / "auth.json"
     path.write_text(
@@ -142,7 +148,7 @@ def test_create_list_load_rename_and_archive_session(
     archived = client.delete(f"/api/sessions/{session_id}")
     assert archived.status_code == 204
     assert archived.content == b""
-    assert not session_path.with_suffix(".lock").exists()
+    assert_session_unlocked(session_path)
     assert client.get("/api/sessions").json() == []
 
 
@@ -388,8 +394,9 @@ def test_discovery_scans_only_base_and_metadata_known_workspaces_and_ignores_fol
         launch_secret=SECRET,
         allowed_origins=frozenset({ORIGIN}),
     )
+    app = create_app(settings, FakeLLM)
     with TestClient(
-        create_app(settings, FakeLLM),
+        app,
         base_url=ORIGIN,
         headers=AUTH_HEADERS,
     ) as test_client:
@@ -440,7 +447,7 @@ def test_transcript_uses_session_log_while_the_session_lock_is_held(
         "messages": [{"role": "assistant", "content": "authoritative"}],
     }
     assert observations == [True]
-    assert not session_path.with_suffix(".lock").exists()
+    assert_session_unlocked(session_path)
 
 
 def test_safety_opens_the_reviewed_runtime_and_returns_public_snapshot(
@@ -488,7 +495,7 @@ def test_folding_resume_failure_is_typed_and_does_not_leave_a_lock(tmp_path: Pat
     assert response.status_code == 409
     assert response.json()["error"]["type"] == "session_resume_error"
     assert "ledger is missing" in response.json()["error"]["message"]
-    assert not session_path.with_suffix(".lock").exists()
+    assert_session_unlocked(session_path)
 
 
 def test_invalid_modes_are_rejected_by_request_validation(
@@ -568,7 +575,8 @@ def test_lifespan_closes_open_runtimes_and_metadata(
         assert lock_path.exists()
         manager = app.state.session_manager
 
-    assert not lock_path.exists()
+    assert lock_path.is_file()
+    assert lock_path.read_text() == ""
     with pytest.raises(Exception):
         manager.metadata.get_session(session_id)
 
@@ -849,6 +857,175 @@ def test_transcript_pins_validated_inode_across_load_boundary_swap(
     assert external.read_bytes() == external_before
 
 
+def test_runtime_creation_uses_pinned_session_and_lock_across_boundary_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    external_session = tmp_path / "external-session.jsonl"
+    external_session.write_text("NOT SESSION DATA")
+    external_lock = tmp_path / "external-lock"
+    external_lock.write_text("not-a-pid")
+    session_before = external_session.read_bytes()
+    lock_before = external_lock.read_bytes()
+    metadata_path = tmp_path / "metadata.sqlite3"
+    settings = AppSettings(
+        metadata_path=metadata_path,
+        base_workspace=workspace,
+        launch_secret=SECRET,
+        allowed_origins=frozenset({ORIGIN}),
+    )
+    session_id = "runtime-swap"
+    session_path = workspace / ".agent" / "sessions" / f"{session_id}.jsonl"
+    lock_path = session_path.with_suffix(".lock")
+    from server import sessions as sessions_module
+
+    monkeypatch.setattr(
+        sessions_module.SessionManager,
+        "_new_session_id",
+        staticmethod(lambda: session_id),
+    )
+    original_init = sessions_module.HarnessRuntime.__init__
+    observed_leases: list[object | None] = []
+
+    def swap_then_initialize(runtime, *args, **kwargs):
+        observed_leases.append(kwargs.get("session_lease"))
+        session_path.unlink()
+        session_path.symlink_to(external_session)
+        if lock_path.exists() or lock_path.is_symlink():
+            lock_path.unlink()
+        lock_path.symlink_to(external_lock)
+        return original_init(runtime, *args, **kwargs)
+
+    monkeypatch.setattr(
+        sessions_module.HarnessRuntime,
+        "__init__",
+        swap_then_initialize,
+    )
+    app = create_app(settings, FakeLLM)
+    with TestClient(
+        app,
+        base_url=ORIGIN,
+        headers=AUTH_HEADERS,
+    ) as test_client:
+        response = test_client.post(
+            "/api/sessions",
+            json={
+                "workspace": str(workspace),
+                "mode": "default",
+                "context_mode": "compaction",
+                "title": "Swap",
+            },
+        )
+        runtime = app.state.session_manager._runtimes[session_id]
+        runtime.messages = [{"role": "assistant", "content": "new local turn"}]
+        runtime.session_log.record_turn(runtime.messages)
+
+    assert response.status_code == 201
+    assert observed_leases and observed_leases[0] is not None
+    assert external_session.read_bytes() == session_before
+    assert external_lock.read_bytes() == lock_before
+
+
+def test_secure_runtime_lock_has_one_owner_and_keeps_a_stable_inode(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    session_path = workspace / ".agent" / "sessions" / "shared.jsonl"
+    write_completed_session(session_path, "local")
+    first_metadata = MetadataStore(tmp_path / "first.sqlite3")
+    second_metadata = MetadataStore(tmp_path / "second.sqlite3")
+    first_metadata.create_session(NewSession.defaults("shared", workspace))
+    second_metadata.create_session(NewSession.defaults("shared", workspace))
+    first = SessionManager(first_metadata, workspace, FakeLLM)
+    second = SessionManager(second_metadata, workspace, FakeLLM)
+    lock_path = session_path.with_suffix(".lock")
+
+    async def scenario() -> None:
+        try:
+            first_runtime = await first.open_runtime("shared")
+            assert first_runtime is not None
+            owned_inode = lock_path.stat().st_ino
+            with pytest.raises(RuntimeError, match="in use"):
+                await second.open_runtime("shared")
+
+            await first.close()
+            assert lock_path.exists()
+            assert lock_path.read_text() == ""
+
+            second_runtime = await second.open_runtime("shared")
+            assert second_runtime is not None
+            assert lock_path.stat().st_ino == owned_inode
+        finally:
+            await first.close()
+            await second.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("failure_point", ["session_descriptor", "lock_clear"])
+def test_secure_session_lease_release_is_retryable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+):
+    workspace = tmp_path / "workspace"
+    session_path = workspace / ".agent" / "sessions" / "retry.jsonl"
+    write_completed_session(session_path, "local")
+    from server import sessions as sessions_module
+
+    lease = SessionManager._acquire_session_lease(
+        workspace,
+        "retry",
+        create_session=False,
+    )
+    lock_path = session_path.with_suffix(".lock")
+    if failure_point == "session_descriptor":
+        target = lease._session_descriptor
+        original = sessions_module.os.close
+        failed = False
+
+        def fail_once(descriptor: int):
+            nonlocal failed
+            if descriptor == target and not failed:
+                failed = True
+                raise OSError("session descriptor close interrupted")
+            return original(descriptor)
+
+        monkeypatch.setattr(sessions_module.os, "close", fail_once)
+    else:
+        target = lease._lock_descriptor
+        original = sessions_module.os.ftruncate
+        failed = False
+
+        def fail_once(descriptor: int, length: int):
+            nonlocal failed
+            if descriptor == target and not failed:
+                failed = True
+                raise OSError("lock clear interrupted")
+            return original(descriptor, length)
+
+        monkeypatch.setattr(sessions_module.os, "ftruncate", fail_once)
+
+    with pytest.raises(OSError, match="interrupted"):
+        lease.close()
+    with pytest.raises(RuntimeError, match="in use"):
+        SessionManager._acquire_session_lease(
+            workspace,
+            "retry",
+            create_session=False,
+        )
+
+    lease.close()
+    replacement = SessionManager._acquire_session_lease(
+        workspace,
+        "retry",
+        create_session=False,
+    )
+    replacement.close()
+
+    assert lock_path.exists()
+    assert lock_path.read_text() == ""
+
+
 def test_new_empty_transcript_is_authoritative_then_deletion_is_a_conflict(
     client: TestClient, workspace: Path
 ):
@@ -892,12 +1069,195 @@ def test_new_empty_session_artifacts_roll_back_if_metadata_insert_fails(
                     title="Rollback",
                 )
             sessions_dir = workspace / ".agent" / "sessions"
-            assert list(sessions_dir.iterdir()) == []
+            artifacts = list(sessions_dir.iterdir())
+            assert len(artifacts) == 1
+            assert artifacts[0].suffix == ".lock"
+            assert artifacts[0].read_text() == ""
             assert manager._runtimes == {}
         finally:
             await manager.close()
 
     asyncio.run(scenario())
+
+
+def test_new_session_abort_preserves_preexisting_companion_and_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    workspace = tmp_path / "workspace"
+    sessions_dir = workspace / ".agent" / "sessions"
+    sessions_dir.mkdir(parents=True)
+    session_id = "collision"
+    context_mode = sessions_dir / f"{session_id}.context-mode"
+    context_mode.write_text("compaction\n")
+    metadata = MetadataStore(tmp_path / "metadata.sqlite3")
+    manager = SessionManager(metadata, workspace, FakeLLM)
+    monkeypatch.setattr(
+        manager,
+        "_new_session_id",
+        lambda: session_id,
+    )
+
+    def fail_create(_session: NewSession):
+        raise RuntimeError("metadata insert failed")
+
+    monkeypatch.setattr(metadata, "create_session", fail_create)
+    from server import runtime as runtime_module
+
+    original_abort = getattr(runtime_module.HarnessRuntime, "abort", None)
+    abort_calls = 0
+
+    def interrupt_first_abort(runtime):
+        nonlocal abort_calls
+        abort_calls += 1
+        if abort_calls == 1:
+            raise OSError("abort interrupted")
+        assert original_abort is not None
+        return original_abort(runtime)
+
+    monkeypatch.setattr(
+        runtime_module.HarnessRuntime,
+        "abort",
+        interrupt_first_abort,
+        raising=False,
+    )
+
+    async def scenario() -> None:
+        try:
+            with pytest.raises(RuntimeError, match="metadata insert failed"):
+                await manager.create_session(
+                    workspace=workspace,
+                    mode="default",
+                    context_mode="compaction",
+                    title="Collision",
+                )
+            assert context_mode.read_text() == "compaction\n"
+            assert not (sessions_dir / f"{session_id}.jsonl").exists()
+            assert abort_calls == 2
+            assert manager._runtimes == {}
+        finally:
+            await manager.close()
+
+    asyncio.run(scenario())
+
+
+def test_new_session_abort_cleans_owned_artifacts_after_lock_release_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    metadata = MetadataStore(tmp_path / "metadata.sqlite3")
+    manager = SessionManager(metadata, workspace, FakeLLM)
+    session_id = "cleanup-retry"
+    monkeypatch.setattr(manager, "_new_session_id", lambda: session_id)
+
+    def fail_create(_session: NewSession):
+        raise RuntimeError("metadata insert failed")
+
+    monkeypatch.setattr(metadata, "create_session", fail_create)
+    from server import sessions as sessions_module
+
+    original_release = sessions_module._SecureSessionLease._release_lock
+    release_calls = 0
+
+    def fail_first_release(lease):
+        nonlocal release_calls
+        release_calls += 1
+        if release_calls == 1:
+            raise OSError("lock release interrupted")
+        return original_release(lease)
+
+    monkeypatch.setattr(
+        sessions_module._SecureSessionLease,
+        "_release_lock",
+        fail_first_release,
+    )
+
+    async def scenario() -> None:
+        try:
+            with pytest.raises(RuntimeError, match="metadata insert failed"):
+                await manager.create_session(
+                    workspace=workspace,
+                    mode="default",
+                    context_mode="compaction",
+                    title="Cleanup retry",
+                )
+            sessions_dir = workspace / ".agent" / "sessions"
+            assert sorted(path.suffix for path in sessions_dir.iterdir()) == [
+                ".lock"
+            ]
+            assert not (sessions_dir / f"{session_id}.jsonl").exists()
+            assert not (sessions_dir / f"{session_id}.context-mode").exists()
+            assert release_calls == 2
+            assert (sessions_dir / f"{session_id}.lock").read_text() == ""
+        finally:
+            await manager.close()
+
+    asyncio.run(scenario())
+
+
+def test_constructor_cleanup_retries_runtime_owned_context_after_partial_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    settings = AppSettings(
+        metadata_path=tmp_path / "metadata.sqlite3",
+        base_workspace=workspace,
+        launch_secret=SECRET,
+        allowed_origins=frozenset({ORIGIN}),
+    )
+    session_id = "constructor-cleanup"
+    from server import runtime as runtime_module
+    from server import sessions as sessions_module
+
+    monkeypatch.setattr(
+        sessions_module.SessionManager,
+        "_new_session_id",
+        staticmethod(lambda: session_id),
+    )
+
+    def fail_registry(**_kwargs):
+        raise ValueError("registry construction failed")
+
+    monkeypatch.setattr(runtime_module, "build_registry", fail_registry)
+    original_rollback = runtime_module.PreparedContext.rollback
+    rollback_calls = 0
+
+    def fail_first_rollback(context):
+        nonlocal rollback_calls
+        rollback_calls += 1
+        if rollback_calls == 1:
+            raise OSError("context rollback interrupted")
+        return original_rollback(context)
+
+    monkeypatch.setattr(
+        runtime_module.PreparedContext,
+        "rollback",
+        fail_first_rollback,
+    )
+
+    with TestClient(
+        create_app(settings, FakeLLM),
+        base_url=ORIGIN,
+        headers=AUTH_HEADERS,
+    ) as test_client:
+        response = test_client.post(
+            "/api/sessions",
+            json={
+                "workspace": str(workspace),
+                "mode": "default",
+                "context_mode": "compaction",
+                "title": "Constructor cleanup",
+            },
+        )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["type"] == "session_resume_error"
+    sessions_dir = workspace / ".agent" / "sessions"
+    assert rollback_calls == 2
+    assert not (sessions_dir / f"{session_id}.jsonl").exists()
+    assert not (sessions_dir / f"{session_id}.context-mode").exists()
+    assert (sessions_dir / f"{session_id}.lock").read_text() == ""
 
 
 @pytest.mark.parametrize(
@@ -1016,7 +1376,7 @@ def test_open_runtime_rolls_back_cache_and_lock_when_metadata_touch_fails(
             with pytest.raises(RuntimeError, match="metadata touch failed"):
                 await manager.open_runtime("touch-fails")
             assert manager._runtimes == {}
-            assert not session_path.with_suffix(".lock").exists()
+            assert_session_unlocked(session_path)
         finally:
             await manager.close()
 
@@ -1045,7 +1405,7 @@ def test_open_runtime_preserves_touch_error_when_rollback_close_also_fails(
         try:
             with pytest.raises(RuntimeError, match="metadata touch failed") as raised:
                 await manager.open_runtime("touch-cleanup")
-            assert runtime.calls == ["runtime"]
+            assert runtime.calls == ["runtime", "runtime"]
             assert manager._runtimes == {}
             assert "runtime cleanup failed" in "\n".join(raised.value.__notes__)
         finally:

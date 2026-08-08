@@ -29,10 +29,21 @@ class PreparedContext:
     compact_threshold: int | None
     folding: FoldingContext | None = None
     _created_paths: list[Path] = field(default_factory=list, repr=False)
+    _created_identities: dict[Path, tuple[int, int]] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
     _folding_owned: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._folding_owned = self.folding is not None
+        for path in self._created_paths:
+            try:
+                created = path.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            self._created_identities[path] = (created.st_dev, created.st_ino)
 
     def close(self) -> None:
         if self._folding_owned and self.folding is not None:
@@ -43,7 +54,17 @@ class PreparedContext:
         """Release resources and remove only artifacts this attempt created."""
         self.close()
         for path in reversed(self._created_paths.copy()):
-            path.unlink(missing_ok=True)
+            identity = self._created_identities.get(path)
+            if identity is not None:
+                try:
+                    current = path.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    current_identity = None
+                else:
+                    current_identity = (current.st_dev, current.st_ino)
+                if current_identity == identity:
+                    path.unlink()
+            self._created_identities.pop(path, None)
             self._created_paths.remove(path)
 
 

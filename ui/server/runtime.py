@@ -1,7 +1,7 @@
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import Protocol, cast
 
 from harness.llm import LLMClient
 from harness.permissions import PermissionPolicy
@@ -23,6 +23,16 @@ from server.registry import PlanReviewer, build_registry
 COMPACT_FRACTION = 0.8
 _DEFAULT_SEARCH = object()
 _SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+class RuntimeSessionLease(Protocol):
+    """A pre-acquired session lock and authoritative log owned by a runtime."""
+
+    session_log: SessionLog
+
+    def close(self) -> None: ...
+
+    def abort(self) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -72,12 +82,15 @@ class HarnessRuntime:
         *,
         search_provider: SearchProvider | None | object = _DEFAULT_SEARCH,
         resuming: bool | None = None,
+        session_lease: RuntimeSessionLease | None = None,
     ) -> None:
         self.config = config
         self.workspace = Path(config.workspace).resolve()
         self.session_path = Path(session_path)
         self.llm = llm
         self._lock_held = False
+        self._session_lease = session_lease
+        self._lease_owned = session_lease is not None
         self._context_owned = False
         self._plan_reviewer: PlanReviewer | None = None
         self.context: PreparedContext | None = None
@@ -94,8 +107,9 @@ class HarnessRuntime:
         self.policy = PermissionPolicy(config.mode)
 
         try:
-            lock(self.session_path)
-            self._lock_held = True
+            if self._session_lease is None:
+                lock(self.session_path)
+                self._lock_held = True
             is_resume = self.session_path.exists() if resuming is None else resuming
             selected_mode = resolve_context_mode(
                 self.session_path,
@@ -120,7 +134,11 @@ class HarnessRuntime:
             self._context_owned = True
             self.sandbox_policy = SandboxPolicy(self.workspace, allow_network=False)
             self.sandbox: Sandbox = default_sandbox(self.sandbox_policy)
-            self.session_log = SessionLog(self.session_path)
+            self.session_log = (
+                self._session_lease.session_log
+                if self._session_lease is not None
+                else SessionLog(self.session_path)
+            )
             self.messages = self.session_log.load()
             active_provider = (
                 default_provider()
@@ -140,7 +158,7 @@ class HarnessRuntime:
         except BaseException as error:
             cleanup_errors = self._cleanup_owned_resources(
                 rollback_context=True,
-                continue_after_error=True,
+                continue_after_error=self._session_lease is None,
             )
             if cleanup_errors:
                 error.add_note(
@@ -156,6 +174,9 @@ class HarnessRuntime:
                     "context_owned": self._context_owned,
                     "lock_held": self._lock_held,
                 }
+                if self._session_lease is not None:
+                    error.cleanup_state["lease_owned"] = self._lease_owned  # type: ignore[attr-defined]
+                error.runtime_abort = self.abort  # type: ignore[attr-defined]
             raise
 
     @property
@@ -219,7 +240,13 @@ class HarnessRuntime:
         if errors and not continue_after_error:
             return errors
         try:
-            if self._lock_held:
+            if self._lease_owned and self._session_lease is not None:
+                if rollback_context:
+                    self._session_lease.abort()
+                else:
+                    self._session_lease.close()
+                self._lease_owned = False
+            elif self._lock_held:
                 unlock(self.session_path)
                 self._lock_held = False
         except BaseException as error:
@@ -229,6 +256,15 @@ class HarnessRuntime:
     def close(self) -> None:
         errors = self._cleanup_owned_resources(
             rollback_context=False,
+            continue_after_error=False,
+        )
+        if errors:
+            raise errors[0]
+
+    def abort(self) -> None:
+        """Rollback construction-owned artifacts and release the session lease."""
+        errors = self._cleanup_owned_resources(
+            rollback_context=True,
             continue_after_error=False,
         )
         if errors:

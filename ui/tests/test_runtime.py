@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from harness.sandbox import NoSandbox
+from harness.session import SessionLog
 from server.registry import build_registry, build_system
 from server.runtime import HarnessRuntime, RuntimeConfig
 
@@ -17,6 +18,22 @@ class FakeLLM:
 
 class InvalidWindowLLM(FakeLLM):
     context_window = 0
+
+
+class RecordingSessionLease:
+    def __init__(self, session_log: SessionLog, *, abort_failures: int = 0):
+        self.session_log = session_log
+        self.abort_failures = abort_failures
+        self.close_calls = 0
+        self.abort_calls = 0
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+    def abort(self) -> None:
+        self.abort_calls += 1
+        if self.abort_calls <= self.abort_failures:
+            raise OSError("lease abort interrupted")
 
 
 def config(workspace: Path, **changes) -> RuntimeConfig:
@@ -61,6 +78,67 @@ def test_runtime_locks_before_loading_and_owns_authoritative_session_log(
         assert session.read_text().count("authoritative") == 1
     finally:
         runtime.close()
+
+
+def test_runtime_uses_preacquired_lease_without_path_lock_or_log_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    session = tmp_path / ".agent" / "sessions" / "s1.jsonl"
+    pinned = tmp_path / "pinned.jsonl"
+    message = {"role": "assistant", "content": "pinned-authoritative"}
+    pinned.write_text(json.dumps({"type": "message", "message": message}) + "\n")
+    lease = RecordingSessionLease(SessionLog(pinned))
+
+    from server import runtime as runtime_module
+
+    monkeypatch.setattr(
+        runtime_module,
+        "lock",
+        lambda _path: pytest.fail("pathname lock must not run for a lease"),
+    )
+    runtime = HarnessRuntime(
+        config(tmp_path),
+        FakeLLM(),
+        session,
+        resuming=False,
+        session_lease=lease,
+    )
+    try:
+        assert runtime.session_log is lease.session_log
+        assert runtime.messages == [message]
+    finally:
+        runtime.close()
+
+    assert lease.close_calls == 1
+    assert lease.abort_calls == 0
+
+
+def test_runtime_abort_retries_lease_release_without_redeleting_context(
+    tmp_path: Path
+):
+    session = tmp_path / ".agent" / "sessions" / "s1.jsonl"
+    pinned = tmp_path / "pinned.jsonl"
+    pinned.touch()
+    lease = RecordingSessionLease(SessionLog(pinned), abort_failures=1)
+    runtime = HarnessRuntime(
+        config(tmp_path),
+        FakeLLM(),
+        session,
+        resuming=False,
+        session_lease=lease,
+    )
+    context_mode = session.with_suffix(".context-mode")
+    assert context_mode.exists()
+
+    with pytest.raises(OSError, match="lease abort interrupted"):
+        runtime.abort()
+    assert not context_mode.exists()
+
+    runtime.abort()
+    runtime.abort()
+
+    assert lease.abort_calls == 2
+    assert lease.close_calls == 0
 
 
 def test_runtime_close_releases_lock_idempotently(tmp_path: Path):

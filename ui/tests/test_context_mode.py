@@ -126,3 +126,19 @@ def test_failed_context_mode_write_removes_a_new_partial_artifact(
         prepare_context_mode(session, requested="compaction", resuming=False)
 
     assert not mode_path.exists()
+
+
+def test_context_rollback_preserves_a_replacement_at_an_owned_path(tmp_path: Path):
+    session = tmp_path / "s.jsonl"
+    prepared = prepare_context_mode(
+        session,
+        requested="compaction",
+        resuming=False,
+    )
+    mode_path = session.with_suffix(".context-mode")
+    mode_path.unlink()
+    mode_path.write_text("replacement\n")
+
+    prepared.rollback()
+
+    assert mode_path.read_text() == "replacement\n"

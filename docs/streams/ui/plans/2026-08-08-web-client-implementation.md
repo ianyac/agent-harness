@@ -285,14 +285,16 @@ export interface PlatformAdapter {
   getServiceConnection(): Promise<{ baseUrl: string; token: string }>;
   chooseWorkspace(): Promise<string | null>;
   notify(input: { title: string; body: string }): Promise<void>;
-  revealPath(path: string): Promise<void>;
+  openLogs?: () => Promise<void>;
 }
 ```
 
 Browser `chooseWorkspace` returns `null`; the onboarding UI uses a validated
 path field and recents. Tauri methods invoke only the narrow commands defined
 in Plan 3. Detect Tauri once in `platform/index.ts`; no feature component may
-read Tauri globals.
+read Tauri globals. The Tauri adapter exposes optional `openLogs()` through
+Plan 3's capability-specific `open_logs` command. The browser adapter omits it.
+Do not expose a generic frontend-supplied path reveal command.
 
 The browser adapter starts at
 `/_app/<static-capability>/#token=<api-capability>`. Capture the fragment token
@@ -430,9 +432,10 @@ Expected: FAIL because the components do not exist.
 
 Use `react-markdown` with `remark-gfm` and omit raw-HTML plugins. External
 links get `target="_blank"` and `rel="noreferrer"`; local file paths call the
-platform adapter only from an explicit Reveal action. Render fenced `diff`
-blocks line-by-line with additions, removals, and hunk headers; all other code
-uses a copyable `<pre><code>`.
+platform adapter for no native action in v1: render them as selectable,
+copyable text without a misleading Reveal control. Render fenced `diff` blocks
+line-by-line with additions, removals, and hunk headers; all other code uses a
+copyable `<pre><code>`.
 
 Activity cards show status, elapsed time, action count, and summarized test
 results. The full result is never truncated in state; only the card preview is
@@ -661,6 +664,8 @@ Map each server error category to one stable recovery view. Reconnect uses
 quiet inline status for the first 10 seconds, then a visible recovery banner.
 When a non-visible session requests permission or completes, call
 `PlatformAdapter.notify` only if the corresponding preference is enabled.
+Show Open logs only when `PlatformAdapter.openLogs` is present; never accept a
+frontend-supplied path for that action.
 
 - [ ] **Step 4: Run onboarding tests and build**
 

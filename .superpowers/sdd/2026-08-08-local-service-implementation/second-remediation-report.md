@@ -369,3 +369,119 @@ Round scope is limited to `ui/server/sessions.py`,
 was self-reviewed; no root source/test/config, metadata/I5, or `ui/frontend/`
 file changed. Root warning-strict baseline debt and the previously documented
 Darwin/fail-closed carrier constraints remain unchanged.
+
+## Fix round 2/5 — authority-helper ownership transfer
+
+Review source:
+`.superpowers/sdd/2026-08-08-local-service-implementation/second-remediation-rereview.md`
+
+Implementation commit: `d7549aa` —
+`ui: make authority transfer resource-atomic`
+
+### Review finding and root cause
+
+The outer acquisition rollback from fix round 1 remains correct and unchanged.
+The remaining failure was inside `_acquire_authority()`, before the outer
+handler receives the authority descriptor. After taking the OFD lock, the
+helper removed that descriptor from its cleanup slot and began a pending
+return; its sequential `finally` then closed the temporary `/dev` descriptor.
+An interruption of that close replaced the return and leaked both `/dev` and
+the live OFD authority, so the same key remained unavailable. On an authority
+acquisition error, an interrupted `/dev/null` close likewise replaced the
+primary and skipped the `/dev` close.
+
+The helper now retains both descriptors until temporary cleanup succeeds.
+Every acquisition failure and the temporary-close boundary use one local
+cleanup routine that attempts each owned descriptor independently, retries a
+transient close once, records cleanup exceptions in a note and
+`cleanup_errors`, and re-raises the exact primary object. Only after `/dev`
+closes does the helper transfer the live authority descriptor to its caller.
+The existing `OSError`/`struct.error` translation remains unchanged at the
+public boundary.
+
+I5 and `_CoordinationLeaseClaim.acquire()`'s outer rollback were not changed in
+this round.
+
+### Exact TDD evidence
+
+The first regression performs a real OFD acquisition and interrupts only the
+temporary `/dev` close. The second injects an exact authority-acquisition
+primary followed by a one-shot authority-descriptor close interruption. Both
+inspect real process FDs and perform a real same-key reacquisition.
+
+Command:
+
+```text
+cd ui
+uv run pytest \
+  tests/test_app_rest.py::test_authority_transfer_close_interruption_is_resource_atomic \
+  tests/test_app_rest.py::test_authority_acquisition_failure_cleanup_is_resource_atomic \
+  -q
+```
+
+RED on `deeb82c` plus the two tests:
+
+```text
+FF                                                                       [100%]
+transfer path: assert 15 == 13
+acquisition-error path:
+  AssertionError: (OSError('injected authority descriptor close failure'),
+                   'fd_growth=2', None)
+2 failed in 0.32s
+```
+
+The transfer path propagated its injected temporary-close error but leaked two
+descriptors; its captured real same-key retry failed with
+`SessionResumeError("session is already in use")`. The acquisition-error path
+also leaked two descriptors and replaced the exact
+`SessionResumeError("injected authority acquisition failure")` primary with the
+cleanup `OSError`; its same-key retry succeeded because that injected failure
+occurred before an OFD lock was taken.
+
+GREEN with the helper fix, using the identical command:
+
+```text
+..                                                                       [100%]
+2 passed in 0.15s
+```
+
+The passing regressions assert exact primary identity, the sole secondary
+cleanup error where applicable, zero descriptor growth immediately after
+failure, immediate same-key reacquisition, and a baseline FD count after the
+replacement is released.
+
+### Round verification
+
+| Check | Result |
+| --- | --- |
+| Warning-strict C1 replacement/hardening/acquisition/release/resource/stage selection | `16 passed in 0.48s` |
+| Full UI: `cd ui && uv run pytest -W error -q` | `392 passed in 9.42s` |
+| Root ordinary discovery: `uv run pytest -q` | `545 passed in 14.49s` |
+| Explicit root scope: `uv run pytest tests -q` | `545 passed in 14.48s` |
+| UI compilation: `cd ui && uv run python -m py_compile server/*.py tests/*.py` | exit 0 |
+| Crash-release subprocess | `crash_release=PASS child=ACQUIRED_BEFORE_CRASH` |
+| Normal FD/process-claim probe across 50 full acquire/close cycles | `before=4`, `after=4`, `process_claims=0` |
+| Async task probe after manager create/close | `pending=0` |
+| `git diff --check` before the implementation commit | pass |
+
+### Scope and self-review
+
+The implementation commit is limited to `ui/server/sessions.py` and
+`ui/tests/test_app_rest.py`. The source diff changes only
+`_acquire_authority()`; the outer coordination rollback and all metadata/I5
+code are byte-for-byte outside the diff. Forbidden-scope inspection for root
+`harness/`, root `tests/`, `pyproject.toml`, `ui/frontend/`, metadata source,
+and metadata tests was empty.
+
+The complete `deeb82c..d7549aa` diff was read line by line. Removing the new
+handoff ordering recreates the two-FD leak and live-key denial. Restoring
+sequential failure cleanup lets the injected close replace the primary and
+skip the remaining descriptor. The regressions use real carrier descriptors,
+measure the process descriptor table before assertion cleanup, and release any
+intentionally leaked RED-state descriptors in their own finalizers so a
+failing run cannot contaminate later tests.
+
+No unrelated refactor, dependency change, remote action, merge action, I5
+change, or outer-rollback change was performed. The previously documented
+Darwin/fail-closed carrier constraints, denial-only byte-range collision risk,
+and out-of-scope root warning-strict finalizer debt remain unchanged.

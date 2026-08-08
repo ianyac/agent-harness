@@ -80,6 +80,21 @@ def test_invalid_bootstrap_attempt_does_not_consume_the_token(auth: LaunchAuth):
     assert auth.consume_bootstrap(SECRET) is True
 
 
+def test_non_ascii_bootstrap_token_fails_closed_without_consuming_secret(
+    auth: LaunchAuth,
+):
+    assert auth.consume_bootstrap("é") is False
+
+    with pytest.raises(HTTPException) as raised:
+        auth.bootstrap_response("é")
+
+    assert raised.value.status_code == 401
+    assert raised.value.detail == "Unauthorized"
+    assert "é" not in repr(raised.value)
+    assert SECRET not in repr(raised.value)
+    assert auth.consume_bootstrap(SECRET) is True
+
+
 def test_bootstrap_consumption_is_atomic(auth: LaunchAuth):
     workers = 16
     gate = threading.Barrier(workers)
@@ -136,8 +151,11 @@ def test_bootstrap_response_rejects_invalid_or_reused_tokens_without_disclosure(
     assert raised.value.status_code == 401
     assert SECRET not in str(raised.value)
     assert token not in str(raised.value)
+    assert SECRET not in repr(raised.value)
+    assert token not in repr(raised.value)
 
 
+@pytest.mark.parametrize("method", ["GET", "HEAD", "OPTIONS"])
 @pytest.mark.parametrize(
     "headers",
     [
@@ -146,16 +164,21 @@ def test_bootstrap_response_rejects_invalid_or_reused_tokens_without_disclosure(
     ],
 )
 def test_http_accepts_bearer_or_session_cookie_without_origin_for_safe_methods(
-    auth: LaunchAuth, headers: list[tuple[str, str]]
+    auth: LaunchAuth, headers: list[tuple[str, str]], method: str
 ):
-    assert auth.require_http(request(headers=headers)) is None
+    assert auth.require_http(request(method, headers=headers)) is None
 
 
-def test_http_accepts_allowed_origin_for_unsafe_method(auth: LaunchAuth):
+@pytest.mark.parametrize(
+    "method", ["POST", "PUT", "PATCH", "DELETE", "TRACE", "CONNECT"]
+)
+def test_http_accepts_allowed_origin_for_unsafe_method(
+    auth: LaunchAuth, method: str
+):
     assert (
         auth.require_http(
             request(
-                "POST",
+                method,
                 headers=[
                     ("Authorization", f"Bearer {SECRET}"),
                     ("Origin", TAURI_ORIGIN),
@@ -185,9 +208,78 @@ def test_http_rejects_missing_or_malformed_credentials_without_disclosure(
 
     assert raised.value.status_code == 401
     assert SECRET not in str(raised.value)
+    assert SECRET not in repr(raised.value)
 
 
-@pytest.mark.parametrize("method", ["POST", "PUT", "PATCH", "DELETE"])
+@pytest.mark.parametrize(
+    "headers",
+    [
+        [("Authorization", "Bearer é")],
+        [("Cookie", "harness_ui_session=é")],
+    ],
+)
+def test_non_ascii_http_credentials_fail_closed(
+    auth: LaunchAuth, headers: list[tuple[str, str]]
+):
+    with pytest.raises(HTTPException) as raised:
+        auth.require_http(request(headers=headers))
+
+    assert raised.value.status_code == 401
+    assert raised.value.detail == "Unauthorized"
+    assert "é" not in repr(raised.value)
+    assert SECRET not in repr(raised.value)
+
+
+@pytest.mark.parametrize(
+    "authorization_headers",
+    [
+        [
+            ("Authorization", f"Bearer {SECRET}"),
+            ("Authorization", f"Bearer {SECRET}"),
+        ],
+        [
+            ("Authorization", f"Bearer {SECRET}"),
+            ("Authorization", "Bearer wrong"),
+            ("Cookie", f"harness_ui_session={SECRET}"),
+        ],
+    ],
+)
+def test_http_rejects_repeated_authorization_fields_without_cookie_fallback(
+    auth: LaunchAuth, authorization_headers: list[tuple[str, str]]
+):
+    with pytest.raises(HTTPException) as raised:
+        auth.require_http(request(headers=authorization_headers))
+
+    assert raised.value.status_code == 401
+
+
+@pytest.mark.parametrize(
+    "cookie_headers",
+    [
+        [
+            (
+                "Cookie",
+                f"harness_ui_session={SECRET}; harness_ui_session={SECRET}",
+            )
+        ],
+        [
+            ("Cookie", f"harness_ui_session={SECRET}"),
+            ("Cookie", f"harness_ui_session={SECRET}"),
+        ],
+    ],
+)
+def test_http_rejects_duplicate_session_cookie_names(
+    auth: LaunchAuth, cookie_headers: list[tuple[str, str]]
+):
+    with pytest.raises(HTTPException) as raised:
+        auth.require_http(request(headers=cookie_headers))
+
+    assert raised.value.status_code == 401
+
+
+@pytest.mark.parametrize(
+    "method", ["POST", "PUT", "PATCH", "DELETE", "TRACE", "CONNECT"]
+)
 @pytest.mark.parametrize(
     "origin_headers",
     [
@@ -211,6 +303,7 @@ def test_unsafe_http_requires_one_exact_allowed_origin(
 
     assert raised.value.status_code == 403
     assert SECRET not in str(raised.value)
+    assert SECRET not in repr(raised.value)
 
 
 def test_websocket_accepts_browser_cookie_from_allowed_origin(auth: LaunchAuth):
@@ -255,6 +348,48 @@ def test_websocket_combines_repeated_protocol_headers_in_wire_order(auth: Launch
 
 
 @pytest.mark.parametrize(
+    "protocol_headers",
+    [
+        [("Sec-WebSocket-Protocol", f"  harness-ui\t,\t{SECRET}  ")],
+        [
+            ("Sec-WebSocket-Protocol", " harness-ui "),
+            ("Sec-WebSocket-Protocol", f"\t{SECRET}\t"),
+        ],
+    ],
+)
+def test_websocket_accepts_optional_whitespace_around_protocol_values(
+    auth: LaunchAuth, protocol_headers: list[tuple[str, str]]
+):
+    selected = auth.require_websocket(
+        websocket(headers=[("Origin", TAURI_ORIGIN), *protocol_headers])
+    )
+
+    assert selected == "harness-ui"
+
+
+@pytest.mark.parametrize(
+    "protocol_headers",
+    [
+        [("Sec-WebSocket-Protocol", f"harness-ui, {SECRET}, {SECRET}")],
+        [
+            ("Sec-WebSocket-Protocol", "harness-ui"),
+            ("Sec-WebSocket-Protocol", SECRET),
+            ("Sec-WebSocket-Protocol", SECRET),
+        ],
+    ],
+)
+def test_websocket_rejects_duplicate_secret_protocol_values(
+    auth: LaunchAuth, protocol_headers: list[tuple[str, str]]
+):
+    with pytest.raises(WebSocketException) as raised:
+        auth.require_websocket(
+            websocket(headers=[("Origin", TAURI_ORIGIN), *protocol_headers])
+        )
+
+    assert raised.value.code == 1008
+
+
+@pytest.mark.parametrize(
     "origin_headers",
     [
         [],
@@ -278,6 +413,7 @@ def test_every_websocket_requires_one_exact_allowed_origin(
 
     assert raised.value.code == 1008
     assert SECRET not in str(raised.value)
+    assert SECRET not in repr(raised.value)
 
 
 @pytest.mark.parametrize(
@@ -305,6 +441,24 @@ def test_websocket_rejects_missing_malformed_or_reordered_secret_protocols(
 
     assert raised.value.code == 1008
     assert SECRET not in str(raised.value)
+    assert SECRET not in repr(raised.value)
+
+
+def test_non_ascii_websocket_protocol_credential_fails_closed(auth: LaunchAuth):
+    with pytest.raises(WebSocketException) as raised:
+        auth.require_websocket(
+            websocket(
+                headers=[
+                    ("Origin", TAURI_ORIGIN),
+                    ("Sec-WebSocket-Protocol", "harness-ui, é"),
+                ]
+            )
+        )
+
+    assert raised.value.code == 1008
+    assert raised.value.reason == "Forbidden"
+    assert "é" not in repr(raised.value)
+    assert SECRET not in repr(raised.value)
 
 
 def test_websocket_does_not_accept_bearer_auth(auth: LaunchAuth):
@@ -330,3 +484,22 @@ def test_malformed_protocol_is_not_bypassed_by_a_valid_cookie(auth: LaunchAuth):
                 ]
             )
         )
+
+
+def test_configured_secret_is_absent_from_auth_and_exception_reprs(auth: LaunchAuth):
+    assert SECRET not in repr(auth)
+
+    with pytest.raises(HTTPException) as http_error:
+        auth.require_http(request(headers=[("Authorization", "Bearer wrong")]))
+    assert SECRET not in repr(http_error.value)
+
+    with pytest.raises(WebSocketException) as websocket_error:
+        auth.require_websocket(
+            websocket(
+                headers=[
+                    ("Origin", TAURI_ORIGIN),
+                    ("Sec-WebSocket-Protocol", "harness-ui, wrong"),
+                ]
+            )
+        )
+    assert SECRET not in repr(websocket_error.value)

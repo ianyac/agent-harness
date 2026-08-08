@@ -30,9 +30,14 @@ class LaunchAuth:
 
     def matches(self, candidate: object) -> bool:
         """Compare a candidate without exposing ordinary equality timing."""
-        return isinstance(candidate, str) and hmac.compare_digest(
-            self._secret, candidate
-        )
+        if not isinstance(candidate, str):
+            return False
+        try:
+            return hmac.compare_digest(self._secret, candidate)
+        except TypeError:
+            # compare_digest's str form rejects non-ASCII text. Credentials are
+            # untrusted decoded input, so unsupported text is simply invalid.
+            return False
 
     def consume_bootstrap(self, token: object) -> bool:
         """Atomically consume the launch token once for browser bootstrap."""

@@ -281,3 +281,91 @@ remote action, or merge action was performed.
   path.
 - Root warning-strict resource-finalizer debt remains outside this remediation
   and is not represented as green here.
+
+## Fix round 1/5 — acquisition rollback resource safety
+
+Review source:
+`.superpowers/sdd/2026-08-08-local-service-implementation/second-remediation-review.md`
+
+Implementation commit: `29b7834` —
+`ui: make coordination rollback resource-atomic`
+
+### Review finding and root cause
+
+The replacement-resistant OFD authority itself passed review, but
+`_CoordinationLeaseClaim.acquire()` still performed hashed descriptor, root
+descriptor, and authority descriptor cleanup sequentially in one `finally`.
+An exception from the first `os.close()` replaced the primary acquisition
+failure and skipped both later closes. Because no claim had been returned, no
+caller could retry that cleanup. The three leaked descriptors included the
+live OFD authority, so the process denied the same key until exit.
+
+The fix moves acquisition failure handling into one `except BaseException as
+primary` boundary. It attempts every owned descriptor independently, retries a
+transient close once using the repository's two-attempt cleanup convention,
+records every encountered cleanup exception in a note and the primary's
+`cleanup_errors`, and re-raises the original object with bare `raise`. Normal
+success closes the temporary root descriptor before ownership transfers into
+the returned claim. Even persistent hashed/root cleanup failure cannot skip the
+authority close attempt.
+
+I5 was not changed in this round.
+
+### Exact TDD evidence
+
+The regression keeps real carrier/path acquisition and injects only the two
+reviewed OS failures: hashed-lock acquisition failure, followed by a one-shot
+close failure for that hashed descriptor. It then inspects real process FDs and
+performs a real same-key reacquisition.
+
+Command:
+
+```text
+cd ui
+uv run pytest -W error -q tests/test_app_rest.py::test_coordination_acquisition_failure_is_resource_atomic
+```
+
+RED on `bf498d1` plus the test change:
+
+```text
+F                                                                        [100%]
+E   AssertionError: (OSError('injected coordination descriptor close failure'), 'fd_growth=3', SessionResumeError('session is already in use'))
+E   assert OSError('injected coordination descriptor close failure') is OSError('injected hashed-lock acquisition failure')
+1 failed in 0.30s
+```
+
+This simultaneously reproduced all reviewed symptoms: cleanup replaced the
+primary, three descriptors leaked, and the same OFD key could not reacquire.
+
+GREEN after the resource-atomic rollback change:
+
+```text
+.                                                                        [100%]
+1 passed in 0.23s
+```
+
+The passing regression asserts the original hashed-lock exception object is
+preserved, the one-shot close interruption is surfaced as the sole
+`cleanup_errors` entry, descriptor growth is zero immediately after failure,
+same-key reacquisition succeeds immediately, and the FD count remains at its
+baseline after releasing the replacement claim.
+
+### Round verification
+
+| Check | Result |
+| --- | --- |
+| Warning-strict C1 ownership/replacement/hardening/acquisition/release/stage/resource selection | `17 passed in 0.53s` |
+| Full UI: `cd ui && uv run pytest -W error -q` | `390 passed in 7.78s` |
+| Root ordinary discovery: `uv run pytest -q` | `545 passed in 12.13s` |
+| Explicit root scope: `uv run pytest tests -q` | `545 passed in 12.16s` |
+| UI compilation: `cd ui && uv run python -m py_compile server/*.py tests/*.py` | exit 0 |
+| Crash-release subprocess | `crash_release=PASS child=ACQUIRED_BEFORE_CRASH` |
+| Normal FD/process-claim probe across 50 full acquire/close cycles | `before=4`, `after=4`, `process_claims=0` |
+| Async task probe after manager create/close | `pending=0` |
+| `git diff --check` before the implementation commit | pass |
+
+Round scope is limited to `ui/server/sessions.py`,
+`ui/tests/test_app_rest.py`, and this appended report. The complete round diff
+was self-reviewed; no root source/test/config, metadata/I5, or `ui/frontend/`
+file changed. Root warning-strict baseline debt and the previously documented
+Darwin/fail-closed carrier constraints remain unchanged.

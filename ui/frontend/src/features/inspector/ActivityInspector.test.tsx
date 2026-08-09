@@ -1,5 +1,5 @@
 import axe from "axe-core";
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -77,6 +77,16 @@ function state(overrides: Partial<TranscriptState> = {}): TranscriptState {
 
 const noop = () => {};
 
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((accept, decline) => {
+    resolve = accept;
+    reject = decline;
+  });
+  return { promise, resolve, reject };
+}
+
 function renderInspector(overrides: Partial<React.ComponentProps<typeof ActivityInspector>> = {}) {
   return render(
     <ActivityInspector
@@ -84,6 +94,7 @@ function renderInspector(overrides: Partial<React.ComponentProps<typeof Activity
       narrow={false}
       width={420}
       pinned={false}
+      sessionId="session-a"
       contextMode="folding"
       state={state()}
       selectedActivityId={null}
@@ -129,6 +140,48 @@ describe("ActivityInspector", () => {
     expect(within(dialog).queryByText("No network access")).not.toBeInTheDocument();
   });
 
+  it("accepts only non-negative safe integer context counts", () => {
+    const definition = (label: string) => {
+      const term = screen.getByText(label);
+      return term.parentElement?.querySelector("dd");
+    };
+    const { rerender } = renderInspector({
+      state: state({
+        latestContext: {
+          mode: "compaction",
+          used_tokens: 0.5,
+          summarized_messages: Number.MAX_SAFE_INTEGER + 1,
+        },
+      }),
+    });
+    expect(definition("Used tokens")).toHaveTextContent("Unknown");
+    expect(definition("Summarized messages")).toHaveTextContent("Unknown");
+
+    rerender(
+      <ActivityInspector
+        open narrow={false} width={420} pinned={false} sessionId="session-a"
+        contextMode="folding"
+        state={state({ latestContext: { used_tokens: -1, summarized_messages: Number.POSITIVE_INFINITY } })}
+        selectedActivityId={null} onClose={noop} onPinnedChange={noop}
+        onSelectActivity={noop} onWidthChange={noop}
+      />,
+    );
+    expect(definition("Used tokens")).toHaveTextContent("Unknown");
+    expect(definition("Summarized messages")).toHaveTextContent("Unknown");
+
+    rerender(
+      <ActivityInspector
+        open narrow={false} width={420} pinned={false} sessionId="session-a"
+        contextMode="folding"
+        state={state({ latestContext: { used_tokens: 0, summarized_messages: 7 } })}
+        selectedActivityId={null} onClose={noop} onPinnedChange={noop}
+        onSelectActivity={noop} onWidthChange={noop}
+      />,
+    );
+    expect(definition("Used tokens")).toHaveTextContent("0");
+    expect(definition("Summarized messages")).toHaveTextContent("7");
+  });
+
   it("keeps chronological row order and computes parent depth without loops", () => {
     const cyclic = state();
     cyclic.activities.root = { ...cyclic.activities.root, parentActivityId: "child" };
@@ -150,13 +203,48 @@ describe("ActivityInspector", () => {
 
     rerender(
       <ActivityInspector
-        open narrow={false} width={420} pinned={false}
+        open narrow={false} width={420} pinned={false} sessionId="session-a"
         contextMode="folding" state={state()} selectedActivityId={null}
         onClose={noop} onPinnedChange={noop} onSelectActivity={noop} onWidthChange={noop}
       />,
     );
     expect(screen.getByRole("listitem", { name: /delegate/ })).toHaveAttribute("aria-level", "1");
     expect(screen.getByRole("listitem", { name: /write file/ })).toHaveAttribute("aria-level", "2");
+  });
+
+  it("keeps full multiline permission and plan-review evidence in native disclosures", async () => {
+    const user = userEvent.setup();
+    const longReason = "The workspace policy requires a reviewed change.\nThe second line must remain fully readable.";
+    const longPlan = "1. Inspect all affected files.\n2. Verify every relevant test and report the result.";
+    const longFeedback = "Add the missing rollback check.\nKeep the permission boundary explicit.";
+    const detailed = state();
+    detailed.timeline = detailed.timeline.map((item) => {
+      if (item.kind === "permission") {
+        return { ...item, request: { ...item.request, reason: longReason } };
+      }
+      if (item.kind === "plan_review") {
+        return {
+          ...item,
+          request: { ...item.request, plan: longPlan },
+          resolution: { approved: false, feedback: longFeedback },
+        };
+      }
+      return item;
+    });
+    renderInspector({ state: detailed });
+
+    const permission = screen.getByText("Permission details").closest("details");
+    const plan = screen.getByText("Plan review details").closest("details");
+    expect(permission).not.toBeNull();
+    expect(plan).not.toBeNull();
+    await user.click(within(permission as HTMLElement).getByText("Permission details"));
+    await user.click(within(plan as HTMLElement).getByText("Plan review details"));
+    expect(permission).toHaveAttribute("open");
+    expect(plan).toHaveAttribute("open");
+    expect(within(permission as HTMLElement).getByText("Reason").nextElementSibling).toHaveTextContent(longReason, { normalizeWhitespace: false });
+    expect(within(permission as HTMLElement).getByText("no")).toBeVisible();
+    expect(within(plan as HTMLElement).getByText("Plan").nextElementSibling).toHaveTextContent(longPlan, { normalizeWhitespace: false });
+    expect(within(plan as HTMLElement).getByText("Revision feedback").nextElementSibling).toHaveTextContent(longFeedback, { normalizeWhitespace: false });
   });
 
   it("shows selected exact activity detail including 0ms, full deterministic payloads, result, and error", async () => {
@@ -191,10 +279,106 @@ describe("ActivityInspector", () => {
     expect(screen.getByRole("region", { name: "Selected activity detail" })).toHaveTextContent("Error");
   });
 
+  it("re-arms identical immediate copy announcements", async () => {
+    const user = userEvent.setup();
+    const copyText = vi.fn().mockResolvedValue(undefined);
+    renderInspector({ selectedActivityId: "child", copyText });
+    const status = screen.getByRole("status", { name: "Inspector copy status" });
+    const copy = screen.getByRole("button", { name: "Copy result" });
+    await user.click(copy);
+    await waitFor(() => expect(status).toHaveTextContent("Copied"));
+    const firstAnnouncement = status.firstElementChild;
+    expect(firstAnnouncement).not.toBeNull();
+
+    await user.click(copy);
+    await waitFor(() => expect(status).toHaveTextContent("Copied"));
+    expect(status.firstElementChild).not.toBe(firstAnnouncement);
+    expect(copyText).toHaveBeenCalledTimes(2);
+  });
+
+  it("lets only the latest overlapping copy completion announce in one selected view", async () => {
+    const user = userEvent.setup();
+    const first = deferred();
+    const second = deferred();
+    const copyText = vi.fn()
+      .mockImplementationOnce(() => first.promise)
+      .mockImplementationOnce(() => second.promise);
+    renderInspector({ selectedActivityId: "root", copyText });
+    await user.click(screen.getByRole("button", { name: "Copy arguments" }));
+    await user.click(screen.getByRole("button", { name: "Copy result" }));
+
+    await act(async () => {
+      second.reject(new Error("latest denied"));
+      await second.promise.catch(() => {});
+    });
+    expect(screen.getByRole("status", { name: "Inspector copy status" })).toHaveTextContent(
+      "Copy failed. Try again.",
+    );
+    await act(async () => {
+      first.resolve();
+      await first.promise;
+    });
+    expect(screen.getByRole("status", { name: "Inspector copy status" })).toHaveTextContent(
+      "Copy failed. Try again.",
+    );
+  });
+
+  it("ignores a copy completion after the selected activity changes", async () => {
+    const user = userEvent.setup();
+    const pending = deferred();
+    const { rerender } = renderInspector({
+      sessionId: "session-a",
+      selectedActivityId: "root",
+      copyText: () => pending.promise,
+    });
+    await user.click(screen.getByRole("button", { name: "Copy result" }));
+    rerender(
+      <ActivityInspector
+        open narrow={false} width={420} pinned={false} sessionId="session-a"
+        contextMode="folding" state={state()} selectedActivityId="child"
+        onClose={noop} onPinnedChange={noop} onSelectActivity={noop} onWidthChange={noop}
+        copyText={() => pending.promise}
+      />,
+    );
+    await act(async () => {
+      pending.resolve();
+      await pending.promise;
+    });
+    expect(screen.getByRole("status", { name: "Inspector copy status" })).toBeEmptyDOMElement();
+  });
+
+  it("ignores a session A copy completion after switching the inspector to session B", async () => {
+    const user = userEvent.setup();
+    const pending = deferred();
+    const { rerender } = renderInspector({
+      sessionId: "session-a",
+      selectedActivityId: "root",
+      copyText: () => pending.promise,
+    });
+    await user.click(screen.getByRole("button", { name: "Copy result" }));
+    rerender(
+      <ActivityInspector
+        open narrow={false} width={420} pinned={false} sessionId="session-b"
+        contextMode="folding" state={state()} selectedActivityId="child"
+        onClose={noop} onPinnedChange={noop} onSelectActivity={noop} onWidthChange={noop}
+        copyText={() => pending.promise}
+      />,
+    );
+    await act(async () => {
+      pending.resolve();
+      await pending.promise;
+    });
+    expect(screen.getByRole("status", { name: "Inspector copy status" })).toBeEmptyDOMElement();
+  });
+
   it("exposes clamped pointer and keyboard resizing through an accessible separator", () => {
     const onWidthChange = vi.fn();
     renderInspector({ width: 400, onWidthChange });
     const separator = screen.getByRole("separator", { name: "Resize activity inspector" });
+    expect(Number.parseFloat(getComputedStyle(separator).width)).toBeGreaterThanOrEqual(32);
+    const visibleRule = separator.querySelector("[data-resize-rule]");
+    expect(visibleRule).not.toBeNull();
+    expect(getComputedStyle(visibleRule as Element).width).toBe("1px");
     expect(separator).toHaveAttribute("aria-valuemin", "320");
     expect(separator).toHaveAttribute("aria-valuemax", "640");
     expect(separator).toHaveAttribute("aria-valuenow", "400");
@@ -235,7 +419,7 @@ describe("ActivityInspector", () => {
 
     rerender(
       <ActivityInspector
-        open narrow width={420} pinned={false} contextMode="folding"
+        open narrow width={420} pinned={false} sessionId="session-a" contextMode="folding"
         state={state()} selectedActivityId={null} onClose={noop} onPinnedChange={noop}
         onSelectActivity={noop} onWidthChange={noop}
       />,
@@ -260,7 +444,7 @@ describe("ActivityInspector", () => {
     expect((await axe.run(document.body)).violations).toEqual([]);
     rerender(
       <ActivityInspector
-        open narrow={false} width={420} pinned={false} contextMode="folding"
+        open narrow={false} width={420} pinned={false} sessionId="session-a" contextMode="folding"
         state={state()} selectedActivityId="child" onClose={noop} onPinnedChange={noop}
         onSelectActivity={noop} onWidthChange={noop}
       />,
@@ -268,7 +452,7 @@ describe("ActivityInspector", () => {
     expect((await axe.run(document.body)).violations).toEqual([]);
     rerender(
       <ActivityInspector
-        open narrow width={420} pinned={false} contextMode="folding"
+        open narrow width={420} pinned={false} sessionId="session-a" contextMode="folding"
         state={state()} selectedActivityId={null} onClose={noop} onPinnedChange={noop}
         onSelectActivity={noop} onWidthChange={noop}
       />,

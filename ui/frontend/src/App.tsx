@@ -101,6 +101,10 @@ export function App({
     onToggleActivity();
     inspector.openOverview(activeElement());
   };
+  const toggleInspector = () => {
+    onToggleActivity();
+    inspector.toggle(activeElement());
+  };
 
   return (
     <div className="app-shell">
@@ -168,6 +172,7 @@ export function App({
           narrow={inspector.narrow}
           width={inspector.width}
           pinned={inspector.pinned}
+          sessionId={activeSession.session_id}
           contextMode={activeSession.context_mode}
           state={activeTranscript}
           selectedActivityId={inspector.selectedActivityId}
@@ -184,7 +189,7 @@ export function App({
         sessions={sessionsModel.sessions}
         onNewChat={sessionsModel.createSession}
         onOpenSettings={onOpenSettings}
-        onToggleActivity={openInspectorOverview}
+        onToggleActivity={toggleInspector}
         onSelectSession={sessionsModel.selectSession}
       />
     </div>

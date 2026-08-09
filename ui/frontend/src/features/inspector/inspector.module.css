@@ -28,23 +28,23 @@
   position: absolute;
   z-index: 1;
   inset-block: 0;
-  inset-inline-start: -5px;
-  width: 10px;
+  inset-inline-start: -16px;
+  width: 32px;
   cursor: col-resize;
   touch-action: none;
 }
 
-.resizeHandle::after {
+.resizeRule {
   position: absolute;
   inset-block: 0;
-  inset-inline-start: 4px;
+  inset-inline-start: 15px;
   width: 1px;
-  background: transparent;
-  content: "";
+  background: var(--color-border);
+  pointer-events: none;
 }
 
-.resizeHandle:hover::after,
-.resizeHandle:focus-visible::after {
+.resizeHandle:hover .resizeRule,
+.resizeHandle:focus-visible .resizeRule {
   background: var(--color-accent);
 }
 
@@ -317,6 +317,50 @@
   background: color-mix(in srgb, var(--color-accent) 12%, transparent);
 }
 
+.timelineDetails {
+  margin-block-start: 5px;
+  color: var(--color-ink-small);
+  font-size: 11px;
+}
+
+.timelineDetails summary {
+  min-height: 32px;
+  width: fit-content;
+  padding-block: 7px;
+  cursor: pointer;
+}
+
+.timelineDetails summary:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.timelineDetails dl {
+  display: grid;
+  gap: 8px;
+  margin: 2px 0 4px;
+  padding-inline-start: 12px;
+  border-inline-start: 1px solid var(--color-border);
+}
+
+.timelineDetails dl > div {
+  display: grid;
+  gap: 2px;
+}
+
+.timelineDetails dt {
+  font-weight: 650;
+}
+
+.timelineDetails dd {
+  margin: 0;
+  color: var(--color-ink);
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
 .detail {
   gap: 14px;
 }
@@ -387,7 +431,8 @@
   .iconButton,
   .copyButton,
   .timelineActivity,
-  .payloadDetails summary {
+  .payloadDetails summary,
+  .timelineDetails summary {
     min-height: 44px;
   }
 

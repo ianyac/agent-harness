@@ -12,7 +12,7 @@ function knownMode(value: JsonValue | undefined): string {
 }
 
 function exactCount(value: JsonValue | undefined): string {
-  return typeof value === "number" && Number.isFinite(value) && value >= 0
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
     ? String(value)
     : "Unknown";
 }

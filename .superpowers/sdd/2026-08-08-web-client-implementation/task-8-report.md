@@ -98,3 +98,58 @@ Passed without warnings. The real vendor split remains:
 
 `git diff --check` passed. No Playwright/browser, Tauri, deployment, Task 9,
 controller ledger, or deferred-Minor work was performed.
+
+## Fix round 1 — Important review findings
+
+Fixed only the five Important findings from the Task 8 review: the palette now
+performs one true inspector toggle while header/card actions retain open
+semantics; copy feedback is latest-operation authoritative within the stable
+session and selected view, re-arms repeated announcements, and ignores stale
+settlements; permission and plan-review rows keep compact summaries with native
+full-evidence disclosures; the desktop separator has a 32 px hit area around a
+1 px rule; and context counts accept only non-negative safe integers.
+
+### Fix-round RED
+
+```text
+cd ui/frontend && npm test -- --run src/features/inspector/ActivityInspector.test.tsx src/App.test.tsx
+```
+
+Before production edits: 2 files failed; 8 failed / 23 passed (31). The failures
+showed the palette leaving the inspector open, `0.5` displayed as an exact
+count, no permission-detail disclosure, repeated copy feedback without a new
+live-region node, older overlapping copy success overwriting the latest
+failure, selection/session stale settlements announcing `Copied`, and a 10 px
+computed separator width.
+
+### Fix-round GREEN and final gates
+
+The same focused command passed 2 files, 31/31 tests. One multiline assertion
+was then corrected to compare exact `textContent` without Testing Library's
+default whitespace normalization; no production behavior changed for that
+fixture correction.
+
+```text
+cd ui/frontend && npm test -- --run
+```
+
+Passed: 17 files, 227/227 tests.
+
+```text
+cd ui/frontend && npm run typecheck
+```
+
+Passed with no diagnostics.
+
+```text
+cd ui/frontend && npm run build
+```
+
+Passed without warnings:
+
+- main application JS: 364.41 kB (114.77 kB gzip)
+- markdown vendor JS: 165.72 kB (50.46 kB gzip)
+- CSS: 38.52 kB (7.12 kB gzip)
+
+`git diff --check` passed. The three Minor review findings remain deferred, and
+no controller-ledger, Task 9, Tauri, deployment, or browser work was performed.

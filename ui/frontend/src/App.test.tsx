@@ -161,6 +161,30 @@ describe("App", () => {
     expect(values.get("agent-harness:inspector-pinned:inspector-a")).toBe("false");
   });
 
+  it("uses the visible palette activity command as one real toggle", async () => {
+    const user = userEvent.setup();
+    const active = session({ session_id: "palette-toggle" });
+    render(
+      <App
+        client={clientWithSessions([active])}
+        sidebarStorage={storage}
+        draftStorage={storage}
+        transcriptBySession={{ [active.session_id]: emptyTranscript() }}
+      />,
+    );
+
+    await user.click(await screen.findByRole("button", { name: "Activity" }));
+    expect(screen.getByRole("dialog", { name: "Activity inspector" })).toBeVisible();
+    await user.keyboard("{Meta>}k{/Meta}");
+    await user.click(screen.getByRole("button", { name: /Toggle activity.*⌘⇧I/ }));
+    expect(screen.queryByRole("dialog", { name: "Activity inspector" })).not.toBeInTheDocument();
+
+    await user.keyboard("{Meta>}k{/Meta}");
+    await user.click(screen.getByRole("button", { name: /Toggle activity.*⌘⇧I/ }));
+    expect(screen.getAllByRole("dialog", { name: "Activity inspector" })).toHaveLength(1);
+    expect(screen.queryByRole("region", { name: "Selected activity detail" })).not.toBeInTheDocument();
+  });
+
   it("renders the focused product shell and reports a failed bootstrap", async () => {
     render(
       <App

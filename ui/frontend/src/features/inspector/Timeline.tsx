@@ -22,6 +22,11 @@ function sentenceCase(value: string): string {
   return `${readableValue[0]?.toLocaleUpperCase() ?? ""}${readableValue.slice(1)}`;
 }
 
+function compactEvidence(value: string): string {
+  const firstLine = value.split(/\r?\n/, 1)[0] ?? "";
+  return firstLine.length > 96 ? `${firstLine.slice(0, 95)}…` : firstLine;
+}
+
 function activityDepth(activity: ActivityItem, activities: TranscriptState["activities"]): number {
   let depth = 1;
   let parentId = activity.parentActivityId;
@@ -98,19 +103,41 @@ export function Timeline({ state, selectedActivityId, onSelectActivity }: Timeli
               return (
                 <li key={`permission-${item.request.requestId}`} className={styles.timelineItem}>
                   <ShieldAlert aria-hidden="true" size={16} />
-                  <span><strong>Permission · {readable(item.request.action)}</strong><small>{item.request.reason} · {decision}</small></span>
+                  <span>
+                    <strong>Permission · {readable(item.request.action)}</strong>
+                    <small>{compactEvidence(item.request.reason)} · {decision}</small>
+                    <details className={styles.timelineDetails}>
+                      <summary>Permission details</summary>
+                      <dl>
+                        <div><dt>Reason</dt><dd>{item.request.reason}</dd></div>
+                        <div><dt>Scope</dt><dd>{item.request.scope}</dd></div>
+                        <div><dt>Decision</dt><dd>{decision}</dd></div>
+                      </dl>
+                    </details>
+                  </span>
                 </li>
               );
             }
             if (item.kind === "plan_review") {
               const decision = item.resolution === null ? "Pending" : item.resolution.approved ? "Approved" : "Revision requested";
-              const detail = [item.request.plan, item.resolution?.feedback || null]
+              const detail = [compactEvidence(item.request.plan), item.resolution?.feedback ? compactEvidence(item.resolution.feedback) : null]
                 .filter((value) => value !== null)
                 .join(" · ");
               return (
                 <li key={`plan-${item.request.requestId}`} className={styles.timelineItem}>
                   <ListChecks aria-hidden="true" size={16} />
-                  <span><strong>Plan review · {decision}</strong><small>{detail}</small></span>
+                  <span>
+                    <strong>Plan review · {decision}</strong>
+                    <small>{detail}</small>
+                    <details className={styles.timelineDetails}>
+                      <summary>Plan review details</summary>
+                      <dl>
+                        <div><dt>Plan</dt><dd>{item.request.plan}</dd></div>
+                        <div><dt>Decision</dt><dd>{decision}</dd></div>
+                        <div><dt>Revision feedback</dt><dd>{item.resolution?.feedback || "None"}</dd></div>
+                      </dl>
+                    </details>
+                  </span>
                 </li>
               );
             }

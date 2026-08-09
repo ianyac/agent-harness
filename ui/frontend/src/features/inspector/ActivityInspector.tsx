@@ -1,6 +1,6 @@
 import * as Dialog from "@radix-ui/react-dialog";
 import { Copy, PanelRightClose, Pin, PinOff } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { CSSProperties, KeyboardEvent, PointerEvent as ReactPointerEvent } from "react";
 
 import type { ActivityItem, JsonValue, TranscriptState } from "../../protocol/types";
@@ -39,24 +39,15 @@ function statusLabel(status: ActivityItem["status"]): string {
 type PayloadProps = {
   readonly label: string;
   readonly value: JsonValue;
-  readonly copyText: CopyText;
-  readonly onCopyStatus: (status: "copied" | "error") => void;
+  readonly onCopy: (value: string) => void;
 };
 
-function Payload({ label, value, copyText, onCopyStatus }: PayloadProps) {
+function Payload({ label, value, onCopy }: PayloadProps) {
   const serialized = serializeInspectorValue(value);
-  const copy = async () => {
-    try {
-      await copyText(serialized);
-      onCopyStatus("copied");
-    } catch {
-      onCopyStatus("error");
-    }
-  };
   return (
     <details open className={styles.payloadDetails}>
       <summary>{label}</summary>
-      <button type="button" className={styles.copyButton} aria-label={`Copy ${label.toLocaleLowerCase()}`} onClick={() => void copy()}>
+      <button type="button" className={styles.copyButton} aria-label={`Copy ${label.toLocaleLowerCase()}`} onClick={() => onCopy(serialized)}>
         <Copy aria-hidden="true" size={14} /> Copy
       </button>
       <pre>{serialized}</pre>
@@ -66,12 +57,10 @@ function Payload({ label, value, copyText, onCopyStatus }: PayloadProps) {
 
 function SelectedActivity({
   activity,
-  copyText,
-  onCopyStatus,
+  onCopy,
 }: {
   readonly activity: ActivityItem;
-  readonly copyText: CopyText;
-  readonly onCopyStatus: (status: "copied" | "error") => void;
+  readonly onCopy: (value: string) => void;
 }) {
   return (
     <section className={styles.detail} aria-label="Selected activity detail">
@@ -83,9 +72,9 @@ function SelectedActivity({
         <div><dt>Duration</dt><dd>{duration(activity)}</dd></div>
         <div><dt>Error</dt><dd>{activity.isError === undefined ? "Unknown" : activity.isError ? "Yes" : "No"}</dd></div>
       </dl>
-      <Payload label="Arguments" value={activity.args} copyText={copyText} onCopyStatus={onCopyStatus} />
+      <Payload label="Arguments" value={activity.args} onCopy={onCopy} />
       {activity.result === undefined ? null : (
-        <Payload label="Result" value={activity.result} copyText={copyText} onCopyStatus={onCopyStatus} />
+        <Payload label="Result" value={activity.result} onCopy={onCopy} />
       )}
     </section>
   );
@@ -96,6 +85,7 @@ export type ActivityInspectorProps = {
   readonly narrow: boolean;
   readonly width: number;
   readonly pinned: boolean;
+  readonly sessionId: string;
   readonly contextMode: string;
   readonly state: TranscriptState;
   readonly selectedActivityId: string | null;
@@ -111,6 +101,7 @@ export function ActivityInspector({
   narrow,
   width,
   pinned,
+  sessionId,
   contextMode,
   state,
   selectedActivityId,
@@ -122,11 +113,49 @@ export function ActivityInspector({
 }: ActivityInspectorProps) {
   const closeRef = useRef<HTMLButtonElement>(null);
   const stopPointerResize = useRef<(() => void) | null>(null);
-  const [copyStatus, setCopyStatus] = useState<"idle" | "copied" | "error">("idle");
+  const nextCopyOperation = useRef(0);
+  const currentCopyOperation = useRef<{
+    readonly id: number;
+    readonly sessionId: string;
+    readonly selectedActivityId: string | null;
+  } | null>(null);
+  const currentView = useRef({ sessionId, selectedActivityId });
+  const [copyFeedback, setCopyFeedback] = useState<{
+    readonly id: number;
+    readonly status: "copied" | "error";
+  } | null>(null);
   const selected = selectedActivityId === null ? undefined : state.activities[selectedActivityId];
   const clampedWidth = clampInspectorWidth(width);
+  currentView.current = { sessionId, selectedActivityId };
 
   useEffect(() => () => stopPointerResize.current?.(), []);
+  useLayoutEffect(() => {
+    currentCopyOperation.current = null;
+    setCopyFeedback(null);
+  }, [sessionId, selectedActivityId]);
+
+  const copyValue = async (value: string) => {
+    const operation = {
+      id: ++nextCopyOperation.current,
+      sessionId,
+      selectedActivityId,
+    };
+    currentCopyOperation.current = operation;
+    setCopyFeedback(null);
+    let status: "copied" | "error" = "copied";
+    try {
+      await copyText(value);
+    } catch {
+      status = "error";
+    }
+    const view = currentView.current;
+    if (
+      currentCopyOperation.current !== operation
+      || view.sessionId !== operation.sessionId
+      || view.selectedActivityId !== operation.selectedActivityId
+    ) return;
+    setCopyFeedback({ id: operation.id, status });
+  };
 
   const onResizeKey = (event: KeyboardEvent<HTMLDivElement>) => {
     const next = event.key === "ArrowLeft" ? clampedWidth + 16
@@ -187,7 +216,9 @@ export function ActivityInspector({
               tabIndex={0}
               onKeyDown={onResizeKey}
               onPointerDown={startPointerResize}
-            />
+            >
+              <span aria-hidden="true" className={styles.resizeRule} data-resize-rule />
+            </div>
           ) : null}
           <header className={styles.header}>
             <div>
@@ -220,12 +251,16 @@ export function ActivityInspector({
                 <ContextSummary contextMode={contextMode} latestContext={state.latestContext} />
               </div>
             ) : (
-              <SelectedActivity activity={selected} copyText={copyText} onCopyStatus={setCopyStatus} />
+              <SelectedActivity activity={selected} onCopy={(value) => void copyValue(value)} />
             )}
             <Timeline state={state} selectedActivityId={selectedActivityId} onSelectActivity={onSelectActivity} />
           </div>
           <span className={styles.srOnly} role="status" aria-label="Inspector copy status" aria-live="polite" aria-atomic="true">
-            {copyStatus === "copied" ? "Copied" : copyStatus === "error" ? "Copy failed. Try again." : ""}
+            {copyFeedback === null ? null : (
+              <span key={copyFeedback.id}>
+                {copyFeedback.status === "copied" ? "Copied" : "Copy failed. Try again."}
+              </span>
+            )}
           </span>
         </Dialog.Content>
       </Dialog.Portal>

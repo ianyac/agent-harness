@@ -1274,9 +1274,19 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
     struct FakeEventSink {
         events: StdMutex<Vec<ServiceStateEvent>>,
+        updates: watch::Sender<u64>,
+    }
+
+    impl Default for FakeEventSink {
+        fn default() -> Self {
+            let (updates, _) = watch::channel(0);
+            Self {
+                events: StdMutex::new(Vec::new()),
+                updates,
+            }
+        }
     }
 
     impl FakeEventSink {
@@ -1288,6 +1298,9 @@ mod tests {
     impl LifecycleEventSink for FakeEventSink {
         fn emit(&self, event: ServiceStateEvent) {
             self.events.lock().expect("fake event lock").push(event);
+            self.updates.send_modify(|revision| {
+                *revision = revision.saturating_add(1);
+            });
         }
     }
 
@@ -1318,33 +1331,53 @@ mod tests {
         )
     }
 
-    async fn wait_for_status(lifecycle: &ServiceLifecycle, expected: LifecycleStatus) {
-        for _ in 0..1_000 {
-            if lifecycle.status().await == expected {
-                return;
+    async fn wait_for_status(
+        events: &FakeEventSink,
+        lifecycle: &ServiceLifecycle,
+        expected: LifecycleStatus,
+    ) {
+        let mut updates = events.updates.subscribe();
+        let reached = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if lifecycle.status().await == expected {
+                    return true;
+                }
+                if updates.changed().await.is_err() {
+                    return false;
+                }
             }
-            tokio::task::yield_now().await;
+        })
+        .await;
+        if !matches!(reached, Ok(true)) {
+            let observed = lifecycle.status().await;
+            panic!("timed out waiting for lifecycle status {expected:?}; observed {observed:?}");
         }
-        assert!(lifecycle.status().await == expected);
     }
 
-    async fn wait_for_token(lifecycle: &ServiceLifecycle, expected: &str) {
-        for _ in 0..1_000 {
-            if lifecycle
-                .connection()
-                .await
-                .is_some_and(|connection| connection.token() == expected)
-            {
-                return;
+    async fn wait_for_token(events: &FakeEventSink, lifecycle: &ServiceLifecycle, expected: &str) {
+        let mut updates = events.updates.subscribe();
+        let reached = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if lifecycle
+                    .connection()
+                    .await
+                    .is_some_and(|connection| connection.token() == expected)
+                {
+                    return true;
+                }
+                if updates.changed().await.is_err() {
+                    return false;
+                }
             }
-            tokio::task::yield_now().await;
+        })
+        .await;
+        if !matches!(reached, Ok(true)) {
+            let observed_status = lifecycle.status().await;
+            let connection_present = lifecycle.connection().await.is_some();
+            panic!(
+                "timed out waiting for replacement connection; observed status {observed_status:?}, connection present: {connection_present}"
+            );
         }
-        assert!(
-            lifecycle
-                .connection()
-                .await
-                .is_some_and(|connection| connection.token() == expected)
-        );
     }
 
     #[test]
@@ -1746,11 +1779,12 @@ mod tests {
             let spawner = Arc::new(FakeSpawner::default());
             let process = spawner.queue_with_kill_failure();
             process.send(ready(49_152));
+            let events = Arc::new(FakeEventSink::default());
             let lifecycle = lifecycle(
                 spawner,
                 ["Q".repeat(43)],
                 Arc::new(FakeTimer::cleanup_immediate()),
-                Arc::new(FakeEventSink::default()),
+                Arc::clone(&events),
             );
             lifecycle
                 .start(canonical_workspace())
@@ -1771,7 +1805,7 @@ mod tests {
             ));
 
             process.send(ProcessEvent::Terminated);
-            wait_for_status(&lifecycle, LifecycleStatus::Stopped).await;
+            wait_for_status(&events, &lifecycle, LifecycleStatus::Stopped).await;
             assert!(!lifecycle.has_active_process().await);
         });
     }
@@ -1782,11 +1816,12 @@ mod tests {
             let spawner = Arc::new(FakeSpawner::default());
             let process = spawner.queue(false);
             process.send(ready(49_152));
+            let events = Arc::new(FakeEventSink::default());
             let lifecycle = lifecycle(
                 spawner,
                 ["R".repeat(43)],
                 Arc::new(FakeTimer::cleanup_immediate()),
-                Arc::new(FakeEventSink::default()),
+                Arc::clone(&events),
             );
             lifecycle
                 .start(canonical_workspace())
@@ -1803,7 +1838,7 @@ mod tests {
             assert!(process.kills() == 1);
 
             process.send(ProcessEvent::Terminated);
-            wait_for_status(&lifecycle, LifecycleStatus::Stopped).await;
+            wait_for_status(&events, &lifecycle, LifecycleStatus::Stopped).await;
         });
     }
 
@@ -1860,7 +1895,7 @@ mod tests {
                 .expect("first generation must start");
 
             first.send(ProcessEvent::Terminated);
-            wait_for_token(&lifecycle, &second_token).await;
+            wait_for_token(&events, &lifecycle, &second_token).await;
 
             let connection = lifecycle
                 .connection()
@@ -1908,11 +1943,12 @@ mod tests {
             let second = spawner.queue(false);
             first.send(ready(49_152));
             second.send(ready(49_153));
+            let events = Arc::new(FakeEventSink::default());
             let lifecycle = lifecycle(
                 Arc::clone(&spawner),
                 ["H".repeat(43), "I".repeat(43)],
                 Arc::new(FakeTimer::pending()),
-                Arc::new(FakeEventSink::default()),
+                Arc::clone(&events),
             );
             let expected_log = canonical_workspace().join("sidecar-diagnostic.log");
             lifecycle
@@ -1920,10 +1956,10 @@ mod tests {
                 .await
                 .expect("first generation must start");
             first.send(ProcessEvent::Terminated);
-            wait_for_token(&lifecycle, &"I".repeat(43)).await;
+            wait_for_token(&events, &lifecycle, &"I".repeat(43)).await;
 
             second.send(ProcessEvent::Terminated);
-            wait_for_status(&lifecycle, LifecycleStatus::Failed).await;
+            wait_for_status(&events, &lifecycle, LifecycleStatus::Failed).await;
 
             assert!(lifecycle.connection().await.is_none());
             assert!(lifecycle.restart_count().await == 1);
@@ -1943,11 +1979,12 @@ mod tests {
             let spawner = Arc::new(FakeSpawner::default());
             let first = spawner.queue(false);
             first.send(ready(49_152));
+            let events = Arc::new(FakeEventSink::default());
             let lifecycle = lifecycle(
                 spawner,
                 ["T".repeat(43), "U".repeat(43)],
                 Arc::new(FakeTimer::pending()),
-                Arc::new(FakeEventSink::default()),
+                Arc::clone(&events),
             );
             lifecycle
                 .start(canonical_workspace())
@@ -1955,7 +1992,7 @@ mod tests {
                 .expect("first generation must start");
 
             first.send(ProcessEvent::Terminated);
-            wait_for_status(&lifecycle, LifecycleStatus::Failed).await;
+            wait_for_status(&events, &lifecycle, LifecycleStatus::Failed).await;
 
             assert!(lifecycle.restart_count().await == 1);
             assert!(lifecycle.connection().await.is_none());
@@ -1973,11 +2010,12 @@ mod tests {
             let spawner = Arc::new(FakeSpawner::default());
             let first = spawner.queue(false);
             first.send(ready(49_152));
+            let events = Arc::new(FakeEventSink::default());
             let lifecycle = lifecycle(
                 spawner,
                 ["V".repeat(43), "W".repeat(43)],
                 Arc::new(FakeTimer::pending()),
-                Arc::new(FakeEventSink::default()),
+                Arc::clone(&events),
             );
             first.observe_drop_lock(&lifecycle);
             lifecycle
@@ -1995,7 +2033,7 @@ mod tests {
             .expect("retired child must be dropped");
 
             assert!(first.dropped_outside_state_lock());
-            wait_for_status(&lifecycle, LifecycleStatus::Failed).await;
+            wait_for_status(&events, &lifecycle, LifecycleStatus::Failed).await;
         });
     }
 
@@ -2008,18 +2046,19 @@ mod tests {
             let second = spawner.queue(true);
             first.send(ready(49_152));
             second.send(ready(49_153));
+            let events = Arc::new(FakeEventSink::default());
             let lifecycle = lifecycle(
                 spawner,
                 ["J".repeat(43), replacement_token.clone()],
                 Arc::new(FakeTimer::pending()),
-                Arc::new(FakeEventSink::default()),
+                Arc::clone(&events),
             );
             lifecycle
                 .start(canonical_workspace())
                 .await
                 .expect("first generation must start");
             first.send(ProcessEvent::Terminated);
-            wait_for_token(&lifecycle, &replacement_token).await;
+            wait_for_token(&events, &lifecycle, &replacement_token).await;
 
             lifecycle.handle_process_end(1).await;
 

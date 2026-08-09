@@ -161,6 +161,23 @@ describe("Composer", () => {
     expect(screen.getByRole("textbox", { name: "Message" })).toHaveFocus();
   });
 
+  it("offers a distinct clear control that discards the queued follow-up without editing it", async () => {
+    const user = userEvent.setup();
+    const onEvent = vi.fn();
+    renderComposer({
+      running: true,
+      queued: { type: "queue_message", text: "discard this request", mode: "plan" },
+      onEvent,
+    });
+
+    expect(screen.getByRole("button", { name: "Edit queued follow-up" })).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Clear queued follow-up" }));
+
+    expect(onEvent).toHaveBeenCalledWith({ type: "clear_queued_message" });
+    await waitFor(() => expect(screen.getByRole("textbox", { name: "Message" })).toHaveValue(""));
+    expect(screen.getByRole("button", { name: "Base mode" })).toHaveAttribute("aria-pressed", "true");
+  });
+
   it("preserves edits made while queue clear is pending and offers the cleared text non-destructively", async () => {
     const user = userEvent.setup();
     const clear = deferred();

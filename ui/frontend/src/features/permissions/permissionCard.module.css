@@ -10,6 +10,7 @@
   scroll-margin-block: 72px;
 }
 
+.card:focus,
 .card:focus-visible {
   outline: none;
   box-shadow: var(--focus-ring);

@@ -143,7 +143,7 @@ export function useInspector({ sessionId, storage: providedStorage }: UseInspect
     }
     setPinnedState(false);
     setOpen(false);
-    restoreOrigin();
+    queueMicrotask(restoreOrigin);
   }, [restoreOrigin, sessionId, storage]);
 
   const openOverview = useCallback((nextOrigin?: HTMLElement | null) => {

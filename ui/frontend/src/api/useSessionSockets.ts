@@ -34,8 +34,27 @@ export function useSessionSockets(
   const [lifecycles, setLifecycles] = useState<Readonly<Record<string, SessionSocketLifecycle>>>({});
   const sessionKey = sessionIds.join("\u0000");
 
+  useEffect(() => () => {
+    for (const socket of sockets.current.values()) socket.dispose();
+    sockets.current.clear();
+  }, [connection, createWebSocket]);
+
   useEffect(() => {
     const wanted = new Set(sessionIds);
+    setTranscripts((current) => {
+      const removed = Object.keys(current).filter((sessionId) => !wanted.has(sessionId));
+      if (removed.length === 0) return current;
+      const next = { ...current };
+      for (const sessionId of removed) delete next[sessionId];
+      return next;
+    });
+    setLifecycles((current) => {
+      const removed = Object.keys(current).filter((sessionId) => !wanted.has(sessionId));
+      if (removed.length === 0) return current;
+      const next = { ...current };
+      for (const sessionId of removed) delete next[sessionId];
+      return next;
+    });
     for (const [sessionId, socket] of sockets.current) {
       if (connection !== null && wanted.has(sessionId)) continue;
       socket.dispose();
@@ -74,10 +93,6 @@ export function useSessionSockets(
       setLifecycles((current) => ({ ...current, [sessionId]: "connecting" }));
       socket.connect();
     }
-    return () => {
-      for (const socket of sockets.current.values()) socket.dispose();
-      sockets.current.clear();
-    };
     // sessionKey is a stable value projection of the ordered session identities.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connection, createWebSocket, sessionKey]);

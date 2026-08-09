@@ -213,7 +213,129 @@ The first visual run intentionally failed for missing approved snapshots. Each g
 ## Residual concerns
 
 - The current service contract has no workspace-relocation REST operation, and the browser platform chooser cannot return a native filesystem path. The web client therefore preserves the `missing_workspace` category and offers an honest, production-capable **Archive session** recovery; it does not present a fake **Locate** action. A true browser relocation flow remains blocked on a service API (or an explicitly supported browser path-selection contract).
-- The Playwright config uses the normal bundled browser when its expected revision is installed. On this offline macOS ARM environment only, it detects the newest locally cached Playwright Chromium headless shell. Other platforms still need their normal Playwright browser installation.
+- Superseded in fix round 1: the initial config selected the newest local macOS ARM headless shell when the package revision was unavailable. The final config instead pins and validates the exact reviewed offline artifact described below.
 - Node emits the existing non-fatal `localStorage is not available because --localstorage-file was not provided` warning in two unit-test workers; all 311 tests pass and no browser storage behavior is affected.
 
 Self-review found no edits outside `ui/` and this report, no root `harness/` or `main.py` changes, no real credentials, no fixture capability in production code, no disabled axe rule, and no test-only production branch. Accessible roles/names used by the browser tests are user-facing interface semantics rather than private CSS selectors. `git diff --check`, frontend type/build/unit/browser verification, and all service tests pass.
+
+## Fix round 1 — independent review
+
+### Root-cause analysis and RED/GREEN evidence
+
+#### 1. Session-list reconciliation destroyed retained socket authority
+
+Root cause: the ID-reconciliation effect returned the component/connection cleanup. React therefore disposed and cleared the entire socket map before every `sessionKey` rerun. Retained sessions were recreated from `emptyTranscript()`, and removed-session keys could no longer be found in the cleared map for state pruning.
+
+The focused hook test starts a real `SessionSocket` through a controlled WebSocket boundary, streams text, adds and reorders a second session, removes it, and finally unmounts. Before the fix:
+
+```text
+npm test -- --run src/api/useSessionSockets.test.tsx
+1 failed
+expected [ FakeWebSocket{…}, FakeWebSocket{…} ] to deeply equal [ FakeWebSocket{…} ]
+```
+
+This proved the retained session had been recreated and its original socket closed. Cleanup is now owned by a connection/unmount-only effect; ID reconciliation separately adds missing sockets, disposes removed sockets, and prunes transcript/lifecycle records directly by wanted ID. Focused GREEN:
+
+```text
+npm test -- --run src/api/useSessionSockets.test.tsx src/api/sessionSocket.test.ts src/App.test.tsx
+Test Files 3 passed (3)
+Tests      70 passed (70)
+```
+
+The test additionally proves a pure reorder creates no socket and that unmount still disposes the retained socket exactly once.
+
+#### 2. Browser selection was nondeterministic
+
+Root cause: the config enumerated every cached headless-shell directory, sorted the directory names lexicographically, and chose the first executable. The package-pinned Playwright revision was neither preferred nor validated, while the accepted baselines were actually generated with cached revision 1223.
+
+The offline suite now explicitly pins one reviewed artifact instead of scanning: Playwright headless-shell revision `1223`, validated at config load against `Google Chrome for Testing 148.0.7778.96`. The browser test independently asserts `browser.version() === "148.0.7778.96"`. Missing or mismatched artifacts fail configuration with an explicit error. The eight existing baselines were retained unchanged and the full visual suite passed; no snapshots were regenerated.
+
+#### 3. WebSocket fixture did not enforce authentication
+
+Root cause: the routed WebSocket callback counted readiness and sent a snapshot without inspecting handshake protocols. A first exploratory check from `about:blank` surfaced a Chromium pre-open `1006`, which did not exercise the loopback route. The final test first establishes the loopback page origin, then opens missing and incorrect protocol pairs. An explicit mutation removing the gate reproduced the original defect:
+
+```text
+npx playwright test e2e/daily-turn.spec.ts --grep "rejects missing and incorrect"
+1 failed
+Expected: not "opened"
+Received: "opened"
+```
+
+The fixture now accepts readiness only when `WebSocketRoute.protocols()` equals exactly `["harness-ui", apiCapability]`; rejected attempts never increment the authenticated connection count. Restored focused GREEN: `1 passed (4.5s)`. The same test then opens the production client and proves the exact valid pair reaches readiness.
+
+#### 4. Keyboard traversal and visible decision focus were under-proven
+
+Root cause for the product defect: permission and plan cards were focused programmatically after a pointer-originated send, but their ring was limited to `:focus-visible`. Chromium correctly focused the cards without matching that pseudo-class, so the user had no visible focus evidence. The browser RED for both cards was:
+
+```text
+Expected: true
+Received: false
+```
+
+The cards now render the same approved focus ring for their programmatic `:focus` state. Permission coverage moves focus outside the card and proves `A` has no decision effect, returns by keyboard to a visibly focused card-owned control, then proves `A` sends the exact request ID and `yes`. Plan approval, revision entry, feedback submission, and authoritative revision resolution are all keyboard-driven; focus remains on the card until resolution and restores to the composer afterward. Focused GREEN: `2 passed (5.0s)`.
+
+The primary tab test now proves visible focus and order across sidebar → header → transcript activity → composer → inspector, activates transcript/inspector controls by keyboard, returns focus after Escape, and verifies `A`/`D`/`S` remain ordinary composer input. Focused GREEN: `2 passed (4.9s)`.
+
+#### 5. Responsive and motion assertions omitted required invariants
+
+New direct assertions verify the 820 px readable transcript measure, visible sidebar connection status in full and rail layouts, every visible desktop interactive target at least 32×32 px, narrow New chat/Send/inspector-close targets at least 44 px, and inspector focus return at every viewport. The narrow modal sheet exposed a real timing defect:
+
+```text
+responsive shell remains functional at 720px
+Expected: focused
+Received: inactive
+```
+
+Root cause: `useInspector.close()` restored the origin synchronously while Radix's modal focus scope was still mounted, allowing the scope to reclaim focus. Restoration now runs in the next microtask, after the close state commits. Focused GREEN: the 720 px browser case passed and all four `useInspector` unit tests remained green.
+
+Reduced-motion coverage now checks every rendered element's transition duration, animation duration, animation name (including pulses), and computed `scroll-behavior`, not transitions alone. The combined responsive/motion slice passed `5 passed`; the complete visual file passed `11 passed`, including all unchanged approved baselines.
+
+#### 6. Queue clear and completion announcement behavior were not independently observed
+
+Root cause: the only queued affordance was labelled Edit and used clear as an implementation step, so there was no user-facing discard action. Focused product RED:
+
+```text
+npm test -- --run src/features/conversation/Composer.test.tsx -t "distinct clear control"
+1 failed
+Unable to find an accessible element with the role "button" and name "Clear queued follow-up"
+```
+
+The queued affordance now exposes separate Edit (clear then restore text/mode) and Clear (discard without restoring) controls. Retry authority retains which intent was requested. Composer GREEN: `34 passed (34)`. The browser journey invokes Clear and proves an empty draft, then separately invokes Edit and proves the queued text is restored.
+
+The successful-turn browser case installs a MutationObserver on the real conversation live region before the terminal envelope. It observes exactly `["Response complete"]`, sends a subsequent authoritative safety update, waits through two animation frames, and proves the sequence remains exactly one announcement. Cancellation still proves no completion announcement. Daily-turn GREEN: `6 passed (5.5s)`.
+
+### Fix-round full regression
+
+Fresh final commands against the complete fix tree:
+
+```text
+cd ui/frontend
+npm test -- --run
+Test Files  26 passed (26)
+Tests       313 passed (313)
+
+npm run typecheck
+exit 0
+
+npm run build
+1954 modules transformed
+exit 0
+
+npm run e2e
+27 passed (12.1s)
+
+cd ui
+uv run pytest -q
+398 passed in 9.75s
+```
+
+The browser matrix remains Playwright `1.62.1`, project `bundled-chromium`, pinned offline revision `1223`, `Google Chrome for Testing 148.0.7778.96`. It covers `1440x900`, `1100x900`, `900x900`, and `720x900`; unsuppressed axe slices; reduced motion/increased contrast; and all eight accepted Darwin PNG baselines without modification.
+
+### Fix-round scope and self-review
+
+- Product changes are limited to socket reconciliation, distinct queue intent, decision-card focus visibility, and post-modal focus restoration.
+- Harness changes are limited to exact WebSocket protocol rejection, deterministic browser validation, and the requested behavioral assertions.
+- No root `harness/` or `main.py` file changed; no external network, real credential, production auth bypass, axe suppression, or private selector was added.
+- The explicit browser artifact makes runs reproducible on this approved offline macOS ARM lane; a missing revision fails loudly rather than selecting another cache entry.
+- The pre-existing Node `localStorage` warning remains deferred exactly as requested and is not changed in this fix round.
+- `git diff --check` and final scope/status checks are required immediately before the fix commit.

@@ -11,6 +11,26 @@ test("built app opens the active session WebSocket", async ({ page, authority })
   await openSession(page, authority);
 });
 
+test("browser project runs the pinned offline Chromium build", async ({ browser }) => {
+  expect(browser.version()).toBe("148.0.7778.96");
+});
+
+test("offline authority rejects missing and incorrect WebSocket capability protocols", async ({ page, authority }) => {
+  const url = `ws://127.0.0.1:4173/ws/sessions/${sessionId}`;
+  await page.goto("http://127.0.0.1:4173/");
+  for (const protocols of [[], ["harness-ui", "wrong-capability"]]) {
+    const outcome = await page.evaluate(({ socketUrl, requestedProtocols }) => new Promise<string>((resolve) => {
+      const socket = new WebSocket(socketUrl, requestedProtocols);
+      socket.addEventListener("open", () => resolve("opened"), { once: true });
+      socket.addEventListener("close", (event) => resolve(`closed:${event.code}`), { once: true });
+    }), { socketUrl: url, requestedProtocols: protocols });
+    expect(outcome).not.toBe("opened");
+    expect(authority.socketConnections()).toBe(0);
+  }
+
+  await openSession(page, authority);
+});
+
 test("sends, streams, groups activity, completes, and opens inspector detail", async ({ page, authority }) => {
   await openSession(page, authority);
   await page.getByRole("textbox", { name: "Message" }).fill("Inspect the workspace");
@@ -40,6 +60,17 @@ test("sends, streams, groups activity, completes, and opens inspector detail", a
   await page.getByRole("button", { name: "Close activity inspector" }).click();
   await expect(activity).toBeFocused();
 
+  await page.evaluate(() => {
+    const liveRegion = document.querySelector('[aria-label="Conversation update"]');
+    if (liveRegion === null) throw new Error("Missing conversation update fixture region");
+    const scope = globalThis as typeof globalThis & { __completionAnnouncements: string[] };
+    scope.__completionAnnouncements = [];
+    new MutationObserver(() => {
+      const value = liveRegion.textContent?.trim() ?? "";
+      if (value !== "") scope.__completionAnnouncements.push(value);
+    }).observe(liveRegion, { childList: true, characterData: true, subtree: true });
+  });
+
   authority.emit({
     type: "turn_completed", turn_id: "turn-1", final_text: "Workspace inspected.",
     messages: [
@@ -49,6 +80,16 @@ test("sends, streams, groups activity, completes, and opens inspector detail", a
   });
   await expect(page.getByText("Workspace inspected.", { exact: true })).toBeVisible();
   await expect(page.getByRole("status", { name: "Conversation update" })).toHaveText("Response complete");
+  await expect.poll(() => page.evaluate(() => (
+    globalThis as typeof globalThis & { __completionAnnouncements: string[] }
+  ).__completionAnnouncements)).toEqual(["Response complete"]);
+  authority.emit({ type: "safety_updated", turn_id: null, safety: { mode: "default" } });
+  await page.evaluate(() => new Promise<void>((resolve) => {
+    requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+  }));
+  expect(await page.evaluate(() => (
+    globalThis as typeof globalThis & { __completionAnnouncements: string[] }
+  ).__completionAnnouncements)).toEqual(["Response complete"]);
 });
 
 test("queues, edits, clears, and stops without a false completion announcement", async ({ page, authority }) => {
@@ -58,6 +99,13 @@ test("queues, edits, clears, and stops without a false completion announcement",
   await expect.poll(() => authority.outbound().length).toBe(1);
   const submissionId = authority.outbound()[0]?.submission_id;
   authority.emit({ type: "turn_started", turn_id: "turn-stop", mode: "base", submission_id: submissionId });
+
+  await page.getByRole("textbox", { name: "Message" }).fill("Clear without editing");
+  await page.getByRole("button", { name: "Queue message" }).click();
+  await expect(page.getByRole("status", { name: "Queued follow-up" })).toContainText("Clear without editing");
+  await page.getByRole("button", { name: "Clear queued follow-up" }).click();
+  expect(authority.outbound().at(-1)).toEqual({ type: "clear_queued_message" });
+  await expect(page.getByRole("textbox", { name: "Message" })).toHaveValue("");
 
   await page.getByRole("textbox", { name: "Message" }).fill("Follow up safely");
   await page.getByRole("button", { name: "Queue message" }).click();

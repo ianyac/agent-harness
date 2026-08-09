@@ -1,17 +1,30 @@
 import { defineConfig, devices } from "@playwright/test";
-import { existsSync, readdirSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-function locallyBundledChromium(): string | undefined {
-  const cache = join(homedir(), "Library", "Caches", "ms-playwright");
-  if (!existsSync(cache)) return undefined;
-  const candidates = readdirSync(cache)
-    .filter((entry) => entry.startsWith("chromium_headless_shell-"))
-    .sort()
-    .reverse()
-    .map((entry) => join(cache, entry, "chrome-headless-shell-mac-arm64", "chrome-headless-shell"));
-  return candidates.find(existsSync);
+const offlineChromiumRevision = "1223";
+const offlineChromiumVersion = "Google Chrome for Testing 148.0.7778.96";
+
+function pinnedOfflineChromium(): string {
+  const executable = join(
+    homedir(),
+    "Library",
+    "Caches",
+    "ms-playwright",
+    `chromium_headless_shell-${offlineChromiumRevision}`,
+    "chrome-headless-shell-mac-arm64",
+    "chrome-headless-shell",
+  );
+  if (!existsSync(executable)) {
+    throw new Error(`Required offline Chromium revision ${offlineChromiumRevision} is not installed at ${executable}`);
+  }
+  const actualVersion = execFileSync(executable, ["--version"], { encoding: "utf8" }).trim();
+  if (actualVersion !== offlineChromiumVersion) {
+    throw new Error(`Offline Chromium revision ${offlineChromiumRevision} reported unexpected version: ${actualVersion}`);
+  }
+  return executable;
 }
 
 export default defineConfig({
@@ -34,7 +47,7 @@ export default defineConfig({
       use: {
         ...devices["Desktop Chrome"],
         browserName: "chromium",
-        launchOptions: { executablePath: locallyBundledChromium() },
+        launchOptions: { executablePath: pinnedOfflineChromium() },
       },
     },
   ],

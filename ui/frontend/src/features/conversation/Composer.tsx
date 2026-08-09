@@ -1,4 +1,4 @@
-import { ArrowUp, Paperclip, RotateCcw, Square, X } from "lucide-react";
+import { ArrowUp, Paperclip, Pencil, RotateCcw, Square, X } from "lucide-react";
 import {
   useEffect,
   useId,
@@ -35,6 +35,7 @@ type EditAuthority = {
 type ClearOperation = EditAuthority & {
   readonly operationId: number;
   readonly queued: QueuedMessage;
+  readonly restoreToDraft: boolean;
 };
 
 type QueueReconciliation = {
@@ -284,7 +285,7 @@ export function Composer({
     });
   };
 
-  const clearQueue = async (retryOperation?: ClearOperation) => {
+  const clearQueue = async (restoreToDraft: boolean, retryOperation?: ClearOperation) => {
     if (
       retryOperation !== undefined &&
       (sessionId !== retryOperation.sessionId || !hasSameQueuedSlot(queued, retryOperation.queued))
@@ -304,6 +305,7 @@ export function Composer({
       ...origin,
       operationId: nextClearOperationId.current,
       queued: queuedMessage,
+      restoreToDraft: retryOperation?.restoreToDraft ?? restoreToDraft,
     };
     currentClearOperations.current.set(operation.sessionId, operation);
     setQueueReconciliation(operation.sessionId, null);
@@ -313,7 +315,9 @@ export function Composer({
       if (currentClearOperations.current.get(operation.sessionId) !== operation) return;
       currentClearOperations.current.delete(operation.sessionId);
       setClearPending(operation.sessionId, false);
-      if (hasSameEditAuthority(editAuthorityFor(operation.sessionId), operation)) {
+      if (!operation.restoreToDraft) {
+        if (activeSessionRef.current === operation.sessionId) textboxRef.current?.focus();
+      } else if (hasSameEditAuthority(editAuthorityFor(operation.sessionId), operation)) {
         markEdited(operation.sessionId);
         setSessionDraft(operation.sessionId, operation.queued.text);
         setSessionMode(operation.sessionId, operation.queued.mode);
@@ -400,7 +404,15 @@ export function Composer({
               type="button"
               aria-label="Edit queued follow-up"
               disabled={clearPending}
-              onClick={() => void clearQueue()}
+              onClick={() => void clearQueue(true)}
+            >
+              <Pencil aria-hidden="true" size={15} />
+            </button>
+            <button
+              type="button"
+              aria-label="Clear queued follow-up"
+              disabled={clearPending}
+              onClick={() => void clearQueue(false)}
             >
               <X aria-hidden="true" size={16} />
             </button>
@@ -583,7 +595,10 @@ export function Composer({
                 <button
                   type="button"
                   aria-label="Retry clearing follow-up"
-                  onClick={() => void clearQueue(queueReconciliation.operation)}
+                  onClick={() => void clearQueue(
+                    queueReconciliation.operation.restoreToDraft,
+                    queueReconciliation.operation,
+                  )}
                 >
                   <RotateCcw aria-hidden="true" size={15} />
                   Retry

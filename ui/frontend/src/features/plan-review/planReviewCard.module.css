@@ -10,6 +10,7 @@
   scroll-margin-block: 72px;
 }
 
+.card:focus,
 .card:focus-visible,
 .actions button:focus-visible,
 .revision textarea:focus-visible {

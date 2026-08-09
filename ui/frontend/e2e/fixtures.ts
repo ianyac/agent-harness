@@ -55,6 +55,11 @@ async function installOfflineAuthority(page: Page): Promise<FixtureAuthority> {
   });
 
   await page.routeWebSocket("**/ws/sessions/**", (socket: WebSocketRoute) => {
+    const protocols = socket.protocols();
+    if (protocols.length !== 2 || protocols[0] !== "harness-ui" || protocols[1] !== apiCapability) {
+      void socket.close({ code: 1008, reason: "Fixture capability required" });
+      return;
+    }
     socketConnections += 1;
     generation += 1;
     sequence = 1;

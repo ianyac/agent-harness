@@ -28,13 +28,26 @@ for (const width of [1440, 1100, 900, 720]) {
     expect(sidebar).not.toBeNull();
     if (width < 1000) expect(sidebar!.width).toBeLessThanOrEqual(60);
     else expect(sidebar!.width).toBeGreaterThanOrEqual(200);
-    await expect(page.getByRole("button", { name: "New chat" })).toBeVisible();
+    const connection = page.getByRole("status", { name: "Local service connected" });
+    await expect(connection).toBeVisible();
+    expect(await connection.boundingBox()).not.toBeNull();
+    const newChat = page.getByRole("button", { name: "New chat" });
+    await expect(newChat).toBeVisible();
     await expect(page.getByRole("button", { name: "Search sessions" })).toBeVisible();
     await expect(page.getByRole("button", { name: /^Fixture session, Workspace/ })).toBeVisible();
     await expect(page.getByRole("button", { name: "Settings" })).toBeVisible();
+    const transcriptMeasure = await page.getByRole("log", { name: "Conversation transcript" }).evaluate((log) => {
+      const transcript = log.firstElementChild;
+      return transcript === null ? null : transcript.getBoundingClientRect().width;
+    });
+    expect(transcriptMeasure).not.toBeNull();
+    expect(transcriptMeasure!).toBeLessThanOrEqual(820);
     const textbox = page.getByRole("textbox", { name: "Message" });
     await expect(textbox).toBeInViewport();
     await textbox.fill("Target size evidence");
+    const newChatBox = await newChat.boundingBox();
+    expect(newChatBox).not.toBeNull();
+    expect(newChatBox!.height).toBeGreaterThanOrEqual(width < 800 ? 44 : 32);
     const send = await page.getByRole("button", { name: "Send message" }).boundingBox();
     expect(send).not.toBeNull();
     expect(send!.height).toBeGreaterThanOrEqual(width === 720 ? 44 : 32);
@@ -55,6 +68,24 @@ for (const width of [1440, 1100, 900, 720]) {
     } else {
       expect(box!.x).toBeGreaterThan(width / 2);
     }
+    const inspectorClose = page.getByRole("button", { name: "Close activity inspector" });
+    const inspectorCloseBox = await inspectorClose.boundingBox();
+    expect(inspectorCloseBox).not.toBeNull();
+    expect(inspectorCloseBox!.height).toBeGreaterThanOrEqual(width < 800 ? 44 : 32);
+    if (width >= 800) {
+      const undersized = await page.locator("button, input, textarea, select, summary, [role='button'], [role='separator'][tabindex]").evaluateAll((elements) => elements.flatMap((element) => {
+        const style = getComputedStyle(element);
+        const box = element.getBoundingClientRect();
+        if (style.visibility === "hidden" || style.display === "none" || box.width === 0 || box.height === 0) return [];
+        return box.width < 32 || box.height < 32
+          ? [{ name: element.getAttribute("aria-label") ?? element.textContent?.trim() ?? element.tagName, width: box.width, height: box.height }]
+          : [];
+      }));
+      expect(undersized).toEqual([]);
+    }
+    await inspectorClose.click();
+    await expect(page.getByRole("dialog", { name: "Activity inspector" })).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Activity", exact: true })).toBeFocused();
   });
 }
 
@@ -106,14 +137,23 @@ test("first-run state has no axe violations", async ({ page, authority }) => {
   await assertAxe(page);
 });
 
-test("reduced motion removes interface transitions", async ({ page, authority }) => {
+test("reduced motion removes transitions, animations, pulses, and smooth scroll interpolation", async ({ page, authority }) => {
   await page.emulateMedia({ reducedMotion: "reduce" });
   await page.goto(authority.entryPath);
   await expect.poll(authority.socketConnections).toBe(1);
-  const durations = await page.evaluate(() => [...document.querySelectorAll("*")]
-    .map((element) => getComputedStyle(element).transitionDuration)
-    .filter((duration) => duration !== "0s" && duration !== "0.001ms"));
-  expect(durations).toEqual([]);
+  const motion = await page.evaluate(() => [...document.querySelectorAll("*")].map((element) => {
+    const style = getComputedStyle(element);
+    return {
+      transitionDuration: style.transitionDuration,
+      animationDuration: style.animationDuration,
+      animationName: style.animationName,
+      scrollBehavior: style.scrollBehavior,
+    };
+  }));
+  expect(motion.filter(({ transitionDuration }) => transitionDuration !== "0s" && transitionDuration !== "0.001ms")).toEqual([]);
+  expect(motion.filter(({ animationDuration }) => animationDuration !== "0s" && animationDuration !== "0.001ms")).toEqual([]);
+  expect(motion.filter(({ animationName }) => animationName !== "none")).toEqual([]);
+  expect(motion.filter(({ scrollBehavior }) => scrollBehavior !== "auto")).toEqual([]);
 });
 
 test("approved deterministic visual states", async ({ page, authority }) => {

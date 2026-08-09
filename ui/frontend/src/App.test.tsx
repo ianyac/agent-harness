@@ -227,17 +227,23 @@ describe("App", () => {
       title: "Decision B",
       workspace: "/work/decision-b",
     });
-    const permissionState = transcriptReducer(emptyTranscript(), event("permission_requested", {
-      sequence: 1,
-      request_id: "permission-a",
-      action: "write_file",
-      scope: '{"path":"A.md"}',
-    }));
-    const planState = transcriptReducer(emptyTranscript(), event("plan_approval_requested", {
-      sequence: 1,
-      request_id: "plan-b",
-      plan: "1. Verify B",
-    }));
+    const permissionState = transcriptReducer(
+      transcriptReducer(emptyTranscript(), event("turn_started", { sequence: 1 })),
+      event("permission_requested", {
+        sequence: 2,
+        request_id: "permission-a",
+        action: "write_file",
+        scope: '{"path":"A.md"}',
+      }),
+    );
+    const planState = transcriptReducer(
+      transcriptReducer(emptyTranscript(), event("turn_started", { sequence: 1 })),
+      event("plan_approval_requested", {
+        sequence: 2,
+        request_id: "plan-b",
+        plan: "1. Verify B",
+      }),
+    );
 
     render(
       <App

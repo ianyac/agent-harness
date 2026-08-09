@@ -133,6 +133,93 @@ describe("PermissionCard", () => {
     );
   });
 
+  it("keeps an immediately sent answer locked until authoritative resolution", async () => {
+    const onAnswer = vi.fn();
+    render(
+      <PermissionCard
+        request={request}
+        resolution={null}
+        active
+        safety={safety}
+        onAnswer={onAnswer}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /^Allow once/ }));
+    await act(async () => Promise.resolve());
+    const card = screen.getByRole("group", { name: "Permission decision" });
+    expect(screen.getByRole("status", { name: "Permission submission" })).toHaveTextContent(
+      "Decision sent. Waiting for confirmation.",
+    );
+    expect(screen.getByRole("button", { name: /^Allow once/ })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /^Deny/ })).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("button", { name: /^Deny/ }));
+    card.focus();
+    fireEvent.keyDown(card, { key: "s" });
+    expect(onAnswer).toHaveBeenCalledTimes(1);
+    expect(onAnswer).toHaveBeenCalledWith(expect.objectContaining({ answer: "yes" }));
+  });
+
+  it("lets authoritative resolution dominate a still-pending local dispatch", async () => {
+    const pending = deferred();
+    const { rerender } = render(
+      <PermissionCard
+        request={request}
+        resolution={null}
+        active
+        safety={safety}
+        onAnswer={() => pending.promise}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /^Allow once/ }));
+    expect(screen.getByRole("status", { name: "Permission submission" })).toHaveTextContent(
+      "Sending decision",
+    );
+
+    rerender(
+      <PermissionCard
+        request={request}
+        resolution={{ answer: "yes" }}
+        active={false}
+        safety={safety}
+        onAnswer={() => pending.promise}
+      />,
+    );
+    expect(screen.getByRole("status", { name: "Permission resolved" })).toHaveTextContent(
+      "Allowed once",
+    );
+    expect(screen.queryByRole("status", { name: "Permission submission" })).not.toBeInTheDocument();
+    expect(screen.queryByText(/Waiting for confirmation/)).not.toBeInTheDocument();
+
+    await act(async () => {
+      pending.resolve();
+      await pending.promise;
+    });
+    expect(screen.getByRole("status", { name: "Permission resolved" })).toHaveTextContent(
+      "Allowed once",
+    );
+  });
+
+  it("labels a retained terminal request without claiming an active wait", () => {
+    render(
+      <PermissionCard
+        request={request}
+        resolution={null}
+        active={false}
+        turnRunning={false}
+        safety={safety}
+        onAnswer={() => {}}
+      />,
+    );
+
+    expect(screen.getByRole("status", { name: "Permission unresolved" })).toHaveTextContent(
+      "Turn ended without a recorded decision.",
+    );
+    expect(screen.queryByText("Awaiting an authoritative decision")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^Allow once/ })).not.toBeInTheDocument();
+  });
+
   it.each([
     ["yes", "Allowed once"],
     ["no", "Denied"],

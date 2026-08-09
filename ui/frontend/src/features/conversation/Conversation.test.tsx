@@ -440,9 +440,9 @@ describe("Conversation", () => {
     const user = userEvent.setup();
     const onSessionEvent = vi.fn();
     const permissionState = transcriptReducer(
-      emptyTranscript(),
+      transcriptReducer(emptyTranscript(), event("turn_started", { sequence: 1 })),
       event("permission_requested", {
-        sequence: 1,
+        sequence: 2,
         request_id: "permission-route",
         action: "bash",
         scope: '{"command":"npm test"}',
@@ -462,11 +462,14 @@ describe("Conversation", () => {
       answer: "always",
     });
 
-    const planState = transcriptReducer(emptyTranscript(), event("plan_approval_requested", {
-      sequence: 1,
-      request_id: "plan-route",
-      plan: "1. Run checks",
-    }));
+    const planState = transcriptReducer(
+      transcriptReducer(emptyTranscript(), event("turn_started", { sequence: 1 })),
+      event("plan_approval_requested", {
+        sequence: 2,
+        request_id: "plan-route",
+        plan: "1. Run checks",
+      }),
+    );
     rerender(
       <Conversation state={planState} openInspector={() => {}} onSessionEvent={onSessionEvent} />,
     );
@@ -476,6 +479,70 @@ describe("Conversation", () => {
       request_id: "plan-route",
       approved: true,
     });
+  });
+
+  it("renders a terminal unresolved permission honestly until a late resolution arrives", () => {
+    let state = transcriptReducer(emptyTranscript(), event("turn_started", { sequence: 1 }));
+    state = transcriptReducer(state, event("permission_requested", {
+      sequence: 2,
+      request_id: "late-permission",
+      action: "bash",
+      scope: '{"command":"npm test"}',
+    }));
+    state = transcriptReducer(state, event("turn_cancelled", { sequence: 3 }));
+    const { rerender } = render(
+      <Conversation state={state} openInspector={() => {}} onSessionEvent={() => {}} />,
+    );
+
+    expect(screen.getByRole("status", { name: "Permission unresolved" })).toHaveTextContent(
+      "Turn ended without a recorded decision.",
+    );
+    expect(screen.queryByText("Awaiting an authoritative decision")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^Allow once/ })).not.toBeInTheDocument();
+
+    state = transcriptReducer(state, event("permission_resolved", {
+      sequence: 4,
+      request_id: "late-permission",
+      answer: "no",
+    }));
+    rerender(<Conversation state={state} openInspector={() => {}} onSessionEvent={() => {}} />);
+    expect(screen.getByRole("status", { name: "Permission resolved" })).toHaveTextContent("Denied");
+    expect(screen.queryByRole("status", { name: "Permission unresolved" })).not.toBeInTheDocument();
+  });
+
+  it("renders a terminal unresolved plan honestly until a late resolution arrives", () => {
+    let state = transcriptReducer(emptyTranscript(), event("turn_started", { sequence: 1 }));
+    state = transcriptReducer(state, event("plan_approval_requested", {
+      sequence: 2,
+      request_id: "late-plan",
+      plan: "1. Verify the change",
+    }));
+    state = transcriptReducer(state, event("turn_failed", {
+      sequence: 3,
+      error_category: "provider",
+      message: "Turn stopped",
+    }));
+    const { rerender } = render(
+      <Conversation state={state} openInspector={() => {}} onSessionEvent={() => {}} />,
+    );
+
+    expect(screen.getByRole("status", { name: "Plan review unresolved" })).toHaveTextContent(
+      "Turn ended without a recorded decision.",
+    );
+    expect(screen.queryByText("Awaiting an authoritative decision")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Approve plan" })).not.toBeInTheDocument();
+
+    state = transcriptReducer(state, event("plan_approval_resolved", {
+      sequence: 4,
+      request_id: "late-plan",
+      approved: false,
+      feedback: "Add verification",
+    }));
+    rerender(<Conversation state={state} openInspector={() => {}} onSessionEvent={() => {}} />);
+    expect(screen.getByRole("status", { name: "Plan review resolved" })).toHaveTextContent(
+      "Revision requested",
+    );
+    expect(screen.queryByRole("status", { name: "Plan review unresolved" })).not.toBeInTheDocument();
   });
 
   it("does not render or position visually empty structured authoritative messages", () => {

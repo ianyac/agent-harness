@@ -192,6 +192,7 @@ export function Conversation({
                   request={item.request}
                   resolution={item.resolution}
                   active={state.permission?.requestId === item.request.requestId}
+                  turnRunning={state.running}
                   safety={state.safety}
                   onAnswer={onSessionEvent}
                 />
@@ -204,6 +205,7 @@ export function Conversation({
                   request={item.request}
                   resolution={item.resolution}
                   active={state.planReview?.requestId === item.request.requestId}
+                  turnRunning={state.running}
                   onAnswer={onSessionEvent}
                 />
               );

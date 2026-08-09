@@ -130,6 +130,82 @@ describe("PlanReviewCard", () => {
     );
   });
 
+  it("keeps an immediately sent plan answer locked until authoritative resolution", async () => {
+    const onAnswer = vi.fn();
+    render(
+      <PlanReviewCard request={request} resolution={null} active onAnswer={onAnswer} />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Approve plan" }));
+    await act(async () => Promise.resolve());
+    expect(screen.getByRole("status", { name: "Plan submission" })).toHaveTextContent(
+      "Decision sent. Waiting for confirmation.",
+    );
+    expect(screen.getByRole("button", { name: "Approve plan" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Revise plan" })).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Revise plan" }));
+    fireEvent.click(screen.getByRole("button", { name: "Approve plan" }));
+    expect(onAnswer).toHaveBeenCalledTimes(1);
+    expect(onAnswer).toHaveBeenCalledWith(expect.objectContaining({ approved: true }));
+  });
+
+  it("lets authoritative plan resolution dominate a still-pending local dispatch", async () => {
+    const pending = deferred();
+    const { rerender } = render(
+      <PlanReviewCard
+        request={request}
+        resolution={null}
+        active
+        onAnswer={() => pending.promise}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Approve plan" }));
+    expect(screen.getByRole("status", { name: "Plan submission" })).toHaveTextContent(
+      "Sending decision",
+    );
+
+    rerender(
+      <PlanReviewCard
+        request={request}
+        resolution={{ approved: true, feedback: "" }}
+        active={false}
+        onAnswer={() => pending.promise}
+      />,
+    );
+    expect(screen.getByRole("status", { name: "Plan review resolved" })).toHaveTextContent(
+      "Plan approved",
+    );
+    expect(screen.queryByRole("status", { name: "Plan submission" })).not.toBeInTheDocument();
+    expect(screen.queryByText(/Waiting for confirmation/)).not.toBeInTheDocument();
+
+    await act(async () => {
+      pending.resolve();
+      await pending.promise;
+    });
+    expect(screen.getByRole("status", { name: "Plan review resolved" })).toHaveTextContent(
+      "Plan approved",
+    );
+  });
+
+  it("labels a retained terminal plan without claiming an active wait", () => {
+    render(
+      <PlanReviewCard
+        request={request}
+        resolution={null}
+        active={false}
+        turnRunning={false}
+        onAnswer={() => {}}
+      />,
+    );
+
+    expect(screen.getByRole("status", { name: "Plan review unresolved" })).toHaveTextContent(
+      "Turn ended without a recorded decision.",
+    );
+    expect(screen.queryByText("Awaiting an authoritative decision")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Approve plan" })).not.toBeInTheDocument();
+  });
+
   it.each([
     [{ approved: true, feedback: "" }, "Plan approved"],
     [{ approved: false, feedback: "Add verification" }, "Revision requested"],

@@ -584,7 +584,7 @@ describe("transcriptReducer", () => {
     ]);
   });
 
-  it("clears active blockers at a terminal event without removing anchored decisions", () => {
+  it("retains a terminal permission anchor and accepts its later matching resolution", () => {
     let state = transcriptReducer(emptyTranscript(), event("turn_started", { sequence: 1 }));
     state = transcriptReducer(state, event("permission_requested", {
       sequence: 2,
@@ -600,6 +600,61 @@ describe("transcriptReducer", () => {
         resolution: null,
       }),
       { kind: "boundary", boundary: "turn_completion" },
+    ]);
+
+    state = transcriptReducer(state, event("permission_resolved", {
+      sequence: 4,
+      request_id: "terminal-permission",
+      answer: "no",
+    }));
+    expect(state.permission).toBeNull();
+    expect(timelineOf(state)).toEqual([
+      expect.objectContaining({
+        kind: "permission",
+        request: expect.objectContaining({ requestId: "terminal-permission" }),
+        resolution: { answer: "no" },
+      }),
+      { kind: "boundary", boundary: "turn_completion" },
+    ]);
+  });
+
+  it("retains a terminal plan anchor and accepts its later matching resolution", () => {
+    let state = transcriptReducer(emptyTranscript(), event("turn_started", { sequence: 1 }));
+    state = transcriptReducer(state, event("plan_approval_requested", {
+      sequence: 2,
+      request_id: "terminal-plan",
+      plan: "1. Verify",
+    }));
+    state = transcriptReducer(state, event("turn_failed", {
+      sequence: 3,
+      error_category: "provider",
+      message: "Turn stopped",
+    }));
+
+    expect(state).toMatchObject({ running: false, planReview: null });
+    expect(timelineOf(state)).toEqual([
+      expect.objectContaining({
+        kind: "plan_review",
+        request: expect.objectContaining({ requestId: "terminal-plan" }),
+        resolution: null,
+      }),
+      { kind: "boundary", boundary: "error" },
+    ]);
+
+    state = transcriptReducer(state, event("plan_approval_resolved", {
+      sequence: 4,
+      request_id: "terminal-plan",
+      approved: false,
+      feedback: "Add a check",
+    }));
+    expect(state.planReview).toBeNull();
+    expect(timelineOf(state)).toEqual([
+      expect.objectContaining({
+        kind: "plan_review",
+        request: expect.objectContaining({ requestId: "terminal-plan" }),
+        resolution: { approved: false, feedback: "Add a check" },
+      }),
+      { kind: "boundary", boundary: "error" },
     ]);
   });
 

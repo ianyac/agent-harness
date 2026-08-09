@@ -15,8 +15,15 @@ type PermissionCardProps = {
   readonly request: PermissionRequest;
   readonly resolution: PermissionResolution | null;
   readonly active: boolean;
+  readonly turnRunning?: boolean;
   readonly safety: SafetySnapshot | null;
   readonly onAnswer: (event: PermissionAnswer) => void | Promise<void>;
+};
+
+type SubmissionState = "idle" | "sending" | "submitted";
+
+type SubmissionOperation = {
+  readonly requestId: string;
 };
 
 function formattedArguments(scope: string): string {
@@ -53,6 +60,7 @@ export function PermissionCard({
   request,
   resolution,
   active,
+  turnRunning = true,
   safety,
   onAnswer,
 }: PermissionCardProps) {
@@ -60,9 +68,12 @@ export function PermissionCard({
   const focusOrigin = useRef<HTMLElement | null>(null);
   const focusedRequest = useRef<string | null>(null);
   const pendingLock = useRef(false);
-  const [pending, setPending] = useState(false);
+  const operationRef = useRef<SubmissionOperation | null>(null);
+  const renderedRequest = useRef(request.requestId);
+  const [submission, setSubmission] = useState<SubmissionState>("idle");
   const [error, setError] = useState("");
-  const actionable = active && resolution === null;
+  const actionable = turnRunning && active && resolution === null;
+  const terminalUnresolved = !turnRunning && resolution === null;
 
   useLayoutEffect(() => {
     if (!actionable || focusedRequest.current === request.requestId) return;
@@ -74,10 +85,34 @@ export function PermissionCard({
     card.focus();
   }, [actionable, request.requestId]);
 
+  useLayoutEffect(() => {
+    if (renderedRequest.current !== request.requestId) {
+      renderedRequest.current = request.requestId;
+      operationRef.current = null;
+      pendingLock.current = false;
+      setSubmission("idle");
+      setError("");
+    }
+
+    if (resolution === null && active && turnRunning) return;
+    const submittedThisRequest = operationRef.current?.requestId === request.requestId;
+    operationRef.current = null;
+    pendingLock.current = false;
+    setSubmission("idle");
+    setError("");
+    if (resolution !== null && submittedThisRequest) {
+      const target = focusOrigin.current;
+      focusOrigin.current = null;
+      if (target?.isConnected) target.focus();
+    }
+  }, [active, request.requestId, resolution, turnRunning]);
+
   const submit = async (answer: PermissionDecision) => {
     if (!actionable || pendingLock.current) return;
+    const operation: SubmissionOperation = { requestId: request.requestId };
+    operationRef.current = operation;
     pendingLock.current = true;
-    setPending(true);
+    setSubmission("sending");
     setError("");
     try {
       await onAnswer({
@@ -85,14 +120,16 @@ export function PermissionCard({
         request_id: request.requestId,
         answer,
       });
-      pendingLock.current = false;
-      setPending(false);
+      if (operationRef.current !== operation) return;
+      setSubmission("submitted");
       const target = focusOrigin.current;
       focusOrigin.current = null;
       if (target?.isConnected) target.focus();
     } catch (reason) {
+      if (operationRef.current !== operation) return;
+      operationRef.current = null;
       pendingLock.current = false;
-      setPending(false);
+      setSubmission("idle");
       setError(errorCopy(reason));
       cardRef.current?.focus();
     }
@@ -122,7 +159,7 @@ export function PermissionCard({
       role="group"
       aria-label={actionable ? "Permission decision" : "Permission review"}
       tabIndex={actionable ? -1 : undefined}
-      data-state={resolution === null ? actionable ? "active" : "waiting" : resolution.answer}
+      data-state={resolution === null ? actionable ? "active" : terminalUnresolved ? "terminal" : "waiting" : resolution.answer}
       onKeyDown={onKeyDown}
     >
       <div className={styles.headingRow}>
@@ -166,7 +203,7 @@ export function PermissionCard({
           <button
             type="button"
             className={styles.primary}
-            disabled={pending}
+            disabled={submission !== "idle"}
             aria-keyshortcuts="A"
             onClick={() => void submit("yes")}
           >
@@ -174,7 +211,7 @@ export function PermissionCard({
           </button>
           <button
             type="button"
-            disabled={pending}
+            disabled={submission !== "idle"}
             aria-keyshortcuts="D"
             onClick={() => void submit("no")}
           >
@@ -182,18 +219,26 @@ export function PermissionCard({
           </button>
           <button
             type="button"
-            disabled={pending}
+            disabled={submission !== "idle"}
             aria-keyshortcuts="S"
             onClick={() => void submit("always")}
           >
             Always for this session <kbd>S</kbd>
           </button>
         </div>
+      ) : terminalUnresolved ? (
+        <p className={styles.waiting} role="status" aria-label="Permission unresolved">
+          Turn ended without a recorded decision.
+        </p>
       ) : (
         <p className={styles.waiting}>Awaiting an authoritative decision</p>
       )}
 
-      {pending ? <p className={styles.pending} role="status">Sending decision…</p> : null}
+      {resolution === null && actionable && submission !== "idle" ? (
+        <p className={styles.pending} role="status" aria-label="Permission submission">
+          {submission === "sending" ? "Sending decision…" : "Decision sent. Waiting for confirmation."}
+        </p>
+      ) : null}
       {error !== "" ? <p className={styles.error} role="alert">{error}</p> : null}
       {actionable ? (
         <span className={styles.srOnly} role="status" aria-label="Permission request" aria-live="assertive">

@@ -105,7 +105,8 @@ function messageText(message: HarnessMessage): string | null {
     if (part === null || Array.isArray(part) || typeof part !== "object") return [];
     return typeof part.text === "string" ? [part.text] : [];
   });
-  return parts.length === 0 ? null : parts.join("\n");
+  const text = parts.join("\n");
+  return text.trim() === "" ? null : text;
 }
 
 function reconcileAssistantTimeline(

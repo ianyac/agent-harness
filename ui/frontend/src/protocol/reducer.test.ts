@@ -307,6 +307,40 @@ describe("transcriptReducer", () => {
     ]);
   });
 
+  it("skips visually empty structured messages before positional reconciliation", () => {
+    let state = transcriptReducer(emptyTranscript(), event("turn_started", { sequence: 1 }));
+    state = transcriptReducer(state, event("assistant_delta", { sequence: 2, text: "Draft before" }));
+    state = transcriptReducer(
+      state,
+      event("activity_started", { sequence: 3, activity_id: "read-current" }),
+    );
+    state = transcriptReducer(state, event("assistant_delta", { sequence: 4, text: "Draft after" }));
+    state = transcriptReducer(
+      state,
+      event("turn_completed", {
+        sequence: 5,
+        final_text: "Authoritative after",
+        messages: [
+          { role: "user", content: "Current" },
+          { role: "assistant", content: [{ type: "text", text: "" }] },
+          { role: "assistant", content: [{ type: "text", text: "Authoritative before" }] },
+          {
+            role: "assistant",
+            content: [{ type: "text", text: "" }, { type: "text", text: "" }],
+          },
+          { role: "assistant", content: [{ type: "text", text: "Authoritative after" }] },
+        ],
+      }),
+    );
+
+    expect(timelineOf(state)).toEqual([
+      { kind: "assistant", text: "Authoritative before", messageIndex: 2 },
+      { kind: "activity", activityId: "read-current" },
+      { kind: "assistant", text: "Authoritative after", messageIndex: 4 },
+      { kind: "boundary", boundary: "turn_completion" },
+    ]);
+  });
+
   it("rejects stale generations, duplicates, and out-of-order sequences", () => {
     let state = transcriptReducer(
       emptyTranscript(),

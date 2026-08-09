@@ -25,7 +25,7 @@ export function visibleMessage(message: HarnessMessage): VisibleMessage | null {
   const role = message.role;
   if (role !== "user" && role !== "assistant") return null;
   const content = textFromContent(message.content);
-  if (content === null || (role === "assistant" && content === "")) return null;
+  if (content === null || (role === "assistant" && content.trim() === "")) return null;
   return { role, content };
 }
 

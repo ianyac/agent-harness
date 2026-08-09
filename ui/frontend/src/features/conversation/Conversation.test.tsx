@@ -396,6 +396,45 @@ describe("Conversation", () => {
     expect(screen.queryByText("Draft after")).not.toBeInTheDocument();
   });
 
+  it("does not render or position visually empty structured authoritative messages", () => {
+    let state = transcriptReducer(emptyTranscript(), event("turn_started", { sequence: 1 }));
+    state = transcriptReducer(state, event("assistant_delta", { sequence: 2, text: "Draft before" }));
+    state = transcriptReducer(
+      state,
+      event("activity_started", { sequence: 3, activity_id: "read-current", name: "read_file" }),
+    );
+    state = transcriptReducer(state, event("assistant_delta", { sequence: 4, text: "Draft after" }));
+    state = transcriptReducer(
+      state,
+      event("turn_completed", {
+        sequence: 5,
+        final_text: "Authoritative after",
+        messages: [
+          { role: "user", content: "Current" },
+          { role: "assistant", content: [{ type: "text", text: "" }] },
+          { role: "assistant", content: [{ type: "text", text: "Authoritative before" }] },
+          {
+            role: "assistant",
+            content: [{ type: "text", text: "" }, { type: "text", text: "" }],
+          },
+          { role: "assistant", content: [{ type: "text", text: "Authoritative after" }] },
+        ],
+      }),
+    );
+    render(<Conversation state={state} openInspector={() => {}} />);
+
+    const before = screen.getByText("Authoritative before").closest("article");
+    const work = screen.getByRole("button", { name: /Open activity/ });
+    const after = screen.getByText("Authoritative after").closest("article");
+    expect(screen.getAllByRole("article", { name: "Assistant message" })).toHaveLength(2);
+    expect(screen.getAllByText("Authoritative before")).toHaveLength(1);
+    expect(screen.getAllByText("Authoritative after")).toHaveLength(1);
+    expect(screen.queryByText("Draft before")).not.toBeInTheDocument();
+    expect(screen.queryByText("Draft after")).not.toBeInTheDocument();
+    expect((before?.compareDocumentPosition(work) ?? 0) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+    expect(work.compareDocumentPosition(after as Node) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+  });
+
   it("auto-scrolls only from near the bottom and otherwise offers New messages", async () => {
     const user = userEvent.setup();
     const initial = transcript({ messages: messages({ role: "assistant", content: "First" }) });

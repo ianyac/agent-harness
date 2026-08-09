@@ -133,6 +133,26 @@ describe("Onboarding", () => {
     }, expect.anything());
   });
 
+  it("never presents the application bootstrap directory as a native user workspace", async () => {
+    const user = userEvent.setup();
+    const onCreate = vi.fn(async () => success());
+    render(
+      <Onboarding
+        serviceStatus="ready"
+        platform={adapter({ kind: "tauri" })}
+        defaultWorkspace="/Users/test/Library/Application Support/Harness/service-bootstrap"
+        defaultMode="default"
+        defaultContextMode="compaction"
+        onCreate={onCreate}
+      />,
+    );
+
+    expect(screen.queryByText(/service-bootstrap/)).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Start local session" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Choose a workspace");
+    expect(onCreate).not.toHaveBeenCalled();
+  });
+
   it("sends one base and one context mode, retains credential request, and suppresses rapid retry duplicates", async () => {
     const user = userEvent.setup();
     const retry = deferred<CreateSessionResult>();

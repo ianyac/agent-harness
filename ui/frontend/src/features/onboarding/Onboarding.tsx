@@ -48,7 +48,8 @@ export function Onboarding({
   onInvalidateCreate = ignoreInvalidation,
   authorityKey,
 }: OnboardingProps) {
-  const [workspace, setWorkspace] = useState(defaultWorkspace);
+  const visibleDefaultWorkspace = platform.kind === "tauri" ? "" : defaultWorkspace;
+  const [workspace, setWorkspace] = useState(visibleDefaultWorkspace);
   const [mode, setMode] = useState<BaseMode>(defaultMode);
   const [contextMode, setContextMode] = useState<ContextMode>(defaultContextMode);
   const [error, setError] = useState<string | null>(null);
@@ -66,10 +67,10 @@ export function Onboarding({
     setComplete(false);
     setCredentialRequest(null);
     setError(null);
-    setWorkspace(defaultWorkspace);
+    setWorkspace(visibleDefaultWorkspace);
     setMode(defaultMode);
     setContextMode(defaultContextMode);
-  }, [authorityKey, defaultContextMode, defaultMode, defaultWorkspace, onInvalidateCreate, platform]);
+  }, [authorityKey, defaultContextMode, defaultMode, onInvalidateCreate, platform, visibleDefaultWorkspace]);
 
   const invalidate = () => {
     const invalidated = authorityRef.current;

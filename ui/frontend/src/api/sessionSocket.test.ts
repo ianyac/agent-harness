@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ClientEvent, ServerEvent, SessionSnapshot } from "../protocol/types";
 import { createTauriPlatform } from "../platform/tauri";
+import type { NativeListen } from "../platform/tauri";
 import type { BrowserEnvironment } from "../platform/browser";
 import type { PlatformAdapter, ServiceConnection } from "../platform/types";
 import { ApiClient } from "./http";
@@ -18,6 +19,11 @@ const staticToken = "s".repeat(43);
 const connection: ServiceConnection = {
   baseUrl: "http://127.0.0.1:49152",
   token: apiToken,
+};
+
+const listenToServiceState: NativeListen = async (event) => {
+  if (event !== "service-state") throw new Error("unexpected native event");
+  return () => {};
 };
 
 function snapshot(overrides: Partial<SessionSnapshot> = {}): SessionSnapshot {
@@ -436,7 +442,7 @@ describe("Tauri platform", () => {
       if (command === "service_connection") return connection as T;
       throw new Error(`unexpected command: ${command}`);
     };
-    const platform = createTauriPlatform(invoke);
+    const platform = createTauriPlatform(invoke, listenToServiceState);
 
     await expect(platform.getServiceConnection()).resolves.toEqual(connection);
     await expect(platform.getServiceConnection()).resolves.toEqual(connection);
@@ -450,7 +456,7 @@ describe("Tauri platform", () => {
       if (command === "choose_workspace") return "/canonical/workspace" as T;
       return undefined as T;
     };
-    const platform = createTauriPlatform(invoke);
+    const platform = createTauriPlatform(invoke, listenToServiceState);
 
     await expect(platform.chooseWorkspace()).resolves.toBe("/canonical/workspace");
     await platform.notify({ title: "Turn complete", body: "The answer is ready." });
@@ -470,7 +476,7 @@ describe("Tauri platform", () => {
       commands.push({ command, args });
       return undefined as T;
     };
-    const platform = createTauriPlatform(invoke);
+    const platform = createTauriPlatform(invoke, listenToServiceState);
     type GenericRevealRemoved = "revealPath" extends keyof PlatformAdapter ? false : true;
     const genericRevealRemoved: GenericRevealRemoved = true;
 

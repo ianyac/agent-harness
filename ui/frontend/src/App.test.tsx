@@ -2,7 +2,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { App } from "./App";
+import { App, createNewChat, resolveNewChatWorkspace } from "./App";
 import { ApiClient } from "./api/http";
 import type { PlatformAdapter } from "./platform/types";
 import type { SessionRecord } from "./features/sessions/useSessions";
@@ -113,6 +113,96 @@ afterEach(() => {
 });
 
 describe("App", () => {
+  it("keeps the native bootstrap workspace out of future New chat selection", async () => {
+    const chooseWorkspace = vi.fn()
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce("/work/picked");
+    const native = platformAdapter({ kind: "tauri", chooseWorkspace });
+    const older = session({
+      session_id: "older",
+      workspace: "/work/older",
+      last_opened_at: "2026-08-08T04:00:00.000000+00:00",
+    });
+    const newer = session({
+      session_id: "newer",
+      workspace: "/work/newer",
+      last_opened_at: "2026-08-10T04:00:00.000000+00:00",
+    });
+
+    await expect(resolveNewChatWorkspace(native, "/app/bootstrap", older, [older, newer]))
+      .resolves.toBe("/work/older");
+    await expect(resolveNewChatWorkspace(native, "/app/bootstrap", null, [older, newer]))
+      .resolves.toBe("/work/newer");
+    await expect(resolveNewChatWorkspace(native, "/app/bootstrap", null, []))
+      .resolves.toBeNull();
+    await expect(resolveNewChatWorkspace(native, "/app/bootstrap", null, []))
+      .resolves.toBe("/work/picked");
+    expect(chooseWorkspace).toHaveBeenCalledTimes(2);
+
+    const browser = platformAdapter({ chooseWorkspace });
+    await expect(resolveNewChatWorkspace(browser, "/work/browser-base", older, [older, newer]))
+      .resolves.toBe("/work/browser-base");
+    expect(chooseWorkspace).toHaveBeenCalledTimes(2);
+  });
+
+  it("flows a successful no-session native picker result into New chat creation", async () => {
+    const chooseWorkspace = vi.fn().mockResolvedValue("/work/picked");
+    const createSession = vi.fn(async () => ({ ok: true as const, session: session() }));
+
+    await createNewChat(
+      platformAdapter({ kind: "tauri", chooseWorkspace }),
+      "/app/bootstrap",
+      null,
+      [],
+      { mode: "readOnly", contextMode: "folding" },
+      createSession,
+    );
+
+    expect(chooseWorkspace).toHaveBeenCalledWith();
+    expect(createSession).toHaveBeenCalledWith({
+      workspace: "/work/picked",
+      mode: "readOnly",
+      contextMode: "folding",
+      title: "New chat",
+    });
+  });
+
+  it("uses the active native session workspace for later New chat instead of app bootstrap", async () => {
+    const user = userEvent.setup();
+    const createBodies: unknown[] = [];
+    const active = session({ workspace: "/work/native-active" });
+    const fetchRequest: typeof fetch = async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : input.toString());
+      if (url.pathname === "/api/config") return Response.json({
+        base_workspace: "/app/bootstrap",
+        default_mode: "default",
+        default_context_mode: "compaction",
+        modes: ["default", "acceptAll", "readOnly"],
+        context_modes: ["compaction", "folding"],
+      });
+      if (url.pathname === "/api/sessions" && init?.method === "GET") return Response.json([active]);
+      if (url.pathname === "/api/sessions" && init?.method === "POST") {
+        createBodies.push(JSON.parse(String(init.body)));
+        return Response.json(session({ session_id: "native-future", workspace: "/work/native-active" }), { status: 201 });
+      }
+      return new Response(null, { status: 404 });
+    };
+    render(
+      <App
+        client={clientWith(fetchRequest)}
+        platformAdapter={platformAdapter({ kind: "tauri" })}
+        sidebarStorage={storage}
+        draftStorage={storage}
+        transcriptBySession={{ [active.session_id]: emptyTranscript() }}
+      />,
+    );
+
+    await user.click(await screen.findByRole("button", { name: "New chat" }));
+    await waitFor(() => expect(createBodies).toHaveLength(1));
+    expect(createBodies[0]).toMatchObject({ workspace: "/work/native-active" });
+    expect(JSON.stringify(createBodies[0])).not.toContain("/app/bootstrap");
+  });
+
   it("projects a direct prompt immediately, keeps it across session switches, and reconciles completion once", async () => {
     const user = userEvent.setup();
     const sessionA = session({ session_id: "optimistic-a", title: "Optimistic A" });

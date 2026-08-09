@@ -18,7 +18,13 @@ import { ConversationHeader } from "./features/sessions/ConversationHeader";
 import { SessionSidebar } from "./features/sessions/SessionSidebar";
 import { SessionOperationRecovery } from "./features/sessions/SessionOperationRecovery";
 import type { ConnectionStatus } from "./features/sessions/SessionSidebar";
-import type { ServiceHealth, SessionRuntimeState } from "./features/sessions/useSessions";
+import type {
+  CreateSessionOptions,
+  CreateSessionResult,
+  ServiceHealth,
+  SessionRecord,
+  SessionRuntimeState,
+} from "./features/sessions/useSessions";
 import { useSessions } from "./features/sessions/useSessions";
 import { NotificationObserver } from "./features/settings/NotificationObserver";
 import { Settings } from "./features/settings/Settings";
@@ -57,6 +63,46 @@ type BootstrapLifecycle = {
   readonly attempt: number;
   readonly retrying: boolean;
 };
+
+function sessionRecency(session: SessionRecord): number {
+  const timestamp = Date.parse(session.last_opened_at ?? session.updated_at);
+  return Number.isFinite(timestamp) ? timestamp : 0;
+}
+
+export async function resolveNewChatWorkspace(
+  platform: PlatformAdapter | null | undefined,
+  configuredBaseWorkspace: string,
+  activeSession: SessionRecord | null,
+  sessions: readonly SessionRecord[],
+): Promise<string | null> {
+  if (platform?.kind !== "tauri") return configuredBaseWorkspace;
+  if (activeSession !== null) return activeSession.workspace;
+  const mostRecent = sessions.reduce<SessionRecord | null>(
+    (current, candidate) => current === null || sessionRecency(candidate) > sessionRecency(current)
+      ? candidate
+      : current,
+    null,
+  );
+  return mostRecent?.workspace ?? platform.chooseWorkspace();
+}
+
+export async function createNewChat(
+  platform: PlatformAdapter | null | undefined,
+  configuredBaseWorkspace: string,
+  activeSession: SessionRecord | null,
+  sessions: readonly SessionRecord[],
+  defaults: Pick<CreateSessionOptions, "mode" | "contextMode">,
+  createSession: (options: CreateSessionOptions) => Promise<CreateSessionResult>,
+): Promise<void> {
+  const workspace = await resolveNewChatWorkspace(
+    platform,
+    configuredBaseWorkspace,
+    activeSession,
+    sessions,
+  );
+  if (workspace === null) return;
+  await createSession({ ...defaults, workspace, title: "New chat" });
+}
 
 function terminalKey(sessionId: string, terminal: TranscriptTerminal): string {
   return `${sessionId}:${terminal.generation}:${terminal.sequence}:${terminal.turnId}`;
@@ -546,12 +592,17 @@ export function App({
   const createFutureSession = async () => {
     const config = sessionsModel.config;
     if (config === null) return;
-    await sessionsModel.createSession({
-      workspace: config.base_workspace,
-      mode: preferenceModel.preferences.defaultMode,
-      contextMode: preferenceModel.preferences.contextMode,
-      title: "New chat",
-    });
+    await createNewChat(
+      selectedPlatform,
+      config.base_workspace,
+      activeSession,
+      sessionsModel.sessions,
+      {
+        mode: preferenceModel.preferences.defaultMode,
+        contextMode: preferenceModel.preferences.contextMode,
+      },
+      sessionsModel.createSession,
+    );
   };
   const selectedPlatform = connection.platform ?? platformAdapter;
   const sessionReadiness = sessionsModel.refreshError !== null

@@ -8,6 +8,7 @@ import { RecoveryView } from "./components/RecoveryView";
 import { Composer } from "./features/conversation/Composer";
 import type { DraftStorage } from "./features/conversation/useDraft";
 import { Conversation } from "./features/conversation/Conversation";
+import type { OptimisticUserMessage } from "./features/conversation/Conversation";
 import { Onboarding } from "./features/onboarding/Onboarding";
 import { ActivityInspector } from "./features/inspector/ActivityInspector";
 import { useInspector } from "./features/inspector/useInspector";
@@ -34,6 +35,7 @@ type SubmissionCandidate = {
   readonly client: ApiClient;
   readonly dispatcher: AppProps["onSessionEvent"];
   readonly generation: number;
+  readonly messageCountAtDispatch: number;
   readonly event: SendMessage;
 };
 
@@ -64,6 +66,25 @@ function newSubmissionId(): string {
   return globalThis.crypto.randomUUID();
 }
 
+function userMessageText(message: TranscriptState["messages"][number]): string | null {
+  if (message.role !== "user") return null;
+  if (typeof message.content === "string") return message.content;
+  if (!Array.isArray(message.content)) return null;
+  const parts = message.content.flatMap((part) => {
+    if (typeof part === "string") return [part];
+    if (part === null || Array.isArray(part) || typeof part !== "object") return [];
+    return typeof part.text === "string" ? [part.text] : [];
+  });
+  return parts.length === 0 ? null : parts.join("\n");
+}
+
+function hasAuthoritativePrompt(candidate: SubmissionCandidate, transcript: TranscriptState): boolean {
+  if (transcript.messages.length <= candidate.messageCountAtDispatch) return false;
+  return transcript.messages
+    .slice(candidate.messageCountAtDispatch)
+    .some((message) => userMessageText(message) === candidate.event.text);
+}
+
 type AppProps = {
   readonly client?: ApiClient;
   readonly runtimeBySession?: Readonly<Record<string, SessionRuntimeState>>;
@@ -73,7 +94,6 @@ type AppProps = {
   readonly onStopSession?: (sessionId: string) => void | Promise<void>;
   readonly onOpenSettings?: () => void;
   readonly onToggleActivity?: () => void;
-  readonly onLocateWorkspace?: (sessionId: string, workspace: string) => void | Promise<void>;
   readonly platformAdapter?: PlatformAdapter;
   readonly preferenceStorage?: PreferenceStorage;
   readonly sidebarStorage?: Pick<Storage, "getItem" | "setItem">;
@@ -91,7 +111,6 @@ export function App({
   onStopSession: providedOnStopSession,
   onOpenSettings = () => {},
   onToggleActivity = () => {},
-  onLocateWorkspace = () => {},
   platformAdapter,
   preferenceStorage,
   sidebarStorage,
@@ -117,12 +136,12 @@ export function App({
       ? { status: "checking", attempt: 0, retrying: true }
       : null,
   );
-  const [, setRetryRevision] = useState(0);
+  const [, setSubmissionRevision] = useState(0);
   const composerDraftMemory = useRef(new Map<string, string>());
   const pendingSubmissionRef = useRef(new Map<string, Map<string, SubmissionCandidate>>());
   const queuedSubmissionRef = useRef(new Map<string, string>());
   const boundSubmissionRef = useRef(new Map<string, BoundSubmission>());
-  const observedTurnRef = useRef(new Map<string, string>());
+  const optimisticSubmissionRef = useRef(new Map<string, SubmissionCandidate>());
   const submissionOwnerRef = useRef<{ readonly client: ApiClient | null; readonly dispatcher: AppProps["onSessionEvent"] } | null>(null);
   const retrySubmittedRef = useRef(new Set<string>());
   const bootstrapPendingRef = useRef(providedClient === undefined);
@@ -237,6 +256,7 @@ export function App({
         client: connection.client,
         dispatcher: onSessionEvent,
         generation: transcript.generation,
+        messageCountAtDispatch: transcript.messages.length,
         event: {
           type: "send_message",
           text: clientEvent.text,
@@ -250,6 +270,9 @@ export function App({
       if (clientEvent.type === "queue_message") {
         previousQueuedId = queuedSubmissionRef.current.get(sessionId);
         queuedSubmissionRef.current.set(sessionId, submissionId);
+      } else {
+        optimisticSubmissionRef.current.set(sessionId, candidate);
+        setSubmissionRevision((revision) => revision + 1);
       }
     } else if (clientEvent.type === "clear_queued_message") {
       clearingCandidateId = queuedSubmissionRef.current.get(sessionId);
@@ -257,6 +280,10 @@ export function App({
     }
     const rollbackCandidate = () => {
       if (candidate !== undefined) {
+        if (optimisticSubmissionRef.current.get(sessionId) === candidate) {
+          optimisticSubmissionRef.current.delete(sessionId);
+          setSubmissionRevision((revision) => revision + 1);
+        }
         if (
           retireCandidate(sessionId, candidate)
           && queuedSubmissionRef.current.get(sessionId) === candidate.submissionId
@@ -292,67 +319,110 @@ export function App({
       pendingSubmissionRef.current.clear();
       queuedSubmissionRef.current.clear();
       boundSubmissionRef.current.clear();
-      observedTurnRef.current.clear();
+      optimisticSubmissionRef.current.clear();
+      setSubmissionRevision((revision) => revision + 1);
       submissionOwnerRef.current = { client: connection.client, dispatcher: onSessionEvent };
     }
+    let changed = false;
+    const owned = (candidate: SubmissionCandidate | undefined) =>
+      candidate !== undefined
+      && candidate.client === connection.client
+      && candidate.dispatcher === onSessionEvent;
     for (const [sessionId, transcript] of Object.entries(transcriptBySession)) {
-      const pendingForGeneration = pendingSubmissionRef.current.get(sessionId);
-      if (
-        pendingForGeneration !== undefined
-        && [...pendingForGeneration.values()].some(
-          (candidate) => candidate.generation !== transcript.generation,
-        )
-      ) {
-        pendingSubmissionRef.current.delete(sessionId);
-        queuedSubmissionRef.current.delete(sessionId);
-        boundSubmissionRef.current.delete(sessionId);
-        observedTurnRef.current.delete(sessionId);
-      }
-      const bound = boundSubmissionRef.current.get(sessionId);
-      if (bound !== undefined && bound.generation !== transcript.generation) {
-        boundSubmissionRef.current.delete(sessionId);
-        pendingSubmissionRef.current.delete(sessionId);
-        queuedSubmissionRef.current.delete(sessionId);
-        observedTurnRef.current.delete(sessionId);
-      }
-      const activeTurn = transcript.activeTurn;
-      if (activeTurn === null) {
-        const terminal = transcript.terminal;
-        if (terminal?.submissionId === null || terminal?.submissionId === undefined) continue;
-        const candidate = pendingSubmissionRef.current.get(sessionId)?.get(terminal.submissionId);
-        if (
-          candidate !== undefined
-          && candidate.client === connection.client
-          && candidate.dispatcher === onSessionEvent
-          && candidate.generation === terminal.generation
-        ) {
-          boundSubmissionRef.current.set(sessionId, { ...candidate, turnId: terminal.turnId });
-          pendingSubmissionRef.current.delete(sessionId);
-          queuedSubmissionRef.current.delete(sessionId);
-          setRetryRevision((revision) => revision + 1);
-        }
-        continue;
-      }
-      const identity = `${activeTurn.generation}:${activeTurn.sequence}:${activeTurn.turnId}:${activeTurn.submissionId ?? "legacy"}`;
-      if (observedTurnRef.current.get(sessionId) === identity) continue;
-      observedTurnRef.current.set(sessionId, identity);
       const pending = pendingSubmissionRef.current.get(sessionId);
-      const candidate = activeTurn.submissionId === null
-        ? undefined
-        : pending?.get(activeTurn.submissionId);
-      if (
-        candidate === undefined
-        || candidate.client !== connection.client
-        || candidate.dispatcher !== onSessionEvent
-        || candidate.generation !== activeTurn.generation
-      ) {
-        boundSubmissionRef.current.delete(sessionId);
+      const previousBound = boundSubmissionRef.current.get(sessionId);
+      const nextPending = new Map<string, SubmissionCandidate>();
+      const queuedSubmissionId = transcript.queued?.submission_id ?? null;
+      if (queuedSubmissionId !== null) {
+        const queuedCandidate = pending?.get(queuedSubmissionId);
+        if (owned(queuedCandidate)) {
+          nextPending.set(queuedSubmissionId, {
+            ...queuedCandidate!,
+            generation: transcript.generation,
+          });
+          queuedSubmissionRef.current.set(sessionId, queuedSubmissionId);
+        }
+      } else {
+        queuedSubmissionRef.current.delete(sessionId);
+      }
+
+      let nextBound: BoundSubmission | undefined;
+      const activeTurn = transcript.activeTurn;
+      if (activeTurn !== null && activeTurn.submissionId !== null) {
+        const pendingActive = pending?.get(activeTurn.submissionId);
+        if (owned(pendingActive)) {
+          nextBound = {
+            ...pendingActive!,
+            generation: activeTurn.generation,
+            turnId: activeTurn.turnId,
+          };
+        } else if (
+          owned(previousBound)
+          && previousBound?.submissionId === activeTurn.submissionId
+          && previousBound.turnId === activeTurn.turnId
+        ) {
+          nextBound = { ...previousBound, generation: activeTurn.generation };
+        }
+      } else if (activeTurn === null) {
+        const terminal = transcript.terminal;
+        if (terminal?.submissionId !== null && terminal?.submissionId !== undefined) {
+          for (const candidate of pending?.values() ?? []) {
+            if (
+              candidate.submissionId !== terminal.submissionId
+              && owned(candidate)
+              && candidate.generation === transcript.generation
+            ) {
+              nextPending.set(candidate.submissionId, candidate);
+            }
+          }
+          const pendingTerminal = pending?.get(terminal.submissionId);
+          if (terminal.kind === "failed" && owned(pendingTerminal) && pendingTerminal?.generation === terminal.generation) {
+            nextBound = { ...pendingTerminal, turnId: terminal.turnId };
+          } else if (
+            terminal.kind === "failed"
+            && owned(previousBound)
+            && previousBound?.generation === terminal.generation
+            && previousBound.submissionId === terminal.submissionId
+            && previousBound.turnId === terminal.turnId
+          ) {
+            nextBound = previousBound;
+          }
+        } else if (terminal === null) {
+          for (const candidate of pending?.values() ?? []) {
+            if (owned(candidate) && candidate.generation === transcript.generation) {
+              nextPending.set(candidate.submissionId, candidate);
+            }
+          }
+        }
+      }
+
+      if (nextPending.size === 0) pendingSubmissionRef.current.delete(sessionId);
+      else pendingSubmissionRef.current.set(sessionId, nextPending);
+      if (nextBound === undefined) boundSubmissionRef.current.delete(sessionId);
+      else boundSubmissionRef.current.set(sessionId, nextBound);
+      changed = changed
+        || pending !== pendingSubmissionRef.current.get(sessionId)
+        || previousBound !== boundSubmissionRef.current.get(sessionId);
+
+      const optimistic = optimisticSubmissionRef.current.get(sessionId);
+      if (optimistic === undefined) continue;
+      const settled = transcript.terminal?.submissionId === optimistic.submissionId
+        && transcript.terminal.kind !== "failed";
+      if (!owned(optimistic) || settled || hasAuthoritativePrompt(optimistic, transcript)) {
+        optimisticSubmissionRef.current.delete(sessionId);
+        changed = true;
         continue;
       }
-      boundSubmissionRef.current.set(sessionId, { ...candidate, turnId: activeTurn.turnId });
-      pendingSubmissionRef.current.delete(sessionId);
-      queuedSubmissionRef.current.delete(sessionId);
+      const remapped = nextBound?.submissionId === optimistic.submissionId
+        ? nextBound
+        : nextPending.get(optimistic.submissionId);
+      if (optimistic.generation !== transcript.generation) {
+        if (remapped === undefined) optimisticSubmissionRef.current.delete(sessionId);
+        else optimisticSubmissionRef.current.set(sessionId, remapped);
+        changed = true;
+      }
     }
+    if (changed) setSubmissionRevision((revision) => revision + 1);
   }, [connection.client, onSessionEvent, transcriptBySession]);
   const retryAuthority = (() => {
     if (
@@ -409,22 +479,51 @@ export function App({
       client: authority.client,
       dispatcher: authority.dispatcher,
       generation: authority.terminal.generation,
+      messageCountAtDispatch: transcript?.messages.length ?? 0,
       event: retryEvent,
     };
     const pending = pendingSubmissionRef.current.get(authority.sessionId) ?? new Map();
     pending.set(submissionId, candidate);
     pendingSubmissionRef.current.set(authority.sessionId, pending);
+    optimisticSubmissionRef.current.set(authority.sessionId, candidate);
     retrySubmittedRef.current.add(authority.key);
     try {
       await authority.dispatcher?.(authority.sessionId, retryEvent);
-      setRetryRevision((revision) => revision + 1);
+      setSubmissionRevision((revision) => revision + 1);
     } catch (error) {
       retireCandidate(authority.sessionId, candidate);
+      if (optimisticSubmissionRef.current.get(authority.sessionId) === candidate) {
+        optimisticSubmissionRef.current.delete(authority.sessionId);
+      }
       retrySubmittedRef.current.delete(authority.key);
-      setRetryRevision((revision) => revision + 1);
+      setSubmissionRevision((revision) => revision + 1);
       throw error;
     }
   };
+  const activeOptimisticCandidate = activeSession === null
+    ? undefined
+    : optimisticSubmissionRef.current.get(activeSession.session_id);
+  const activeOptimisticSettled = activeOptimisticCandidate !== undefined
+    && activeTranscript?.terminal?.submissionId === activeOptimisticCandidate.submissionId
+    && activeTranscript.terminal.kind !== "failed";
+  const optimisticUserMessages: readonly OptimisticUserMessage[] = activeOptimisticCandidate === undefined
+    || activeTranscript === null
+    || activeOptimisticSettled
+    || hasAuthoritativePrompt(activeOptimisticCandidate, activeTranscript)
+    ? []
+    : [{
+        submissionId: activeOptimisticCandidate.submissionId,
+        content: activeOptimisticCandidate.event.text,
+      }];
+  const failedDraft = activeOptimisticCandidate !== undefined
+    && activeTranscript?.terminal?.kind === "failed"
+    && activeTranscript.terminal.submissionId === activeOptimisticCandidate.submissionId
+    ? {
+        submissionId: activeOptimisticCandidate.submissionId,
+        text: activeOptimisticCandidate.event.text,
+        mode: activeOptimisticCandidate.event.mode,
+      }
+    : null;
   const inspector = useInspector({
     sessionId: activeSession?.session_id ?? null,
     storage: inspectorStorage ?? sidebarStorage,
@@ -564,7 +663,9 @@ export function App({
             />
           ) : activeTranscript?.error !== null && activeTranscript?.error !== undefined && activeSession !== null && selectedPlatform !== null && selectedPlatform !== undefined ? (
             <RecoveryView
-              key={retryAuthority?.key ?? `${activeSession.session_id}:recovery`}
+              key={activeTranscript.terminal === null
+                ? `${activeSession.session_id}:recovery`
+                : terminalKey(activeSession.session_id, activeTranscript.terminal)}
               error={{
                 category: activeTranscript.error.category === "session_resume_error"
                   || activeTranscript.error.category === "session_resume_failure"
@@ -576,7 +677,6 @@ export function App({
               }}
               sessionId={activeSession.session_id}
               platform={selectedPlatform}
-              onLocate={onLocateWorkspace}
               onArchive={sessionsModel.archiveSession}
               onRetry={retryFailedSubmission}
             />
@@ -584,6 +684,7 @@ export function App({
             <Conversation
               key={`conversation-${activeSession?.session_id}`}
               state={activeTranscript}
+              optimisticUserMessages={optimisticUserMessages}
               openInspector={(activityId) => {
                 onToggleActivity();
                 inspector.openActivity(activityId, activeElement());
@@ -605,6 +706,7 @@ export function App({
             onStop={() => onStopSession(activeSession.session_id)}
             draftStorage={draftStorage}
             draftMemory={composerDraftMemory.current}
+            failedDraft={failedDraft}
           />
         ) : null}
       </div>

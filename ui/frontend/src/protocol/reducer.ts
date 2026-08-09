@@ -202,6 +202,16 @@ export function transcriptReducer(state: TranscriptState, event: ServerEvent): T
     if (event.generation < state.generation || (sameGeneration && event.sequence <= state.lastSequence)) {
       return state;
     }
+    const activeTurn = event.running && event.turn_id !== null
+      ? {
+          generation: event.generation,
+          sequence: event.sequence,
+          turnId: event.turn_id,
+          submissionId: state.activeTurn?.turnId === event.turn_id
+            ? state.activeTurn.submissionId
+            : null,
+        }
+      : null;
     return {
       generation: event.generation,
       lastSequence: event.sequence,
@@ -219,7 +229,7 @@ export function transcriptReducer(state: TranscriptState, event: ServerEvent): T
       latestContext: null,
       error: null,
       terminal: null,
-      activeTurn: null,
+      activeTurn,
     };
   }
 

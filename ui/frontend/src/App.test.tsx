@@ -113,6 +113,129 @@ afterEach(() => {
 });
 
 describe("App", () => {
+  it("projects a direct prompt immediately, keeps it across session switches, and reconciles completion once", async () => {
+    const user = userEvent.setup();
+    const sessionA = session({ session_id: "optimistic-a", title: "Optimistic A" });
+    const sessionB = session({ session_id: "optimistic-b", title: "Optimistic B" });
+    const onSessionEvent = vi.fn();
+    const props = {
+      client: clientWithSessions([sessionA, sessionB]),
+      platformAdapter: platformAdapter(),
+      sidebarStorage: storage,
+      draftStorage: storage,
+      onSessionEvent,
+    };
+    const initial = {
+      [sessionA.session_id]: emptyTranscript(),
+      [sessionB.session_id]: emptyTranscript(),
+    };
+    const { rerender } = render(<App {...props} transcriptBySession={initial} />);
+
+    await user.type(await screen.findByRole("textbox", { name: "Message" }), "Visible before streaming");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+    expect(screen.getByRole("article", { name: "User message" })).toHaveTextContent("Visible before streaming");
+
+    await selectSession(user, sessionB.title);
+    expect(screen.queryByText("Visible before streaming", { exact: true })).not.toBeInTheDocument();
+    await selectSession(user, sessionA.title);
+    expect(screen.getByRole("article", { name: "User message" })).toHaveTextContent("Visible before streaming");
+
+    const submissionId = capturedSubmissionId(onSessionEvent, 0);
+    let state = transcriptReducer(emptyTranscript(), event("turn_started", {
+      sequence: 1,
+      turn_id: "optimistic-turn",
+      submission_id: submissionId,
+    }));
+    state = transcriptReducer(state, event("assistant_delta", {
+      sequence: 2,
+      turn_id: "optimistic-turn",
+      text: "Streaming after prompt",
+    }));
+    rerender(<App {...props} transcriptBySession={{ ...initial, [sessionA.session_id]: state }} />);
+    const prompt = screen.getByRole("article", { name: "User message" });
+    const streaming = screen.getByRole("article", { name: "Assistant message" });
+    expect(prompt.compareDocumentPosition(streaming) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+
+    state = transcriptReducer(state, event("turn_completed", {
+      sequence: 3,
+      turn_id: "optimistic-turn",
+      messages: [
+        { role: "user", content: "Visible before streaming" },
+        { role: "assistant", content: "Complete" },
+      ],
+      final_text: "Complete",
+    }));
+    rerender(<App {...props} transcriptBySession={{ ...initial, [sessionA.session_id]: state }} />);
+    expect(screen.getAllByRole("article", { name: "User message" })).toHaveLength(1);
+  });
+
+  it("restores an exact failed direct prompt", async () => {
+    const user = userEvent.setup();
+    const active = session({ session_id: "restore-failed", title: "Restore failed" });
+    const onSessionEvent = vi.fn();
+    const props = {
+      client: clientWithSessions([active]),
+      platformAdapter: platformAdapter(),
+      sidebarStorage: storage,
+      draftStorage: storage,
+      onSessionEvent,
+    };
+    const { rerender } = render(
+      <App {...props} transcriptBySession={{ [active.session_id]: emptyTranscript() }} />,
+    );
+    const textbox = await screen.findByRole("textbox", { name: "Message" });
+    await user.type(textbox, "Restore this exact prompt");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(textbox).toHaveValue(""));
+    const submissionId = capturedSubmissionId(onSessionEvent, 0);
+    let state = transcriptReducer(emptyTranscript(), event("turn_started", {
+      sequence: 1,
+      turn_id: "restore-turn",
+      submission_id: submissionId,
+    }));
+    state = transcriptReducer(state, event("turn_failed", {
+      sequence: 2,
+      turn_id: "restore-turn",
+      error_category: "turn_failure",
+    }));
+    rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
+    expect(await screen.findByRole("textbox", { name: "Message" })).toHaveValue("Restore this exact prompt");
+  });
+
+  it("does not let failed prompt restoration overwrite a newer draft", async () => {
+    const user = userEvent.setup();
+    const active = session({ session_id: "keep-newer", title: "Keep newer" });
+    const onSessionEvent = vi.fn();
+    const props = {
+      client: clientWithSessions([active]),
+      platformAdapter: platformAdapter(),
+      sidebarStorage: storage,
+      draftStorage: storage,
+      onSessionEvent,
+    };
+    const { rerender } = render(
+      <App {...props} transcriptBySession={{ [active.session_id]: emptyTranscript() }} />,
+    );
+    const textbox = await screen.findByRole("textbox", { name: "Message" });
+    await user.type(textbox, "Older failed prompt");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(textbox).toHaveValue(""));
+    await user.type(textbox, "Keep my newer draft");
+    const submissionId = capturedSubmissionId(onSessionEvent, 0);
+    let state = transcriptReducer(emptyTranscript(), event("turn_started", {
+      sequence: 1,
+      turn_id: "keep-newer-turn",
+      submission_id: submissionId,
+    }));
+    state = transcriptReducer(state, event("turn_failed", {
+      sequence: 2,
+      turn_id: "keep-newer-turn",
+      error_category: "turn_failure",
+    }));
+    rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
+    expect(screen.getByRole("textbox", { name: "Message" })).toHaveValue("Keep my newer draft");
+  });
+
   it("creates the first real session from onboarding with persisted future defaults exactly once", async () => {
     const user = userEvent.setup();
     const values = new Map<string, string>([[

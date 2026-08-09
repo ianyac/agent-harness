@@ -22,6 +22,11 @@ type ComposerProps = {
   readonly draftStorage?: DraftStorage;
   readonly backupDelayMs?: number;
   readonly draftMemory?: Map<string, string>;
+  readonly failedDraft?: {
+    readonly submissionId: string;
+    readonly text: string;
+    readonly mode: TurnMode;
+  } | null;
 };
 
 type Submission = Extract<ClientEvent, { type: "send_message" | "queue_message" }>;
@@ -93,6 +98,7 @@ export function Composer({
   draftStorage,
   backupDelayMs,
   draftMemory,
+  failedDraft = null,
 }: ComposerProps) {
   const [draft, setDraft, setSessionDraft] = useDraft(sessionId, {
     storage: draftStorage,
@@ -124,6 +130,7 @@ export function Composer({
   const currentClearOperations = useRef(new Map<string, ClearOperation>());
   const nextStopOperationId = useRef(0);
   const currentStopOperations = useRef(new Map<string, StopOperation>());
+  const handledFailedDrafts = useRef(new Set<string>());
   const activeSessionRef = useRef(sessionId);
   activeSessionRef.current = sessionId;
   const textboxRef = useRef<HTMLTextAreaElement>(null);
@@ -254,6 +261,17 @@ export function Composer({
     if (next !== mode) markEdited();
     setSessionMode(sessionId, next);
   };
+
+  useEffect(() => {
+    if (failedDraft === null) return;
+    const key = `${sessionId}:${failedDraft.submissionId}`;
+    if (handledFailedDrafts.current.has(key)) return;
+    handledFailedDrafts.current.add(key);
+    if (draft !== "") return;
+    markEdited(sessionId);
+    setSessionDraft(sessionId, failedDraft.text);
+    setSessionMode(sessionId, failedDraft.mode);
+  }, [draft, failedDraft, sessionId, setSessionDraft]);
 
   const setQueueReconciliation = (
     reconciliationSessionId: string,

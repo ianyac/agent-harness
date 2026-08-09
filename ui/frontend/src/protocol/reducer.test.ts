@@ -8,6 +8,45 @@ function timelineOf(state: ReturnType<typeof emptyTranscript>): unknown[] | unde
 }
 
 describe("transcriptReducer", () => {
+  it("hydrates the exact running snapshot turn and remaps known submission authority", () => {
+    let state = transcriptReducer(emptyTranscript(), event("turn_started", {
+      generation: 1,
+      sequence: 4,
+      turn_id: "turn-reconnecting",
+      submission_id: "submission-reconnecting",
+    }));
+
+    state = transcriptReducer(state, event("session_snapshot", {
+      generation: 2,
+      sequence: 1,
+      turn_id: "turn-reconnecting",
+      running: true,
+    }));
+
+    expect(state.activeTurn).toEqual({
+      generation: 2,
+      sequence: 1,
+      turnId: "turn-reconnecting",
+      submissionId: "submission-reconnecting",
+    });
+  });
+
+  it("hydrates a running snapshot turn without guessing submission authority", () => {
+    const state = transcriptReducer(emptyTranscript(), event("session_snapshot", {
+      generation: 2,
+      sequence: 1,
+      turn_id: "turn-resumed",
+      running: true,
+    }));
+
+    expect(state.activeTurn).toEqual({
+      generation: 2,
+      sequence: 1,
+      turnId: "turn-resumed",
+      submissionId: null,
+    });
+  });
+
   it("exposes only the current authoritative turn-start identity", () => {
     let state = transcriptReducer(emptyTranscript(), event("turn_started", {
       generation: 1,

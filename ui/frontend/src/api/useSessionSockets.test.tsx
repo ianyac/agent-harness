@@ -18,10 +18,13 @@ class FakeWebSocket implements SessionSocketWebSocket {
   onclose: ((event: CloseEvent) => void) | null = null;
   onerror: ((event: Event) => void) | null = null;
   readonly closeCalls: Array<{ code?: number; reason?: string }> = [];
+  readonly sent: string[] = [];
 
   constructor(readonly sessionId: string) {}
 
-  send(): void {}
+  send(value: string): void {
+    this.sent.push(value);
+  }
 
   close(code?: number, reason?: string): void {
     this.readyState = 3;
@@ -32,6 +35,34 @@ class FakeWebSocket implements SessionSocketWebSocket {
     this.onmessage?.(new MessageEvent("message", { data: JSON.stringify(value) }));
   }
 }
+
+it("stops the exact turn hydrated from a running reconnect snapshot", () => {
+  const sockets: FakeWebSocket[] = [];
+  const createWebSocket: WebSocketFactory = (url) => {
+    const sessionId = url.split("/").at(-1);
+    if (sessionId === undefined) throw new Error("Missing fixture session id");
+    const socket = new FakeWebSocket(sessionId);
+    sockets.push(socket);
+    return socket;
+  };
+  const { result } = renderHook(() =>
+    useSessionSockets(connection, ["resumed"], createWebSocket),
+  );
+  const socket = sockets[0]!;
+
+  act(() => socket.receive({
+    ...snapshot("resumed"),
+    generation: 2,
+    turn_id: "turn-from-snapshot",
+    running: true,
+  }));
+  act(() => result.current.stop("resumed"));
+
+  expect(socket.sent.map((value) => JSON.parse(value))).toContainEqual({
+    type: "cancel_turn",
+    turn_id: "turn-from-snapshot",
+  });
+});
 
 function snapshot(sessionId: string): SessionSnapshot {
   return {

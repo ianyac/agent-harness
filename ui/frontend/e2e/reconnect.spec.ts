@@ -33,6 +33,18 @@ test("new-generation snapshot removes stale stream and old generation events sta
   await expect(page.getByText("superseded stream", { exact: true })).toHaveCount(0);
 });
 
+test("running reconnect snapshot keeps exact Stop authority", async ({ page, authority }) => {
+  await page.clock.install();
+  await page.goto(authority.entryPath);
+  await expect.poll(authority.socketConnections).toBe(1);
+  authority.setNextSnapshot({ running: true, turn_id: "turn-after-reconnect" });
+  authority.closeSocket();
+  await page.clock.fastForward(1_000);
+  await expect.poll(authority.socketConnections).toBe(2);
+  await page.getByRole("button", { name: "Stop turn" }).click();
+  expect(authority.outbound().at(-1)).toEqual({ type: "cancel_turn", turn_id: "turn-after-reconnect" });
+});
+
 test("missing workspace preserves its category and offers honest archive recovery", async ({ page, authority }) => {
   await page.goto(authority.entryPath);
   await expect.poll(authority.socketConnections).toBe(1);
@@ -43,6 +55,7 @@ test("missing workspace preserves its category and offers honest archive recover
   });
   await expect(page.getByRole("heading", { name: "Workspace unavailable" })).toBeVisible();
   await expect(page.getByRole("alert")).not.toContainText("fixture detail");
+  await expect(page.getByRole("button", { name: "Locate workspace" })).toHaveCount(0);
   await page.getByRole("button", { name: "Archive session" }).click();
   await expect(page.getByRole("button", { name: /Fixture session/ })).toHaveCount(0);
 });

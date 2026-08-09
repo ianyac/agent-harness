@@ -19,10 +19,16 @@ import styles from "./conversation.module.css";
 
 type ConversationProps = {
   readonly state: TranscriptState;
+  readonly optimisticUserMessages?: readonly OptimisticUserMessage[];
   readonly openInspector: (activityId: string) => void;
   readonly copyText?: CopyText;
   readonly ownsSearchShortcut?: boolean;
   readonly onSessionEvent?: (event: ClientEvent) => void | Promise<void>;
+};
+
+export type OptimisticUserMessage = {
+  readonly submissionId: string;
+  readonly content: string;
 };
 
 const NEAR_BOTTOM_PX = 80;
@@ -37,6 +43,7 @@ function isActivityGroup(item: GroupedTimelineItem): item is ActivityGroup {
 
 export function Conversation({
   state,
+  optimisticUserMessages = [],
   openInspector,
   copyText,
   ownsSearchShortcut = false,
@@ -88,6 +95,10 @@ export function Conversation({
     id: `${instanceId}-message-${message.messageIndex}`,
     text: message.content,
   }));
+  searchMessages.push(...optimisticUserMessages.map((message) => ({
+    id: `${instanceId}-optimistic-${message.submissionId}`,
+    text: message.content,
+  })));
   searchMessages.push(...timelineAssistants.map((item) => ({
     id: `${instanceId}-timeline-${item.timelineIndex}`,
     text: item.text,
@@ -95,7 +106,10 @@ export function Conversation({
   if (state.timeline.length === 0 && state.streamingText !== "") {
     searchMessages.push({ id: `${instanceId}-streaming`, text: state.streamingText });
   }
-  const contentVersion = `${state.generation}:${state.lastSequence}:${visibleMessages.length}:${state.streamingText.length}:${state.activityOrder.length}`;
+  const optimisticVersion = optimisticUserMessages
+    .map((message) => `${message.submissionId}:${message.content.length}`)
+    .join("|");
+  const contentVersion = `${state.generation}:${state.lastSequence}:${visibleMessages.length}:${state.streamingText.length}:${state.activityOrder.length}:${optimisticVersion}`;
 
   useEffect(() => {
     if (!ownsSearchShortcut) return;
@@ -170,6 +184,15 @@ export function Conversation({
               key={`${message.messageIndex}-${message.role}`}
               id={`${instanceId}-message-${message.messageIndex}`}
               role={message.role}
+              content={message.content}
+              copyText={copyText}
+            />
+          ))}
+          {optimisticUserMessages.map((message) => (
+            <Message
+              key={`optimistic-${message.submissionId}`}
+              id={`${instanceId}-optimistic-${message.submissionId}`}
+              role="user"
               content={message.content}
               copyText={copyText}
             />

@@ -1,4 +1,4 @@
-import { Archive, FolderOpen, Logs, Power, RefreshCw } from "lucide-react";
+import { Archive, Logs, Power, RefreshCw } from "lucide-react";
 import { useRef, useState } from "react";
 
 import type { PlatformAdapter } from "../platform/types";
@@ -9,7 +9,6 @@ type RecoveryViewProps = {
   readonly error: RecoverableError;
   readonly sessionId: string;
   readonly platform: PlatformAdapter;
-  readonly onLocate: (sessionId: string, workspace: string) => void | Promise<void>;
   readonly onArchive: (sessionId: string) => void | Promise<void>;
   readonly onRetry?: () => void | Promise<void>;
 };
@@ -54,7 +53,6 @@ export function RecoveryView({
   error,
   sessionId,
   platform,
-  onLocate,
   onArchive,
   onRetry,
 }: RecoveryViewProps) {
@@ -84,10 +82,6 @@ export function RecoveryView({
     }
   };
 
-  const locate = () => run(async () => {
-    const chosen = await platform.chooseWorkspace();
-    if (chosen !== null) await onLocate(sessionId, chosen);
-  });
   const workspaceError = error.category === "invalid_workspace" || error.category === "missing_workspace";
   const crashed = error.category === "sidecar_second_crash";
 
@@ -97,14 +91,9 @@ export function RecoveryView({
       <p>{copy.body}</p>
       <div className={styles.actions}>
         {workspaceError ? (
-          <>
-            <button type="button" disabled={pending} onClick={() => void locate()}>
-              <FolderOpen aria-hidden="true" size={18} /> Locate workspace
-            </button>
-            <button type="button" disabled={pending} onClick={() => void run(() => onArchive(sessionId))}>
-              <Archive aria-hidden="true" size={18} /> Archive session
-            </button>
-          </>
+          <button type="button" disabled={pending} onClick={() => void run(() => onArchive(sessionId))}>
+            <Archive aria-hidden="true" size={18} /> Archive session
+          </button>
         ) : null}
         {onRetry === undefined || ![
           "turn_failure",

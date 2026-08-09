@@ -92,6 +92,30 @@ test("sends, streams, groups activity, completes, and opens inspector detail", a
   ).__completionAnnouncements)).toEqual(["Response complete"]);
 });
 
+test("projects a direct prompt before streaming and restores it after terminal failure", async ({ page, authority }) => {
+  await openSession(page, authority);
+  const textbox = page.getByRole("textbox", { name: "Message" });
+  await textbox.fill("Prompt that must stay actionable");
+  await page.getByRole("button", { name: "Send message" }).click();
+  await expect(page.getByRole("article", { name: "User message" }))
+    .toHaveText("Prompt that must stay actionable");
+  const submissionId = authority.outbound()[0]?.submission_id;
+  authority.emit({ type: "turn_started", turn_id: "failed-visible-turn", mode: "base", submission_id: submissionId });
+  authority.emit({ type: "assistant_delta", turn_id: "failed-visible-turn", text: "Assistant starts later" });
+  const prompt = page.getByRole("article", { name: "User message" });
+  const streaming = page.getByRole("article", { name: "Assistant message" });
+  expect(await prompt.evaluate((node, assistant) => Boolean(
+    node.compareDocumentPosition(assistant as Node) & Node.DOCUMENT_POSITION_FOLLOWING
+  ), await streaming.elementHandle())).toBe(true);
+  authority.emit({
+    type: "turn_failed",
+    turn_id: "failed-visible-turn",
+    error_category: "turn_failure",
+    message: "fixture detail",
+  });
+  await expect(textbox).toHaveValue("Prompt that must stay actionable");
+});
+
 test("queues, edits, clears, and stops without a false completion announcement", async ({ page, authority }) => {
   await openSession(page, authority);
   await page.getByRole("textbox", { name: "Message" }).fill("Long running task");

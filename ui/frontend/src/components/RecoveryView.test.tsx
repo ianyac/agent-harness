@@ -40,7 +40,6 @@ describe("RecoveryView", () => {
         error={{ category, message: "unsafe provider detail token=secret" }}
         sessionId="session-stable"
         platform={adapter()}
-        onLocate={async () => {}}
         onArchive={async () => {}}
       />,
     );
@@ -48,55 +47,25 @@ describe("RecoveryView", () => {
     expect(screen.getByRole("alert")).not.toHaveTextContent("token=secret");
   });
 
-  it("locates with the canonical picker result or archives the exact stable session once", async () => {
+  it("offers only honest archive recovery for a missing workspace", async () => {
     const user = userEvent.setup();
-    const locate = deferred();
     const archive = deferred();
-    const chooseWorkspace = vi.fn().mockResolvedValue("/canonical/replacement");
-    const onLocate = vi.fn(() => locate.promise);
     const onArchive = vi.fn(() => archive.promise);
     const { container } = render(
       <RecoveryView
         error={{ category: "invalid_workspace", message: "missing" }}
         sessionId="session-stable"
-        platform={adapter({ kind: "tauri", chooseWorkspace })}
-        onLocate={onLocate}
+        platform={adapter({ kind: "tauri" })}
         onArchive={onArchive}
       />,
     );
 
-    await user.dblClick(screen.getByRole("button", { name: "Locate workspace" }));
-    expect(chooseWorkspace).toHaveBeenCalledTimes(1);
-    expect(onLocate).toHaveBeenCalledTimes(1);
-    expect(onLocate).toHaveBeenCalledWith("session-stable", "/canonical/replacement");
-    await act(async () => locate.resolve());
+    expect(screen.queryByRole("button", { name: "Locate workspace" })).not.toBeInTheDocument();
     await user.dblClick(screen.getByRole("button", { name: "Archive session" }));
     expect(onArchive).toHaveBeenCalledTimes(1);
     expect(onArchive).toHaveBeenCalledWith("session-stable");
     expect((await axe.run(container, { rules: { "color-contrast": { enabled: false } } })).violations).toEqual([]);
     await act(async () => archive.resolve());
-  });
-
-  it("recovers after picker cancel or rejection without inventing a frontend path", async () => {
-    const user = userEvent.setup();
-    const chooseWorkspace = vi.fn().mockResolvedValueOnce(null).mockRejectedValueOnce(new Error("Picker failed"));
-    const onLocate = vi.fn();
-    render(
-      <RecoveryView
-        error={{ category: "invalid_workspace", message: "missing" }}
-        sessionId="session-stable"
-        platform={adapter({ kind: "tauri", chooseWorkspace })}
-        onLocate={onLocate}
-        onArchive={async () => {}}
-      />,
-    );
-    await user.click(screen.getByRole("button", { name: "Locate workspace" }));
-    expect(onLocate).not.toHaveBeenCalled();
-    await user.click(screen.getByRole("button", { name: "Locate workspace" }));
-    expect(await screen.findByRole("status", { name: "Recovery action failed" }))
-      .toHaveTextContent("The recovery action failed.");
-    expect(screen.getByRole("alert")).not.toHaveTextContent("Picker failed");
-    expect(screen.getByRole("button", { name: "Locate workspace" })).toBeEnabled();
   });
 
   it.each(["turn_failure", "session_resume_failure", "session_resume_error"])(
@@ -110,7 +79,6 @@ describe("RecoveryView", () => {
           error={{ category, message: "safe retry" }}
           sessionId="session-stable"
           platform={adapter()}
-          onLocate={async () => {}}
           onArchive={async () => {}}
           onRetry={onRetry}
         />,
@@ -134,7 +102,6 @@ describe("RecoveryView", () => {
         error={{ category: "sidecar_second_crash", message: "crashed" }}
         sessionId="session-stable"
         platform={adapter({ kind: "tauri", restartService, openLogs, quit })}
-        onLocate={async () => {}}
         onArchive={async () => {}}
       />,
     );
@@ -156,7 +123,6 @@ describe("RecoveryView", () => {
         error={{ category: "sidecar_second_crash", message: "crashed" }}
         sessionId="session-stable"
         platform={adapter()}
-        onLocate={async () => {}}
         onArchive={async () => {}}
       />,
     );

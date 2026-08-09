@@ -31,6 +31,7 @@ export type FixtureAuthority = {
   readonly sendRaw: (event: FixtureEvent) => void;
   readonly closeSocket: () => void;
   readonly withholdNextSnapshots: (count?: number) => void;
+  readonly setNextSnapshot: (snapshot: { readonly running: boolean; readonly turn_id: string | null }) => void;
   readonly failNextDelete: () => void;
 };
 
@@ -44,6 +45,7 @@ async function installOfflineAuthority(page: Page): Promise<FixtureAuthority> {
   let sequence = 0;
   let withheldSnapshots = 0;
   let deleteFailures = 0;
+  let nextSnapshot: { readonly running: boolean; readonly turn_id: string | null } | null = null;
   const outboundEvents: FixtureEvent[] = [];
   const createBodies: Record<string, unknown>[] = [];
 
@@ -75,14 +77,16 @@ async function installOfflineAuthority(page: Page): Promise<FixtureAuthority> {
       withheldSnapshots -= 1;
       return;
     }
+    const snapshotState = nextSnapshot ?? { running: false, turn_id: null };
+    nextSnapshot = null;
     socket.send(JSON.stringify({
       type: "session_snapshot",
       session_id: sessionId,
       generation,
       sequence: 1,
-      turn_id: null,
+      turn_id: snapshotState.turn_id,
       messages: [],
-      running: false,
+      running: snapshotState.running,
       queued_message: null,
       safety: {},
     }));
@@ -189,6 +193,7 @@ async function installOfflineAuthority(page: Page): Promise<FixtureAuthority> {
       activeSocket = null;
     },
     withholdNextSnapshots: (count = 1) => { withheldSnapshots += count; },
+    setNextSnapshot: (snapshot) => { nextSnapshot = snapshot; },
     failNextDelete: () => { deleteFailures += 1; },
   };
 }

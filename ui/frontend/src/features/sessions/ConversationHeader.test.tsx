@@ -12,6 +12,7 @@ describe("ConversationHeader", () => {
     const onSetSessionMode = vi.fn();
     render(
       <ConversationHeader
+        {...{ sessionId: "session-1" }}
         workspace="/work/agent-harness"
         branch="ui/navigation"
         mode="default"
@@ -40,6 +41,7 @@ describe("ConversationHeader", () => {
     const onSetSessionMode = vi.fn();
     render(
       <ConversationHeader
+        {...{ sessionId: "session-1" }}
         workspace="/work/agent-harness"
         branch={null}
         mode="default"
@@ -60,5 +62,58 @@ describe("ConversationHeader", () => {
       type: "set_session_mode",
       mode: "acceptAll",
     });
+  });
+
+  it("stages confirmation focus and returns it to the permission-mode control on Escape", async () => {
+    const user = userEvent.setup();
+    render(
+      <ConversationHeader
+        {...{ sessionId: "session-1" }}
+        workspace="/work/agent-harness"
+        branch={null}
+        mode="default"
+        onSetSessionMode={() => {}}
+        onToggleActivity={() => {}}
+      />,
+    );
+    const modeButton = screen.getByRole("button", { name: "Permission mode: Default" });
+    await user.click(modeButton);
+    await user.click(screen.getByRole("menuitemradio", { name: "Accept all" }));
+
+    expect(screen.getByRole("button", { name: "Cancel" })).toHaveFocus();
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog", { name: "Enable accept all?" })).not.toBeInTheDocument();
+    expect(modeButton).toHaveFocus();
+  });
+
+  it("cancels the confirmation instead of retargeting it when the session prop changes", async () => {
+    const user = userEvent.setup();
+    const onSetSessionMode = vi.fn();
+    const { rerender } = render(
+      <ConversationHeader
+        {...{ sessionId: "session-1" }}
+        workspace="/work/one"
+        branch={null}
+        mode="default"
+        onSetSessionMode={onSetSessionMode}
+        onToggleActivity={() => {}}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: "Permission mode: Default" }));
+    await user.click(screen.getByRole("menuitemradio", { name: "Accept all" }));
+
+    rerender(
+      <ConversationHeader
+        {...{ sessionId: "session-2" }}
+        workspace="/work/two"
+        branch={null}
+        mode="default"
+        onSetSessionMode={onSetSessionMode}
+        onToggleActivity={() => {}}
+      />,
+    );
+
+    expect(screen.queryByRole("dialog", { name: "Enable accept all?" })).not.toBeInTheDocument();
+    expect(onSetSessionMode).not.toHaveBeenCalled();
   });
 });

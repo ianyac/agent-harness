@@ -35,12 +35,31 @@
   white-space: nowrap;
 }
 
-.connection {
+.connectionStatus {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: 5px;
+  margin-inline-start: auto;
+  color: var(--color-ink-muted);
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.connectionDot {
+  flex: 0 0 8px;
   width: 8px;
   height: 8px;
-  margin-inline-start: auto;
   border-radius: 50%;
+  background: var(--color-attention);
+}
+
+.connectionStatus[data-status="connected"] .connectionDot {
   background: var(--color-success);
+}
+
+.connectionStatus[data-status="disconnected"] .connectionDot {
+  background: var(--color-danger-strong);
 }
 
 .primaryAction,
@@ -224,6 +243,20 @@
   gap: 2px;
 }
 
+.renameDialog {
+  position: fixed;
+  z-index: 61;
+  inset-block-start: 50%;
+  inset-inline-start: 50%;
+  width: min(calc(100vw - 32px), 400px);
+  padding: 20px;
+  transform: translate(-50%, -50%);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-card);
+  background: var(--color-surface);
+  box-shadow: 0 18px 50px color-mix(in srgb, #000 25%, transparent);
+}
+
 .renameForm input,
 .searchField input {
   min-width: 0;
@@ -268,7 +301,7 @@
 .sidebar[data-collapsed="true"] .shortcut,
 .sidebar[data-collapsed="true"] .groupHeading,
 .sidebar[data-collapsed="true"] .sessionCopy,
-.sidebar[data-collapsed="true"] .connection {
+.sidebar[data-collapsed="true"] .connectionCopy {
   display: none;
 }
 
@@ -395,9 +428,9 @@
 }
 
 .dangerButton {
-  border-color: var(--color-danger);
-  color: var(--color-surface);
-  background: var(--color-danger);
+  border-color: var(--color-danger-strong);
+  color: #fff;
+  background: var(--color-danger-strong);
 }
 
 .palette {
@@ -492,7 +525,7 @@
   .sidebar .shortcut,
   .sidebar .groupHeading,
   .sidebar .sessionCopy,
-  .sidebar .connection {
+  .sidebar .connectionCopy {
     display: none;
   }
 

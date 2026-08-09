@@ -86,7 +86,7 @@ describe("SessionSidebar", () => {
     expect(within(navigation).getByRole("heading", { name: "Earlier" })).toBeVisible();
     expect(
       within(navigation).getByRole("button", {
-        name: /Ship navigation.*acme.*waiting for permission/i,
+        name: /Ship navigation.*\/work\/acme.*waiting for permission/i,
       }),
     ).toHaveAttribute("aria-current", "page");
     expect(
@@ -101,6 +101,7 @@ describe("SessionSidebar", () => {
     const user = userEvent.setup();
     render(
       <SessionSidebar
+        {...{ connectionStatus: "disconnected" }}
         sessions={[session()]}
         activeSessionId="session-1"
         runtimeBySession={{}}
@@ -122,16 +123,61 @@ describe("SessionSidebar", () => {
     expect(sidebarStorage.getItem("harness.sidebar.collapsed")).toBe("true");
     expect(screen.getByRole("button", { name: "New chat" })).toBeVisible();
     expect(screen.getByRole("button", { name: "Search sessions" })).toBeVisible();
-    expect(screen.getByRole("button", { name: /Ship navigation.*acme/i })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Settings" })).toBeVisible();
+    expect(screen.getByRole("status", { name: "Local service disconnected" })).toBeVisible();
+    expect(screen.getByRole("button", { name: /Ship navigation.*\/work\/acme/i })).toHaveAttribute(
+      "title",
+      expect.stringMatching(/Ship navigation.*\/work\/acme/i),
+    );
     expect(screen.getByRole("button", { name: /More actions for Ship navigation/i })).toBeVisible();
 
-    window.dispatchEvent(new Event("resize"));
-    expect(sidebarStorage.getItem("harness.sidebar.collapsed")).toBe("true");
+    await user.click(screen.getByRole("button", { name: /More actions for Ship navigation/i }));
+    await user.click(screen.getByRole("menuitem", { name: "Rename" }));
+    const rename = screen.getByRole("textbox", { name: "Rename Ship navigation" });
+    expect(rename).toHaveFocus();
+    await user.keyboard("{Escape}");
+    expect(rename).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /More actions for Ship navigation/i })).toHaveFocus();
+  });
+
+  it("uses local midnight boundaries for Today and Yesterday", () => {
+    const now = new Date(2026, 7, 9, 0, 1);
+    const justBeforeMidnight = new Date(2026, 7, 8, 23, 59).toISOString();
+    render(
+      <SessionSidebar
+        sessions={[
+          session({ session_id: "today", title: "After midnight", last_opened_at: now.toISOString() }),
+          session({
+            session_id: "yesterday",
+            title: "Before midnight",
+            last_opened_at: justBeforeMidnight,
+          }),
+        ]}
+        activeSessionId="today"
+        runtimeBySession={{}}
+        now={now}
+        storage={sidebarStorage}
+        onCreate={() => {}}
+        onSelect={() => {}}
+        onRename={() => {}}
+        onArchive={() => {}}
+        onSearch={() => {}}
+        onOpenSettings={() => {}}
+      />,
+    );
+
+    const today = screen.getByRole("region", { name: "Today" });
+    const yesterday = screen.getByRole("region", { name: "Yesterday" });
+    expect(within(today).getByRole("button", { name: /^After midnight,/ })).toBeVisible();
+    expect(within(yesterday).getByRole("button", { name: /^Before midnight,/ })).toBeVisible();
   });
 
   it("creates, selects, renames, and archives through the real session hook", async () => {
     const user = userEvent.setup();
-    let records = [session()];
+    let records = [
+      session(),
+      session({ session_id: "session-existing-2", title: "Second session" }),
+    ];
     let created = 1;
     const fetchRequest: typeof fetch = async (input, init) => {
       const url = new URL(input instanceof Request ? input.url : input.toString());
@@ -197,6 +243,15 @@ describe("SessionSidebar", () => {
     const createdRow = await screen.findByRole("button", { name: /New chat.*acme/i });
     expect(createdRow).toHaveAttribute("aria-current", "page");
 
+    await user.click(screen.getByRole("button", { name: /Ship navigation.*\/work\/acme/i }));
+    expect(screen.getByRole("button", { name: /Ship navigation.*\/work\/acme/i })).toHaveAttribute(
+      "aria-current",
+      "page",
+    );
+    expect(createdRow).not.toHaveAttribute("aria-current");
+
+    await user.click(createdRow);
+
     await user.click(screen.getByRole("button", { name: /More actions for New chat/i }));
     await user.click(await screen.findByRole("menuitem", { name: "Rename" }));
     const renameInput = screen.getByRole("textbox", { name: /Rename New chat/i });
@@ -204,6 +259,7 @@ describe("SessionSidebar", () => {
     await user.type(renameInput, "Fresh title");
     await user.click(screen.getByRole("button", { name: "Save name" }));
     expect(await screen.findByRole("button", { name: /Fresh title.*acme/i })).toBeVisible();
+    expect(screen.getByRole("button", { name: /More actions for Fresh title/i })).toHaveFocus();
 
     await user.click(screen.getByRole("button", { name: /More actions for Fresh title/i }));
     await user.click(await screen.findByRole("menuitem", { name: "Archive" }));

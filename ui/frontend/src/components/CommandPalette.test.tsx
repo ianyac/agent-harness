@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -50,6 +50,24 @@ function Harness(props: {
       onToggleActivity={props.onToggleActivity ?? (() => {})}
       onSelectSession={props.onSelectSession ?? (() => {})}
     />
+  );
+}
+
+function TriggerHarness() {
+  const [open, setOpen] = useState(false);
+  return (
+    <>
+      <button type="button" onClick={() => setOpen(true)}>Search sessions</button>
+      <CommandPalette
+        open={open}
+        onOpenChange={setOpen}
+        sessions={sessions}
+        onNewChat={() => {}}
+        onOpenSettings={() => {}}
+        onToggleActivity={() => {}}
+        onSelectSession={() => {}}
+      />
+    </>
   );
 }
 
@@ -129,5 +147,47 @@ describe("CommandPalette", () => {
     await user.keyboard("{Meta>}k{/Meta}");
     await user.click(screen.getByRole("button", { name: /Toggle activity.*⌘⇧I/ }));
     expect(onToggleActivity).toHaveBeenCalledOnce();
+  });
+
+  it("stages search focus and restores the invoking control after Escape", async () => {
+    const user = userEvent.setup();
+    render(<TriggerHarness />);
+    const trigger = screen.getByRole("button", { name: "Search sessions" });
+    await user.click(trigger);
+
+    expect(screen.getByRole("searchbox", { name: "Search commands and sessions" })).toHaveFocus();
+    await user.keyboard("{Escape}");
+
+    expect(screen.queryByRole("dialog", { name: "Command palette" })).not.toBeInTheDocument();
+    expect(trigger).toHaveFocus();
+  });
+
+  it("restores the Command+K focus origin and removes its shortcut listener on unmount", async () => {
+    const user = userEvent.setup();
+    const onNewChat = vi.fn();
+    const { unmount } = render(<Harness onNewChat={onNewChat} />);
+    const outside = document.createElement("button");
+    outside.textContent = "Outside";
+    document.body.append(outside);
+    outside.focus();
+
+    await user.keyboard("{Meta>}k{/Meta}");
+    await user.keyboard("{Escape}");
+    expect(outside).toHaveFocus();
+
+    unmount();
+    fireEvent.keyDown(window, { key: "n", metaKey: true });
+    expect(onNewChat).not.toHaveBeenCalled();
+    outside.remove();
+  });
+
+  it("ignores repeated global shortcut keydown events", () => {
+    const onNewChat = vi.fn();
+    render(<Harness onNewChat={onNewChat} />);
+
+    fireEvent.keyDown(window, { key: "n", metaKey: true, repeat: true });
+
+    expect(onNewChat).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog", { name: "Command palette" })).not.toBeInTheDocument();
   });
 });

@@ -1,6 +1,6 @@
 import * as Dialog from "@radix-ui/react-dialog";
 import { Activity, MessageSquarePlus, Search, Settings } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import type { SessionRecord } from "../features/sessions/useSessions";
 import { workspaceName } from "../features/sessions/SessionRow";
@@ -34,6 +34,8 @@ export function CommandPalette({
   onSelectSession,
 }: CommandPaletteProps) {
   const [query, setQuery] = useState("");
+  const focusOrigin = useRef<HTMLElement | null>(null);
+  const searchInput = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -41,6 +43,9 @@ export function CommandPalette({
       const key = event.key.toLowerCase();
       if (key === "k") {
         event.preventDefault();
+        if (!open && document.activeElement instanceof HTMLElement) {
+          focusOrigin.current = document.activeElement;
+        }
         onOpenChange(true);
       } else if (key === "n") {
         event.preventDefault();
@@ -50,7 +55,7 @@ export function CommandPalette({
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [onNewChat, onOpenChange]);
+  }, [onNewChat, onOpenChange, open]);
 
   useEffect(() => {
     if (!open) setQuery("");
@@ -101,13 +106,29 @@ export function CommandPalette({
     <Dialog.Root open={open} onOpenChange={onOpenChange}>
       <Dialog.Portal>
         <Dialog.Overlay className={styles.overlay} />
-        <Dialog.Content className={styles.palette} aria-describedby={undefined}>
+        <Dialog.Content
+          className={styles.palette}
+          aria-describedby={undefined}
+          onOpenAutoFocus={(event) => {
+            event.preventDefault();
+            if (focusOrigin.current === null && document.activeElement instanceof HTMLElement) {
+              focusOrigin.current = document.activeElement;
+            }
+            searchInput.current?.focus();
+          }}
+          onCloseAutoFocus={(event) => {
+            event.preventDefault();
+            const target = focusOrigin.current;
+            focusOrigin.current = null;
+            if (target?.isConnected) target.focus();
+          }}
+        >
           <Dialog.Title className={styles.srOnly}>Command palette</Dialog.Title>
           <div className={styles.searchField}>
             <Search aria-hidden="true" size={18} />
             <input
+              ref={searchInput}
               type="search"
-              autoFocus
               aria-label="Search commands and sessions"
               placeholder="Search commands and sessions"
               value={query}

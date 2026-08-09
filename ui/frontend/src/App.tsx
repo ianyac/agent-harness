@@ -4,6 +4,7 @@ import { ApiClient } from "./api/http";
 import { CommandPalette } from "./components/CommandPalette";
 import { ConversationHeader } from "./features/sessions/ConversationHeader";
 import { SessionSidebar } from "./features/sessions/SessionSidebar";
+import type { ConnectionStatus } from "./features/sessions/SessionSidebar";
 import type { SessionRuntimeState } from "./features/sessions/useSessions";
 import { useSessions } from "./features/sessions/useSessions";
 import type { ClientEvent } from "./protocol/types";
@@ -27,29 +28,37 @@ export function App({
   onToggleActivity = () => {},
   sidebarStorage,
 }: AppProps) {
-  const [connectedClient, setConnectedClient] = useState<ApiClient | null>(providedClient ?? null);
+  const [connection, setConnection] = useState<{
+    readonly client: ApiClient | null;
+    readonly status: ConnectionStatus;
+  }>(() =>
+    providedClient === undefined
+      ? { client: null, status: "connecting" }
+      : { client: providedClient, status: "connected" },
+  );
   const [paletteOpen, setPaletteOpen] = useState(false);
 
   useEffect(() => {
     if (providedClient !== undefined) {
-      setConnectedClient(providedClient);
+      setConnection({ client: providedClient, status: "connected" });
       return;
     }
     let current = true;
+    setConnection({ client: null, status: "connecting" });
     void import("./platform")
       .then(({ platform }) => platform.getServiceConnection())
       .then((connection) => {
-        if (current) setConnectedClient(new ApiClient(connection));
+        if (current) setConnection({ client: new ApiClient(connection), status: "connected" });
       })
       .catch(() => {
-        // Task 9 owns the user-facing bootstrap and recovery state.
+        if (current) setConnection({ client: null, status: "disconnected" });
       });
     return () => {
       current = false;
     };
   }, [providedClient]);
 
-  const sessionsModel = useSessions(connectedClient);
+  const sessionsModel = useSessions(connection.client);
   const activeSession = useMemo(
     () =>
       sessionsModel.sessions.find(
@@ -64,6 +73,7 @@ export function App({
         sessions={sessionsModel.sessions}
         activeSessionId={sessionsModel.activeSessionId}
         runtimeBySession={runtimeBySession}
+        connectionStatus={connection.status}
         storage={sidebarStorage}
         onCreate={sessionsModel.createSession}
         onSelect={sessionsModel.selectSession}
@@ -79,6 +89,8 @@ export function App({
           </header>
         ) : (
           <ConversationHeader
+            key={activeSession.session_id}
+            sessionId={activeSession.session_id}
             workspace={activeSession.workspace}
             branch={branchBySession[activeSession.session_id] ?? null}
             mode={activeSession.mode}

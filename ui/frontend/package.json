@@ -7,6 +7,7 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "test": "vitest",
+    "test:task4-browser": "node scripts/task4-browser-probe.mjs",
     "test:watch": "vitest --watch",
     "e2e": "playwright test --pass-with-no-tests e2e",
     "typecheck": "tsc -b --pretty false"

@@ -1,0 +1,209 @@
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { afterEach, describe, expect, it } from "vitest";
+
+import { ApiClient } from "../../api/http";
+import type { SessionRecord } from "./useSessions";
+import { useSessions } from "./useSessions";
+
+const connection = {
+  baseUrl: "http://127.0.0.1:4010",
+  token: "t".repeat(43),
+};
+
+const config = {
+  base_workspace: "/work/acme",
+  default_mode: "default",
+  default_context_mode: "compaction",
+  modes: ["default", "acceptAll", "readOnly"],
+  context_modes: ["compaction", "folding"],
+};
+
+function session(id: string, title = id): SessionRecord {
+  return {
+    session_id: id,
+    workspace: "/work/acme",
+    title,
+    mode: "default",
+    context_mode: "compaction",
+    created_at: "2026-08-09T04:00:00.000000+00:00",
+    updated_at: "2026-08-09T04:00:00.000000+00:00",
+    last_opened_at: "2026-08-09T04:00:00.000000+00:00",
+    archived_at: null,
+  };
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((accept) => {
+    resolve = accept;
+  });
+  return { promise, resolve };
+}
+
+function client(fetchRequest: typeof fetch) {
+  return new ApiClient(connection, fetchRequest);
+}
+
+function SessionsHarness({ api }: { api: ApiClient }) {
+  const model = useSessions(api);
+  return (
+    <>
+      <output aria-label="Session titles">{model.sessions.map((item) => item.title).join("|")}</output>
+      <output aria-label="Active session">{model.activeSessionId ?? "none"}</output>
+      <button type="button" onClick={() => void model.refresh()}>Refresh</button>
+      <button type="button" onClick={() => void model.createSession()}>Create</button>
+      <button type="button" onClick={() => void model.renameSession("session-1", "First rename")}>
+        First rename
+      </button>
+      <button type="button" onClick={() => void model.renameSession("session-1", "Second rename")}>
+        Second rename
+      </button>
+      <button type="button" onClick={() => void model.archiveSession("session-1")}>Archive</button>
+    </>
+  );
+}
+
+afterEach(cleanup);
+
+describe("useSessions async authority", () => {
+  it("ignores a slow refresh from a superseded client", async () => {
+    const oldSessions = deferred<Response>();
+    const oldConfig = deferred<Response>();
+    const oldClient = client(async (input) => {
+      const path = new URL(input instanceof Request ? input.url : input.toString()).pathname;
+      return path === "/api/sessions" ? oldSessions.promise : oldConfig.promise;
+    });
+    const newClient = client(async (input) => {
+      const path = new URL(input instanceof Request ? input.url : input.toString()).pathname;
+      return Response.json(path === "/api/sessions" ? [session("new-client")] : config);
+    });
+
+    const { rerender } = render(<SessionsHarness api={oldClient} />);
+    rerender(<SessionsHarness api={newClient} />);
+    expect(await screen.findByRole("status", { name: "Session titles" })).toHaveTextContent(
+      "new-client",
+    );
+
+    oldSessions.resolve(Response.json([session("stale-client")]));
+    oldConfig.resolve(Response.json(config));
+    await waitFor(() =>
+      expect(screen.getByRole("status", { name: "Session titles" })).toHaveTextContent(
+        "new-client",
+      ),
+    );
+    expect(screen.getByRole("status", { name: "Session titles" })).not.toHaveTextContent(
+      "stale-client",
+    );
+  });
+
+  it("does not let an older refresh drop a session created while it was pending", async () => {
+    const user = userEvent.setup();
+    const staleList = deferred<Response>();
+    let listRequests = 0;
+    const api = client(async (input, init) => {
+      const path = new URL(input instanceof Request ? input.url : input.toString()).pathname;
+      if (path === "/api/config") return Response.json(config);
+      if (path === "/api/sessions" && init?.method === "GET") {
+        listRequests += 1;
+        return listRequests === 1
+          ? Response.json([session("session-1")])
+          : staleList.promise;
+      }
+      if (path === "/api/sessions" && init?.method === "POST") {
+        return Response.json(session("created", "Created session"), { status: 201 });
+      }
+      return new Response(null, { status: 404 });
+    });
+    render(<SessionsHarness api={api} />);
+    await waitFor(() =>
+      expect(screen.getByRole("status", { name: "Session titles" })).toHaveTextContent(
+        "session-1",
+      ),
+    );
+
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    await user.click(screen.getByRole("button", { name: "Create" }));
+    expect(await screen.findByText(/Created session/, { selector: "output" })).toBeVisible();
+    staleList.resolve(Response.json([session("session-1")]));
+
+    await waitFor(() =>
+      expect(screen.getByRole("status", { name: "Session titles" })).toHaveTextContent(
+        "Created session",
+      ),
+    );
+  });
+
+  it("keeps the latest rapid rename when responses finish out of order", async () => {
+    const user = userEvent.setup();
+    const first = deferred<Response>();
+    const second = deferred<Response>();
+    const api = client(async (input, init) => {
+      const path = new URL(input instanceof Request ? input.url : input.toString()).pathname;
+      if (path === "/api/config") return Response.json(config);
+      if (path === "/api/sessions" && init?.method === "GET") {
+        return Response.json([session("session-1", "Original")]);
+      }
+      if (init?.method === "PATCH") {
+        const body = JSON.parse(String(init.body)) as { title: string };
+        return body.title === "First rename" ? first.promise : second.promise;
+      }
+      return new Response(null, { status: 404 });
+    });
+    render(<SessionsHarness api={api} />);
+    await screen.findByText("Original", { selector: "output" });
+
+    await user.click(screen.getByRole("button", { name: "First rename" }));
+    await user.click(screen.getByRole("button", { name: "Second rename" }));
+    second.resolve(Response.json(session("session-1", "Second rename")));
+    expect(await screen.findByText("Second rename", { selector: "output" })).toBeVisible();
+    first.resolve(Response.json(session("session-1", "First rename")));
+
+    await waitFor(() =>
+      expect(screen.getByRole("status", { name: "Session titles" })).toHaveTextContent(
+        "Second rename",
+      ),
+    );
+    expect(screen.getByRole("status", { name: "Session titles" })).not.toHaveTextContent(
+      "First rename",
+    );
+  });
+
+  it("does not let a pending refresh resurrect a completed archive", async () => {
+    const user = userEvent.setup();
+    const staleList = deferred<Response>();
+    let listRequests = 0;
+    const api = client(async (input, init) => {
+      const path = new URL(input instanceof Request ? input.url : input.toString()).pathname;
+      if (path === "/api/config") return Response.json(config);
+      if (path === "/api/sessions" && init?.method === "GET") {
+        listRequests += 1;
+        return listRequests === 1
+          ? Response.json([session("session-1")])
+          : staleList.promise;
+      }
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      return new Response(null, { status: 404 });
+    });
+    render(<SessionsHarness api={api} />);
+    await waitFor(() =>
+      expect(screen.getByRole("status", { name: "Session titles" })).toHaveTextContent(
+        "session-1",
+      ),
+    );
+
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    await user.click(screen.getByRole("button", { name: "Archive" }));
+    await waitFor(() =>
+      expect(screen.getByRole("status", { name: "Session titles" })).toBeEmptyDOMElement(),
+    );
+    staleList.resolve(Response.json([session("session-1")]));
+
+    await waitFor(() =>
+      expect(screen.getByRole("status", { name: "Session titles" })).not.toHaveTextContent(
+        "session-1",
+      ),
+    );
+    expect(screen.getByRole("status", { name: "Active session" })).toHaveTextContent("none");
+  });
+});

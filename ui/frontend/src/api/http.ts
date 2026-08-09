@@ -18,7 +18,10 @@ export class ApiClient {
   readonly #connection: ServiceConnection;
   readonly #fetch: typeof fetch;
 
-  constructor(connection: ServiceConnection, fetchRequest: typeof fetch = globalThis.fetch) {
+  constructor(
+    connection: ServiceConnection,
+    fetchRequest: typeof fetch = globalThis.fetch.bind(globalThis),
+  ) {
     this.#connection = normalizeServiceConnection(connection);
     this.#fetch = fetchRequest;
   }

@@ -16,10 +16,13 @@ const collapsePreferenceKey = "harness.sidebar.collapsed";
 
 type GroupName = "Today" | "Yesterday" | "Earlier";
 
+export type ConnectionStatus = "connecting" | "connected" | "disconnected";
+
 type SessionSidebarProps = {
   readonly sessions: readonly SessionRecord[];
   readonly activeSessionId: string | null;
   readonly runtimeBySession: Readonly<Record<string, SessionRuntimeState>>;
+  readonly connectionStatus?: ConnectionStatus;
   readonly now?: Date;
   readonly storage?: Pick<Storage, "getItem" | "setItem">;
   readonly onCreate: () => void | Promise<void>;
@@ -62,6 +65,7 @@ export function SessionSidebar({
   sessions,
   activeSessionId,
   runtimeBySession,
+  connectionStatus = "connecting",
   now = new Date(),
   storage = browserStorage(),
   onCreate,
@@ -91,6 +95,16 @@ export function SessionSidebar({
       return next;
     });
   };
+  const connectionLabel = {
+    connecting: "Local service connecting",
+    connected: "Local service connected",
+    disconnected: "Local service disconnected",
+  }[connectionStatus];
+  const connectionCopy = {
+    connecting: "Connecting",
+    connected: "Connected",
+    disconnected: "Disconnected",
+  }[connectionStatus];
 
   return (
     <nav
@@ -101,7 +115,16 @@ export function SessionSidebar({
       <div className={styles.identity}>
         <Bot aria-hidden="true" size={20} />
         <span className={styles.collapseCopy}>Agent Harness</span>
-        <span className={styles.connection} aria-label="Local service connected" title="Connected" />
+        <span
+          className={styles.connectionStatus}
+          data-status={connectionStatus}
+          role="status"
+          aria-label={connectionLabel}
+          title={connectionLabel}
+        >
+          <span className={styles.connectionDot} aria-hidden="true" />
+          <span className={styles.connectionCopy}>{connectionCopy}</span>
+        </span>
       </div>
       <button
         type="button"
@@ -152,7 +175,13 @@ export function SessionSidebar({
       </div>
 
       <div className={styles.footer}>
-        <button type="button" className={styles.utilityAction} onClick={onOpenSettings}>
+        <button
+          type="button"
+          className={styles.utilityAction}
+          aria-label="Settings"
+          title="Settings"
+          onClick={onOpenSettings}
+        >
           <Settings aria-hidden="true" size={18} />
           <span className={styles.collapseCopy}>Settings</span>
         </button>

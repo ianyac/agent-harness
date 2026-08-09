@@ -1,13 +1,14 @@
 import * as Dialog from "@radix-ui/react-dialog";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { Activity, ChevronDown, GitBranch, ShieldCheck } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import type { BaseMode, SetSessionMode } from "../../protocol/types";
 import { workspaceName } from "./SessionRow";
 import styles from "./sessionSidebar.module.css";
 
 type ConversationHeaderProps = {
+  readonly sessionId: string;
   readonly workspace: string;
   readonly branch: string | null;
   readonly mode: BaseMode;
@@ -22,18 +23,31 @@ const modeLabels: Record<BaseMode, string> = {
 };
 
 export function ConversationHeader({
+  sessionId,
   workspace,
   branch,
   mode,
   onSetSessionMode,
   onToggleActivity,
 }: ConversationHeaderProps) {
-  const [confirmAcceptAll, setConfirmAcceptAll] = useState(false);
+  const [confirmation, setConfirmation] = useState<{
+    readonly sessionId: string;
+    readonly submit: (event: SetSessionMode) => void;
+  } | null>(null);
+  const modeTriggerRef = useRef<HTMLButtonElement>(null);
+  const cancelRef = useRef<HTMLButtonElement>(null);
+  const confirmationOpen = confirmation?.sessionId === sessionId;
+
+  useEffect(() => {
+    if (confirmation !== null && confirmation.sessionId !== sessionId) {
+      setConfirmation(null);
+    }
+  }, [confirmation, sessionId]);
 
   const chooseMode = (nextMode: BaseMode) => {
     if (nextMode === mode) return;
     if (nextMode === "acceptAll") {
-      setConfirmAcceptAll(true);
+      setConfirmation({ sessionId, submit: onSetSessionMode });
       return;
     }
     onSetSessionMode({ type: "set_session_mode", mode: nextMode });
@@ -54,6 +68,7 @@ export function ConversationHeader({
         <DropdownMenu.Root>
           <DropdownMenu.Trigger asChild>
             <button
+              ref={modeTriggerRef}
               type="button"
               className={styles.headerButton}
               aria-label={`Permission mode: ${modeLabels[mode]}`}
@@ -88,24 +103,47 @@ export function ConversationHeader({
         </button>
       </div>
 
-      <Dialog.Root open={confirmAcceptAll} onOpenChange={setConfirmAcceptAll}>
+      <Dialog.Root
+        open={confirmationOpen}
+        onOpenChange={(nextOpen) => {
+          if (!nextOpen) setConfirmation(null);
+        }}
+      >
         <Dialog.Portal>
           <Dialog.Overlay className={styles.overlay} />
-          <Dialog.Content className={styles.confirmDialog}>
+          <Dialog.Content
+            className={styles.confirmDialog}
+            onOpenAutoFocus={(event) => {
+              event.preventDefault();
+              cancelRef.current?.focus();
+            }}
+            onCloseAutoFocus={(event) => {
+              event.preventDefault();
+              modeTriggerRef.current?.focus();
+            }}
+            onKeyDownCapture={(event) => {
+              if (event.metaKey && ["k", "n"].includes(event.key.toLowerCase())) {
+                event.preventDefault();
+                event.stopPropagation();
+              }
+            }}
+          >
             <Dialog.Title className={styles.dialogTitle}>Enable accept all?</Dialog.Title>
             <Dialog.Description className={styles.dialogDescription}>
               Mutating tools will run without per-call prompts for this session.
             </Dialog.Description>
             <div className={styles.dialogActions}>
               <Dialog.Close asChild>
-                <button type="button" className={styles.secondaryButton}>Cancel</button>
+                <button ref={cancelRef} type="button" className={styles.secondaryButton}>Cancel</button>
               </Dialog.Close>
               <button
                 type="button"
                 className={styles.dangerButton}
                 onClick={() => {
-                  onSetSessionMode({ type: "set_session_mode", mode: "acceptAll" });
-                  setConfirmAcceptAll(false);
+                  if (confirmation?.sessionId === sessionId) {
+                    confirmation.submit({ type: "set_session_mode", mode: "acceptAll" });
+                  }
+                  setConfirmation(null);
                 }}
               >
                 Enable accept all

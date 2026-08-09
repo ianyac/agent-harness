@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import type { ApiClient } from "../../api/http";
 import type { BaseMode } from "../../protocol/types";
@@ -59,107 +59,198 @@ function errorFrom(value: unknown): Error {
 
 export function useSessions(client: ApiClient | null): SessionsModel {
   const [sessions, setSessions] = useState<SessionRecord[]>([]);
-  const [config, setConfig] = useState<ServiceConfig | null>(null);
+  const [, setConfig] = useState<ServiceConfig | null>(null);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [loading, setLoading] = useState(client !== null);
   const [error, setError] = useState<Error | null>(null);
+  const sessionsRef = useRef<SessionRecord[]>([]);
+  const configRef = useRef<ServiceConfig | null>(null);
+  const activeSessionIdRef = useRef<string | null>(null);
+  const clientRef = useRef(client);
+  const clientEpochRef = useRef(0);
+  const refreshRequestRef = useRef(0);
+  const mutationVersionRef = useRef(0);
+  const sessionMutationRef = useRef(new Map<string, number>());
+
+  const commitSessions = useCallback((next: SessionRecord[]) => {
+    sessionsRef.current = next;
+    setSessions(next);
+  }, []);
+
+  const commitConfig = useCallback((next: ServiceConfig | null) => {
+    configRef.current = next;
+    setConfig(next);
+  }, []);
+
+  const commitActiveSession = useCallback((next: string | null) => {
+    activeSessionIdRef.current = next;
+    setActiveSessionId(next);
+  }, []);
+
+  const isCurrentClient = useCallback((requestClient: ApiClient, epoch: number) => {
+    return clientRef.current === requestClient && clientEpochRef.current === epoch;
+  }, []);
 
   const refresh = useCallback(async () => {
     if (client === null) return;
+    const requestClient = client;
+    const epoch = clientEpochRef.current;
+    const request = ++refreshRequestRef.current;
+    const mutationVersion = mutationVersionRef.current;
     setLoading(true);
     try {
       const [records, serviceConfig] = await Promise.all([
-        client.get<SessionRecord[]>("/api/sessions"),
-        client.get<ServiceConfig>("/api/config"),
+        requestClient.get<SessionRecord[]>("/api/sessions"),
+        requestClient.get<ServiceConfig>("/api/config"),
       ]);
+      if (!isCurrentClient(requestClient, epoch) || refreshRequestRef.current !== request) return;
       const visible = unarchived(records);
-      setSessions(visible);
-      setConfig(serviceConfig);
-      setActiveSessionId((current) => {
-        if (current !== null && visible.some((record) => record.session_id === current)) {
-          return current;
-        }
-        return visible[0]?.session_id ?? null;
-      });
+      commitConfig(serviceConfig);
+      if (mutationVersionRef.current === mutationVersion) {
+        commitSessions(visible);
+        const current = activeSessionIdRef.current;
+        commitActiveSession(
+          current !== null && visible.some((record) => record.session_id === current)
+            ? current
+            : (visible[0]?.session_id ?? null),
+        );
+      }
       setError(null);
     } catch (value) {
-      setError(errorFrom(value));
+      if (isCurrentClient(requestClient, epoch) && refreshRequestRef.current === request) {
+        setError(errorFrom(value));
+      }
     } finally {
-      setLoading(false);
+      if (isCurrentClient(requestClient, epoch) && refreshRequestRef.current === request) {
+        setLoading(false);
+      }
     }
+  }, [client, commitActiveSession, commitConfig, commitSessions, isCurrentClient]);
+
+  useLayoutEffect(() => {
+    if (clientRef.current === client) return;
+    clientRef.current = client;
+    clientEpochRef.current += 1;
+    refreshRequestRef.current += 1;
+    mutationVersionRef.current += 1;
+    sessionMutationRef.current.clear();
   }, [client]);
 
   useEffect(() => {
+    commitSessions([]);
+    commitConfig(null);
+    commitActiveSession(null);
+    setError(null);
     if (client === null) {
       setLoading(false);
       return;
     }
+    setLoading(true);
     void refresh();
-  }, [client, refresh]);
+  }, [client, commitActiveSession, commitConfig, commitSessions, refresh]);
 
   const createSession = useCallback(async () => {
-    if (client === null || config === null) return;
+    const serviceConfig = configRef.current;
+    if (client === null || serviceConfig === null) return;
+    const requestClient = client;
+    const epoch = clientEpochRef.current;
+    mutationVersionRef.current += 1;
     try {
-      const created = await client.post<SessionRecord>("/api/sessions", {
-        workspace: config.base_workspace,
-        mode: config.default_mode,
-        context_mode: config.default_context_mode,
+      const created = await requestClient.post<SessionRecord>("/api/sessions", {
+        workspace: serviceConfig.base_workspace,
+        mode: serviceConfig.default_mode,
+        context_mode: serviceConfig.default_context_mode,
         title: "New chat",
       });
-      setSessions((current) => [created, ...current.filter((item) => item.session_id !== created.session_id)]);
-      setActiveSessionId(created.session_id);
+      if (!isCurrentClient(requestClient, epoch)) return;
+      mutationVersionRef.current += 1;
+      commitSessions([
+        created,
+        ...sessionsRef.current.filter((item) => item.session_id !== created.session_id),
+      ]);
+      commitActiveSession(created.session_id);
       setError(null);
     } catch (value) {
-      setError(errorFrom(value));
+      if (isCurrentClient(requestClient, epoch)) setError(errorFrom(value));
     }
-  }, [client, config]);
+  }, [client, commitActiveSession, commitSessions, isCurrentClient]);
 
   const selectSession = useCallback(
     (sessionId: string) => {
-      if (sessions.some((record) => record.session_id === sessionId)) {
-        setActiveSessionId(sessionId);
+      if (sessionsRef.current.some((record) => record.session_id === sessionId)) {
+        commitActiveSession(sessionId);
       }
     },
-    [sessions],
+    [commitActiveSession],
   );
 
   const renameSession = useCallback(
     async (sessionId: string, title: string) => {
       if (client === null) return;
+      const requestClient = client;
+      const epoch = clientEpochRef.current;
+      const mutation = (sessionMutationRef.current.get(sessionId) ?? 0) + 1;
+      sessionMutationRef.current.set(sessionId, mutation);
+      mutationVersionRef.current += 1;
       try {
-        const renamed = await client.patch<SessionRecord>(
+        const renamed = await requestClient.patch<SessionRecord>(
           `/api/sessions/${encodeURIComponent(sessionId)}`,
           { title },
         );
-        setSessions((current) =>
-          current.map((record) => (record.session_id === sessionId ? renamed : record)),
+        if (
+          !isCurrentClient(requestClient, epoch) ||
+          sessionMutationRef.current.get(sessionId) !== mutation
+        ) return;
+        mutationVersionRef.current += 1;
+        commitSessions(
+          sessionsRef.current.map((record) =>
+            record.session_id === sessionId ? renamed : record,
+          ),
         );
         setError(null);
       } catch (value) {
-        setError(errorFrom(value));
+        if (
+          isCurrentClient(requestClient, epoch) &&
+          sessionMutationRef.current.get(sessionId) === mutation
+        ) {
+          setError(errorFrom(value));
+        }
       }
     },
-    [client],
+    [client, commitSessions, isCurrentClient],
   );
 
   const archiveSession = useCallback(
     async (sessionId: string) => {
       if (client === null) return;
+      const requestClient = client;
+      const epoch = clientEpochRef.current;
+      const mutation = (sessionMutationRef.current.get(sessionId) ?? 0) + 1;
+      sessionMutationRef.current.set(sessionId, mutation);
+      mutationVersionRef.current += 1;
       try {
-        await client.delete(`/api/sessions/${encodeURIComponent(sessionId)}`);
-        setSessions((current) => {
-          const remaining = current.filter((record) => record.session_id !== sessionId);
-          setActiveSessionId((active) =>
-            active === sessionId ? (remaining[0]?.session_id ?? null) : active,
-          );
-          return remaining;
-        });
+        await requestClient.delete(`/api/sessions/${encodeURIComponent(sessionId)}`);
+        if (
+          !isCurrentClient(requestClient, epoch) ||
+          sessionMutationRef.current.get(sessionId) !== mutation
+        ) return;
+        mutationVersionRef.current += 1;
+        const remaining = sessionsRef.current.filter((record) => record.session_id !== sessionId);
+        commitSessions(remaining);
+        if (activeSessionIdRef.current === sessionId) {
+          commitActiveSession(remaining[0]?.session_id ?? null);
+        }
         setError(null);
       } catch (value) {
-        setError(errorFrom(value));
+        if (
+          isCurrentClient(requestClient, epoch) &&
+          sessionMutationRef.current.get(sessionId) === mutation
+        ) {
+          setError(errorFrom(value));
+        }
       }
     },
-    [client],
+    [client, commitActiveSession, commitSessions, isCurrentClient],
   );
 
   return {

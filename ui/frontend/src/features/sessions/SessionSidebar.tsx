@@ -3,6 +3,9 @@ import {
   Bot,
   ChevronLeft,
   ChevronRight,
+  CircleAlert,
+  CircleCheck,
+  LoaderCircle,
   MessageSquarePlus,
   Search,
   Settings,
@@ -106,10 +109,10 @@ export function SessionSidebar({
     connected: "Connected",
     disconnected: "Disconnected",
   }[connectionStatus];
-  const connectionMark = {
-    connecting: "…",
-    connected: "✓",
-    disconnected: "!",
+  const ConnectionIcon = {
+    connecting: LoaderCircle,
+    connected: CircleCheck,
+    disconnected: CircleAlert,
   }[connectionStatus];
 
   return (
@@ -129,14 +132,12 @@ export function SessionSidebar({
           aria-label={connectionLabel}
           title={connectionLabel}
         >
-          <span
+          <ConnectionIcon
             className={styles.connectionMark}
-            data-connection-mark=""
-            data-state-symbol={connectionStatus}
+            data-connection-icon={connectionStatus}
             aria-hidden="true"
-          >
-            {connectionMark}
-          </span>
+            size={16}
+          />
           <span className={styles.connectionCopy}>{connectionCopy}</span>
         </span>
       </div>

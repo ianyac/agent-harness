@@ -155,7 +155,7 @@ describe("SessionSidebar", () => {
     expect(screen.getByRole("button", { name: /More actions for Ship navigation/i })).toHaveFocus();
   });
 
-  it("uses distinct visible marks for every connection state in the rail", async () => {
+  it("uses distinct Lucide SVG icons for every accessible connection state in the rail", async () => {
     const user = userEvent.setup();
     const props = {
       sessions: [session()],
@@ -175,17 +175,25 @@ describe("SessionSidebar", () => {
     );
     await user.click(screen.getByRole("button", { name: "Collapse sidebar" }));
 
-    expect(
-      within(screen.getByRole("status", { name: "Local service connecting" })).getByText("…"),
-    ).toBeVisible();
+    const iconFor = (accessibleName: string, state: string) => {
+      const status = screen.getByRole("status", { name: accessibleName });
+      const icon = status.querySelector<SVGElement>(
+        `svg.lucide[data-connection-icon="${state}"]`,
+      );
+      expect(icon).toBeVisible();
+      expect(icon).toHaveAttribute("aria-hidden", "true");
+      expect(icon).toHaveAttribute("stroke", "currentColor");
+      if (icon === null) throw new Error(`Missing Lucide connection icon for ${state}.`);
+      return Array.from(icon.children, (child) => child.outerHTML).join("");
+    };
+
+    const signatures = [iconFor("Local service connecting", "connecting")];
     rerender(<SessionSidebar {...props} connectionStatus="connected" />);
-    expect(
-      within(screen.getByRole("status", { name: "Local service connected" })).getByText("✓"),
-    ).toBeVisible();
+    signatures.push(iconFor("Local service connected", "connected"));
     rerender(<SessionSidebar {...props} connectionStatus="disconnected" />);
-    expect(
-      within(screen.getByRole("status", { name: "Local service disconnected" })).getByText("!"),
-    ).toBeVisible();
+    signatures.push(iconFor("Local service disconnected", "disconnected"));
+
+    expect(new Set(signatures)).toHaveLength(3);
   });
 
   it("uses local midnight boundaries for Today and Yesterday", () => {

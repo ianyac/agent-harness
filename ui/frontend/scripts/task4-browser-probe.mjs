@@ -142,24 +142,28 @@ const connectionLabels = {
   disconnected: "Local service disconnected",
 };
 
-async function verifyConnectionTreatment(page, state, symbol, theme) {
+async function verifyConnectionTreatment(page, state, theme) {
   await page.locator("html").evaluate((element, value) => {
     element.dataset.theme = value;
   }, theme);
   const sidebar = page.getByRole("navigation", { name: "Sessions" });
   const status = page.getByRole("status", { name: connectionLabels[state] });
-  const mark = status.locator("[data-connection-mark]");
-  await mark.waitFor();
-  assert.equal((await mark.textContent())?.trim(), symbol, `${state} must have a distinct mark`);
-  const box = await mark.boundingBox();
-  assert(box && box.width >= 14 && box.height >= 14, `${state} mark must remain visible in the rail`);
-  const [border, background] = await Promise.all([
-    mark.evaluate((element) => getComputedStyle(element).borderTopColor),
+  const icon = status.locator(`svg.lucide[data-connection-icon="${state}"]`);
+  await icon.waitFor({ timeout: 3_000 });
+  assert.equal(await icon.getAttribute("aria-hidden"), "true", `${state} icon must be decorative`);
+  assert.equal(await icon.getAttribute("stroke"), "currentColor", `${state} must use Lucide color`);
+  const box = await icon.boundingBox();
+  assert(box && box.width >= 14 && box.height >= 14, `${state} icon must remain visible in the rail`);
+  const [iconColor, background] = await Promise.all([
+    icon.evaluate((element) => getComputedStyle(element).color),
     sidebar.evaluate((element) => getComputedStyle(element).backgroundColor),
   ]);
   assert(
-    contrast(border, background) >= 3,
-    `${theme} ${state} mark must meet 3:1 against the sidebar`,
+    contrast(iconColor, background) >= 3,
+    `${theme} ${state} icon must meet 3:1 against the sidebar`,
+  );
+  return icon.evaluate((element) =>
+    Array.from(element.children, (child) => child.outerHTML).join(""),
   );
 }
 
@@ -280,8 +284,12 @@ try {
   const focusedIdentity = wide.getByRole("tooltip");
   await focusedIdentity.waitFor({ timeout: 3_000 });
   assert.match(await focusedIdentity.innerText(), /Ship navigation.*\/work\/acme/is);
-  await verifyConnectionTreatment(wide, "connected", "✓", "light");
-  await verifyConnectionTreatment(wide, "connected", "✓", "dark");
+  const connectedIcon = await verifyConnectionTreatment(wide, "connected", "light");
+  assert.equal(
+    await verifyConnectionTreatment(wide, "connected", "dark"),
+    connectedIcon,
+    "connected icon geometry must remain stable across themes",
+  );
   await wide.locator("html").evaluate((element) => {
     element.dataset.theme = "light";
   });
@@ -321,16 +329,29 @@ try {
   const connectingContext = await browser.newContext();
   await connectingContext.addInitScript(() => localStorage.clear());
   const connecting = await prepareConnectingPage(connectingContext, 900);
-  await verifyConnectionTreatment(connecting.page, "connecting", "…", "light");
-  await verifyConnectionTreatment(connecting.page, "connecting", "…", "dark");
+  const connectingIcon = await verifyConnectionTreatment(connecting.page, "connecting", "light");
+  assert.equal(
+    await verifyConnectionTreatment(connecting.page, "connecting", "dark"),
+    connectingIcon,
+    "connecting icon geometry must remain stable across themes",
+  );
   await connecting.release();
   await connectingContext.close();
 
   const disconnectedContext = await browser.newContext();
   await disconnectedContext.addInitScript(() => localStorage.clear());
   const disconnected = await prepareDisconnectedPage(disconnectedContext, 900);
-  await verifyConnectionTreatment(disconnected, "disconnected", "!", "light");
-  await verifyConnectionTreatment(disconnected, "disconnected", "!", "dark");
+  const disconnectedIcon = await verifyConnectionTreatment(disconnected, "disconnected", "light");
+  assert.equal(
+    await verifyConnectionTreatment(disconnected, "disconnected", "dark"),
+    disconnectedIcon,
+    "disconnected icon geometry must remain stable across themes",
+  );
+  assert.equal(
+    new Set([connectingIcon, connectedIcon, disconnectedIcon]).size,
+    3,
+    "connection states must use three distinct Lucide silhouettes",
+  );
   await disconnectedContext.close();
   console.log("Task 4 browser probe passed at 1100px and 900px.");
 } finally {

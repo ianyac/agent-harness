@@ -47,26 +47,10 @@
 }
 
 .connectionMark {
-  display: grid;
+  display: block;
   flex: 0 0 16px;
   width: 16px;
   height: 16px;
-  box-sizing: border-box;
-  border: 2px solid currentColor;
-  border-radius: 50%;
-  background: var(--color-sidebar);
-  font-size: 10px;
-  font-weight: 800;
-  line-height: 1;
-  place-items: center;
-}
-
-.connectionStatus[data-status="connected"] .connectionMark {
-  border-radius: 4px;
-}
-
-.connectionStatus[data-status="disconnected"] .connectionMark {
-  border-radius: 1px;
 }
 
 .primaryAction,

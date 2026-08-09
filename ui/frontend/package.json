@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "tauri:dev": "cd .. && tauri dev --config desktop/src-tauri/tauri.conf.json",
+    "tauri:build": "cd .. && tauri build --config desktop/src-tauri/tauri.conf.json",
     "test": "vitest",
     "test:task4-browser": "node scripts/task4-browser-probe.mjs",
     "test:watch": "vitest --watch",
@@ -27,6 +29,7 @@
   },
   "devDependencies": {
     "@playwright/test": "^1.55.0",
+    "@tauri-apps/cli": "^2.11.4",
     "@testing-library/jest-dom": "^6.8.0",
     "@testing-library/react": "^16.3.0",
     "@testing-library/user-event": "^14.6.1",

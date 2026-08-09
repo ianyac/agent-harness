@@ -17,6 +17,14 @@ from pydantic import (
 
 
 NonEmptyId = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+SubmissionId = Annotated[
+    str,
+    StringConstraints(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+    ),
+]
 TurnMode = Literal["base", "plan"]
 BaseMode = Literal["default", "acceptAll", "readOnly"]
 PermissionDecision = Literal["yes", "no", "always"]
@@ -73,6 +81,7 @@ class ProtocolModel(BaseModel):
 class _TextMessage(ProtocolModel):
     text: str
     mode: TurnMode
+    submission_id: SubmissionId | None = None
 
     @field_validator("text")
     @classmethod
@@ -158,6 +167,7 @@ class TurnStarted(EventEnvelope):
     type: Literal["turn_started"] = "turn_started"
     turn_id: NonEmptyId
     mode: TurnMode
+    submission_id: SubmissionId | None = None
 
 
 class AssistantDelta(EventEnvelope):

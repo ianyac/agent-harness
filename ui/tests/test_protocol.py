@@ -55,6 +55,38 @@ def test_user_message_is_trimmed_but_preserves_internal_newlines():
     assert event == UserMessage(text="first\nsecond", mode="plan")
 
 
+def test_submission_correlation_is_bounded_nullable_and_preserved():
+    direct = parse_client_event(
+        '{"type":"send_message","text":"hello","mode":"base",'
+        '"submission_id":"submission-A_123"}'
+    )
+    queued = parse_client_event(
+        '{"type":"queue_message","text":"later","mode":"plan",'
+        '"submission_id":"submission-B_456"}'
+    )
+
+    assert direct.submission_id == "submission-A_123"
+    assert queued.submission_id == "submission-B_456"
+    assert UserMessage(text="legacy", mode="base").submission_id is None
+    started = TurnStarted(
+        session_id="s1",
+        generation=1,
+        sequence=1,
+        turn_id="t1",
+        mode="base",
+        submission_id="submission-A_123",
+    )
+    assert json.loads(dump_server_event(started))["submission_id"] == "submission-A_123"
+
+    for invalid in ("", "has spaces", "x" * 129, "bad\ud800id"):
+        with pytest.raises(ValidationError):
+            UserMessage(
+                text="hello",
+                mode="base",
+                submission_id=invalid,
+            )
+
+
 @pytest.mark.parametrize(
     ("raw", "expected_type"),
     [

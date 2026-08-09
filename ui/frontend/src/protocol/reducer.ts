@@ -247,6 +247,7 @@ export function transcriptReducer(state: TranscriptState, event: ServerEvent): T
           generation: event.generation,
           sequence: event.sequence,
           turnId: event.turn_id,
+          submissionId: event.submission_id ?? null,
         },
       };
     case "assistant_delta": {

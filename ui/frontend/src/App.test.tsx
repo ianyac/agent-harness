@@ -56,6 +56,17 @@ function deferred<T = void>() {
   return { promise, resolve, reject };
 }
 
+function capturedSubmissionId(
+  spy: { readonly mock: { readonly calls: readonly (readonly unknown[])[] } },
+  callIndex: number,
+): string {
+  const outbound = spy.mock.calls[callIndex]?.[1] as { readonly submission_id?: unknown } | undefined;
+  if (typeof outbound?.submission_id !== "string") {
+    throw new Error(`call ${callIndex} did not carry a submission id`);
+  }
+  return outbound.submission_id;
+}
+
 function clientWith(fetchRequest: typeof fetch) {
   const withIdentity: typeof fetch = async (input, init) => {
     const path = new URL(input instanceof Request ? input.url : input.toString()).pathname;
@@ -391,15 +402,18 @@ describe("App", () => {
     await user.type(textbox, "exact retained plan");
     await user.click(screen.getByRole("button", { name: "Plan mode" }));
     await user.click(screen.getByRole("button", { name: "Send message" }));
-    expect(onSessionEvent).toHaveBeenCalledWith(active.session_id, {
+    const submission = capturedSubmissionId(onSessionEvent, 0);
+    expect(onSessionEvent).toHaveBeenCalledWith(active.session_id, expect.objectContaining({
       type: "send_message",
       text: "exact retained plan",
       mode: "plan",
-    });
+      submission_id: submission,
+    }));
 
     const started = transcriptReducer(emptyTranscript(), event("turn_started", {
       sequence: 1,
       turn_id: "failed-turn",
+      submission_id: submission,
     }));
     rerender(<App {...appProps} transcriptBySession={{ [active.session_id]: started }} />);
     await act(async () => { await Promise.resolve(); });
@@ -414,11 +428,11 @@ describe("App", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent("This session could not be reopened.");
     await user.dblClick(screen.getByRole("button", { name: "Retry" }));
     expect(onSessionEvent).toHaveBeenCalledTimes(2);
-    expect(onSessionEvent).toHaveBeenLastCalledWith(active.session_id, {
+    expect(onSessionEvent).toHaveBeenLastCalledWith(active.session_id, expect.objectContaining({
       type: "send_message",
       text: "exact retained plan",
       mode: "plan",
-    });
+    }));
     await act(async () => retry.resolve());
   });
 
@@ -433,9 +447,14 @@ describe("App", () => {
     );
     await user.type(await screen.findByRole("textbox", { name: "Message" }), "same safe retry");
     await user.click(screen.getByRole("button", { name: "Send message" }));
+    const initialSubmission = capturedSubmissionId(onSessionEvent, 0);
     let state = transcriptReducer(
       emptyTranscript(),
-      event("turn_started", { sequence: 1, turn_id: "turn-a" }),
+      event("turn_started", {
+        sequence: 1,
+        turn_id: "turn-a",
+        submission_id: initialSubmission,
+      }),
     );
     rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
     await act(async () => { await Promise.resolve(); });
@@ -444,7 +463,12 @@ describe("App", () => {
 
     await user.dblClick(await screen.findByRole("button", { name: "Retry" }));
     expect(onSessionEvent).toHaveBeenCalledTimes(2);
-    state = transcriptReducer(state, event("turn_started", { sequence: 3, turn_id: "turn-b" }));
+    const retrySubmission = capturedSubmissionId(onSessionEvent, 1);
+    state = transcriptReducer(state, event("turn_started", {
+      sequence: 3,
+      turn_id: "turn-b",
+      submission_id: retrySubmission,
+    }));
     rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
     await act(async () => { await Promise.resolve(); });
     state = transcriptReducer(state, event("turn_failed", { sequence: 4, turn_id: "turn-b" }));
@@ -452,11 +476,48 @@ describe("App", () => {
 
     await user.dblClick(await screen.findByRole("button", { name: "Retry" }));
     expect(onSessionEvent).toHaveBeenCalledTimes(3);
-    expect(onSessionEvent).toHaveBeenLastCalledWith(active.session_id, {
+    expect(onSessionEvent).toHaveBeenLastCalledWith(active.session_id, expect.objectContaining({
       type: "send_message",
       text: "same safe retry",
       mode: "base",
-    });
+    }));
+  });
+
+  it("assigns a fresh bounded submission id to direct, queued, and retry attempts", async () => {
+    const user = userEvent.setup();
+    const active = session();
+    const client = clientWithSessions([active]);
+    const onSessionEvent = vi.fn();
+    const props = { client, platformAdapter: platformAdapter(), sidebarStorage: storage, draftStorage: storage, onSessionEvent };
+    const { rerender } = render(<App {...props} transcriptBySession={{ [active.session_id]: emptyTranscript() }} />);
+    await user.type(await screen.findByRole("textbox", { name: "Message" }), "turn A");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+    const submissionA = capturedSubmissionId(onSessionEvent, 0);
+    expect(submissionA).toMatch(/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/);
+    let state = transcriptReducer(emptyTranscript(), event("turn_started", {
+      sequence: 1,
+      turn_id: "turn-a",
+      submission_id: submissionA,
+    }));
+    rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
+    await act(async () => { await Promise.resolve(); });
+    await user.type(screen.getByRole("textbox", { name: "Message" }), "queued B");
+    await user.click(screen.getByRole("button", { name: "Queue message" }));
+    const submissionB = capturedSubmissionId(onSessionEvent, 1);
+    expect(submissionB).not.toBe(submissionA);
+    state = transcriptReducer(state, event("turn_failed", { sequence: 2, turn_id: "turn-a" }));
+    rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
+
+    await user.dblClick(await screen.findByRole("button", { name: "Retry" }));
+    expect(onSessionEvent).toHaveBeenCalledTimes(3);
+    const retrySubmission = capturedSubmissionId(onSessionEvent, 2);
+    expect(new Set([submissionA, submissionB, retrySubmission])).toHaveLength(3);
+    expect(onSessionEvent).toHaveBeenLastCalledWith(active.session_id, expect.objectContaining({
+      type: "send_message",
+      text: "turn A",
+      mode: "base",
+      submission_id: retrySubmission,
+    }));
   });
 
   it("binds a queued follow-up only when its own turn starts and retries that failed follow-up", async () => {
@@ -472,25 +533,35 @@ describe("App", () => {
     const textbox = await screen.findByRole("textbox", { name: "Message" });
     await user.type(textbox, "turn A");
     await user.click(screen.getByRole("button", { name: "Send message" }));
-    let state = transcriptReducer(emptyTranscript(), event("turn_started", { sequence: 1, turn_id: "turn-a" }));
+    const submissionA = capturedSubmissionId(onSessionEvent, 0);
+    let state = transcriptReducer(emptyTranscript(), event("turn_started", {
+      sequence: 1,
+      turn_id: "turn-a",
+      submission_id: submissionA,
+    }));
     rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
     await act(async () => { await Promise.resolve(); });
     await user.type(screen.getByRole("textbox", { name: "Message" }), "queued B");
     await user.click(screen.getByRole("button", { name: "Queue message" }));
+    const submissionB = capturedSubmissionId(onSessionEvent, 1);
 
     state = transcriptReducer(state, event("turn_completed", { sequence: 2, turn_id: "turn-a" }));
-    state = transcriptReducer(state, event("turn_started", { sequence: 3, turn_id: "turn-b" }));
+    state = transcriptReducer(state, event("turn_started", {
+      sequence: 3,
+      turn_id: "turn-b",
+      submission_id: submissionB,
+    }));
     rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
     await act(async () => { await Promise.resolve(); });
     state = transcriptReducer(state, event("turn_failed", { sequence: 4, turn_id: "turn-b" }));
     rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
 
     await user.dblClick(await screen.findByRole("button", { name: "Retry" }));
-    expect(onSessionEvent).toHaveBeenLastCalledWith(active.session_id, {
+    expect(onSessionEvent).toHaveBeenLastCalledWith(active.session_id, expect.objectContaining({
       type: "send_message",
       text: "queued B",
       mode: "base",
-    });
+    }));
     expect(onSessionEvent).toHaveBeenCalledTimes(3);
   });
 
@@ -505,7 +576,12 @@ describe("App", () => {
     );
     await user.type(await screen.findByRole("textbox", { name: "Message" }), "turn A");
     await user.click(screen.getByRole("button", { name: "Send message" }));
-    let state = transcriptReducer(emptyTranscript(), event("turn_started", { sequence: 1, turn_id: "turn-a" }));
+    const submissionA = capturedSubmissionId(onSessionEvent, 0);
+    let state = transcriptReducer(emptyTranscript(), event("turn_started", {
+      sequence: 1,
+      turn_id: "turn-a",
+      submission_id: submissionA,
+    }));
     rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
     await act(async () => { await Promise.resolve(); });
     await user.type(screen.getByRole("textbox", { name: "Message" }), "queued B");
@@ -514,11 +590,11 @@ describe("App", () => {
     rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
 
     await user.click(await screen.findByRole("button", { name: "Retry" }));
-    expect(onSessionEvent).toHaveBeenLastCalledWith(active.session_id, {
+    expect(onSessionEvent).toHaveBeenLastCalledWith(active.session_id, expect.objectContaining({
       type: "send_message",
       text: "turn A",
       mode: "base",
-    });
+    }));
   });
 
   it("binds queued B when its authoritative start wins an accepted clear race", async () => {
@@ -530,27 +606,40 @@ describe("App", () => {
     const { rerender } = render(<App {...props} transcriptBySession={{ [active.session_id]: emptyTranscript() }} />);
     await user.type(await screen.findByRole("textbox", { name: "Message" }), "turn A");
     await user.click(screen.getByRole("button", { name: "Send message" }));
-    let state = transcriptReducer(emptyTranscript(), event("turn_started", { sequence: 1, turn_id: "turn-a" }));
+    const submissionA = capturedSubmissionId(onSessionEvent, 0);
+    let state = transcriptReducer(emptyTranscript(), event("turn_started", {
+      sequence: 1,
+      turn_id: "turn-a",
+      submission_id: submissionA,
+    }));
     rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
     await act(async () => { await Promise.resolve(); });
     await user.type(await screen.findByRole("textbox", { name: "Message" }), "retired B");
     await user.click(screen.getByRole("button", { name: "Queue message" }));
-    state = { ...state, queued: { type: "queue_message", text: "retired B", mode: "base" } };
+    const submissionB = capturedSubmissionId(onSessionEvent, 1);
+    state = {
+      ...state,
+      queued: { type: "queue_message", text: "retired B", mode: "base", submission_id: submissionB },
+    };
     rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
     await user.click(screen.getByRole("button", { name: "Edit queued follow-up" }));
     state = transcriptReducer(state, event("turn_completed", { sequence: 2, turn_id: "turn-a" }));
-    state = transcriptReducer(state, event("turn_started", { sequence: 3, turn_id: "turn-b" }));
+    state = transcriptReducer(state, event("turn_started", {
+      sequence: 3,
+      turn_id: "turn-b",
+      submission_id: submissionB,
+    }));
     rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
     await act(async () => { await Promise.resolve(); });
     state = transcriptReducer(state, event("turn_failed", { sequence: 4, turn_id: "turn-b" }));
     rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
 
     await user.dblClick(await screen.findByRole("button", { name: "Retry" }));
-    expect(onSessionEvent).toHaveBeenLastCalledWith(active.session_id, {
+    expect(onSessionEvent).toHaveBeenLastCalledWith(active.session_id, expect.objectContaining({
       type: "send_message",
       text: "retired B",
       mode: "base",
-    });
+    }));
     expect(onSessionEvent).toHaveBeenCalledTimes(4);
   });
 
@@ -567,27 +656,40 @@ describe("App", () => {
     const { rerender } = render(<App {...props} transcriptBySession={{ [active.session_id]: emptyTranscript() }} />);
     await user.type(await screen.findByRole("textbox", { name: "Message" }), "turn A");
     await user.click(screen.getByRole("button", { name: "Send message" }));
-    let state = transcriptReducer(emptyTranscript(), event("turn_started", { sequence: 1, turn_id: "turn-a" }));
+    const submissionA = capturedSubmissionId(onSessionEvent, 0);
+    let state = transcriptReducer(emptyTranscript(), event("turn_started", {
+      sequence: 1,
+      turn_id: "turn-a",
+      submission_id: submissionA,
+    }));
     rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
     await act(async () => { await Promise.resolve(); });
     await user.type(screen.getByRole("textbox", { name: "Message" }), "queued B");
     await user.click(screen.getByRole("button", { name: "Queue message" }));
-    state = { ...state, queued: { type: "queue_message", text: "queued B", mode: "base" } };
+    const submissionB = capturedSubmissionId(onSessionEvent, 1);
+    state = {
+      ...state,
+      queued: { type: "queue_message", text: "queued B", mode: "base", submission_id: submissionB },
+    };
     rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
     await user.click(screen.getByRole("button", { name: "Edit queued follow-up" }));
     state = transcriptReducer(state, event("turn_completed", { sequence: 2, turn_id: "turn-a" }));
-    state = transcriptReducer(state, event("turn_started", { sequence: 3, turn_id: "turn-b" }));
+    state = transcriptReducer(state, event("turn_started", {
+      sequence: 3,
+      turn_id: "turn-b",
+      submission_id: submissionB,
+    }));
     rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
     await act(async () => { await Promise.resolve(); });
     state = transcriptReducer(state, event("turn_failed", { sequence: 4, turn_id: "turn-b" }));
     rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
 
     await user.click(await screen.findByRole("button", { name: "Retry" }));
-    expect(onSessionEvent).toHaveBeenLastCalledWith(active.session_id, {
+    expect(onSessionEvent).toHaveBeenLastCalledWith(active.session_id, expect.objectContaining({
       type: "send_message",
       text: "queued B",
       mode: "base",
-    });
+    }));
     expect(screen.getByRole("alert")).not.toHaveTextContent("unsafe clear detail");
   });
 
@@ -603,16 +705,29 @@ describe("App", () => {
     const { rerender } = render(<App {...props} transcriptBySession={{ [active.session_id]: emptyTranscript() }} />);
     await user.type(await screen.findByRole("textbox", { name: "Message" }), "turn A");
     await user.click(screen.getByRole("button", { name: "Send message" }));
-    let state = transcriptReducer(emptyTranscript(), event("turn_started", { sequence: 1, turn_id: "turn-a" }));
+    const submissionA = capturedSubmissionId(onSessionEvent, 0);
+    let state = transcriptReducer(emptyTranscript(), event("turn_started", {
+      sequence: 1,
+      turn_id: "turn-a",
+      submission_id: submissionA,
+    }));
     rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
     await act(async () => { await Promise.resolve(); });
     await user.type(screen.getByRole("textbox", { name: "Message" }), "queued B");
     await user.click(screen.getByRole("button", { name: "Queue message" }));
-    state = { ...state, queued: { type: "queue_message", text: "queued B", mode: "base" } };
+    const submissionB = capturedSubmissionId(onSessionEvent, 1);
+    state = {
+      ...state,
+      queued: { type: "queue_message", text: "queued B", mode: "base", submission_id: submissionB },
+    };
     rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
     await user.click(screen.getByRole("button", { name: "Edit queued follow-up" }));
     state = transcriptReducer(state, event("turn_completed", { sequence: 2, turn_id: "turn-a" }));
-    state = transcriptReducer(state, event("turn_started", { sequence: 3, turn_id: "turn-b" }));
+    state = transcriptReducer(state, event("turn_started", {
+      sequence: 3,
+      turn_id: "turn-b",
+      submission_id: submissionB,
+    }));
     rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
     await act(async () => { await Promise.resolve(); });
     state = transcriptReducer(state, event("turn_failed", { sequence: 4, turn_id: "turn-b" }));
@@ -620,11 +735,11 @@ describe("App", () => {
     await act(async () => clear.reject(new Error("late clear rejection")));
 
     await user.click(await screen.findByRole("button", { name: "Retry" }));
-    expect(onSessionEvent).toHaveBeenLastCalledWith(active.session_id, {
+    expect(onSessionEvent).toHaveBeenLastCalledWith(active.session_id, expect.objectContaining({
       type: "send_message",
       text: "queued B",
       mode: "base",
-    });
+    }));
   });
 
   it("retires an accepted clearing B when a later direct C becomes authoritative", async () => {
@@ -636,12 +751,21 @@ describe("App", () => {
     const { rerender } = render(<App {...props} transcriptBySession={{ [active.session_id]: emptyTranscript() }} />);
     await user.type(await screen.findByRole("textbox", { name: "Message" }), "turn A");
     await user.click(screen.getByRole("button", { name: "Send message" }));
-    let state = transcriptReducer(emptyTranscript(), event("turn_started", { sequence: 1, turn_id: "turn-a" }));
+    const submissionA = capturedSubmissionId(onSessionEvent, 0);
+    let state = transcriptReducer(emptyTranscript(), event("turn_started", {
+      sequence: 1,
+      turn_id: "turn-a",
+      submission_id: submissionA,
+    }));
     rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
     await act(async () => { await Promise.resolve(); });
     await user.type(screen.getByRole("textbox", { name: "Message" }), "cleared B");
     await user.click(screen.getByRole("button", { name: "Queue message" }));
-    state = { ...state, queued: { type: "queue_message", text: "cleared B", mode: "base" } };
+    const submissionB = capturedSubmissionId(onSessionEvent, 1);
+    state = {
+      ...state,
+      queued: { type: "queue_message", text: "cleared B", mode: "base", submission_id: submissionB },
+    };
     rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
     await user.click(screen.getByRole("button", { name: "Edit queued follow-up" }));
 
@@ -653,18 +777,23 @@ describe("App", () => {
     await user.clear(directComposer);
     await user.type(directComposer, "direct C");
     await user.click(screen.getByRole("button", { name: "Send message" }));
-    state = transcriptReducer(state, event("turn_started", { sequence: 3, turn_id: "turn-c" }));
+    const submissionC = capturedSubmissionId(onSessionEvent, 3);
+    state = transcriptReducer(state, event("turn_started", {
+      sequence: 3,
+      turn_id: "turn-c",
+      submission_id: submissionC,
+    }));
     rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
     await act(async () => { await Promise.resolve(); });
     state = transcriptReducer(state, event("turn_failed", { sequence: 4, turn_id: "turn-c" }));
     rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
 
     await user.click(await screen.findByRole("button", { name: "Retry" }));
-    expect(onSessionEvent).toHaveBeenLastCalledWith(active.session_id, {
+    expect(onSessionEvent).toHaveBeenLastCalledWith(active.session_id, expect.objectContaining({
       type: "send_message",
       text: "direct C",
       mode: "base",
-    });
+    }));
     expect(onSessionEvent).toHaveBeenCalledTimes(5);
   });
 
@@ -680,32 +809,220 @@ describe("App", () => {
     const { rerender } = render(<App {...props} transcriptBySession={{ [active.session_id]: emptyTranscript() }} />);
     await user.type(await screen.findByRole("textbox", { name: "Message" }), "turn A");
     await user.click(screen.getByRole("button", { name: "Send message" }));
-    let state = transcriptReducer(emptyTranscript(), event("turn_started", { sequence: 1, turn_id: "turn-a" }));
+    const submissionA = capturedSubmissionId(onSessionEvent, 0);
+    let state = transcriptReducer(emptyTranscript(), event("turn_started", {
+      sequence: 1,
+      turn_id: "turn-a",
+      submission_id: submissionA,
+    }));
     rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
     await act(async () => { await Promise.resolve(); });
     await user.type(screen.getByRole("textbox", { name: "Message" }), "queued B");
     await user.click(screen.getByRole("button", { name: "Queue message" }));
-    state = { ...state, queued: { type: "queue_message", text: "queued B", mode: "base" } };
+    const submissionB = capturedSubmissionId(onSessionEvent, 1);
+    state = {
+      ...state,
+      queued: { type: "queue_message", text: "queued B", mode: "base", submission_id: submissionB },
+    };
     rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
     await user.click(screen.getByRole("button", { name: "Edit queued follow-up" }));
     state = transcriptReducer(state, event("turn_failed", { sequence: 2, turn_id: "turn-a" }));
     rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
 
     await user.click(await screen.findByRole("button", { name: "Retry" }));
+    const retrySubmission = capturedSubmissionId(onSessionEvent, 3);
     await act(async () => clear.reject(new Error("late rejected clear")));
-    state = transcriptReducer(state, event("turn_started", { sequence: 3, turn_id: "turn-a-retry" }));
+    state = transcriptReducer(state, event("turn_started", {
+      sequence: 3,
+      turn_id: "turn-a-retry",
+      submission_id: retrySubmission,
+    }));
     rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
     await act(async () => { await Promise.resolve(); });
     state = transcriptReducer(state, event("turn_failed", { sequence: 4, turn_id: "turn-a-retry" }));
     rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
 
     await user.click(await screen.findByRole("button", { name: "Retry" }));
-    expect(onSessionEvent).toHaveBeenLastCalledWith(active.session_id, {
+    expect(onSessionEvent).toHaveBeenLastCalledWith(active.session_id, expect.objectContaining({
       type: "send_message",
       text: "turn A",
       mode: "base",
-    });
+    }));
     expect(onSessionEvent).toHaveBeenCalledTimes(5);
+  });
+
+  it("binds B by exact submission id when B beats a clear and a later direct C", async () => {
+    const user = userEvent.setup();
+    const active = session();
+    const client = clientWithSessions([active]);
+    const clear = deferred();
+    const onSessionEvent = vi.fn((_sessionId: string, outbound: ClientEvent) => (
+      outbound.type === "clear_queued_message" ? clear.promise : undefined
+    ));
+    const props = { client, platformAdapter: platformAdapter(), sidebarStorage: storage, draftStorage: storage, onSessionEvent };
+    const { rerender } = render(<App {...props} transcriptBySession={{ [active.session_id]: emptyTranscript() }} />);
+    await user.type(await screen.findByRole("textbox", { name: "Message" }), "turn A");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+    const submissionA = capturedSubmissionId(onSessionEvent, 0);
+    let state = transcriptReducer(emptyTranscript(), event("turn_started", {
+      sequence: 1,
+      turn_id: "turn-a",
+      submission_id: submissionA,
+    }));
+    rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
+    await act(async () => { await Promise.resolve(); });
+    await user.type(screen.getByRole("textbox", { name: "Message" }), "queued B");
+    await user.click(screen.getByRole("button", { name: "Queue message" }));
+    const submissionB = capturedSubmissionId(onSessionEvent, 1);
+    state = {
+      ...state,
+      queued: {
+        type: "queue_message",
+        text: "queued B",
+        mode: "base",
+        submission_id: submissionB,
+      },
+    };
+    rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
+    await user.click(screen.getByRole("button", { name: "Edit queued follow-up" }));
+    state = transcriptReducer(state, event("turn_completed", { sequence: 2, turn_id: "turn-a" }));
+    state = { ...state, queued: null };
+    rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
+    const composer = await screen.findByRole("textbox", { name: "Message" });
+    await user.clear(composer);
+    await user.type(composer, "direct C");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+    capturedSubmissionId(onSessionEvent, 3);
+
+    state = transcriptReducer(state, event("turn_started", {
+      sequence: 3,
+      turn_id: "turn-b",
+      submission_id: submissionB,
+    }));
+    rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
+    await act(async () => { await Promise.resolve(); });
+    state = transcriptReducer(state, event("turn_failed", { sequence: 4, turn_id: "turn-b" }));
+    rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
+    await act(async () => clear.reject(new Error("late clear rejection")));
+
+    await user.click(await screen.findByRole("button", { name: "Retry" }));
+    expect(onSessionEvent).toHaveBeenLastCalledWith(active.session_id, expect.objectContaining({
+      type: "send_message",
+      text: "queued B",
+      mode: "base",
+    }));
+  });
+
+  it("never binds edited D to a stale B start with B's submission id", async () => {
+    const user = userEvent.setup();
+    const active = session();
+    const client = clientWithSessions([active]);
+    const onSessionEvent = vi.fn();
+    const props = { client, platformAdapter: platformAdapter(), sidebarStorage: storage, draftStorage: storage, onSessionEvent };
+    const { rerender } = render(<App {...props} transcriptBySession={{ [active.session_id]: emptyTranscript() }} />);
+    await user.type(await screen.findByRole("textbox", { name: "Message" }), "turn A");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+    const submissionA = capturedSubmissionId(onSessionEvent, 0);
+    let state = transcriptReducer(emptyTranscript(), event("turn_started", {
+      sequence: 1,
+      turn_id: "turn-a",
+      submission_id: submissionA,
+    }));
+    rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
+    await act(async () => { await Promise.resolve(); });
+    await user.type(screen.getByRole("textbox", { name: "Message" }), "queued B");
+    await user.click(screen.getByRole("button", { name: "Queue message" }));
+    const submissionB = capturedSubmissionId(onSessionEvent, 1);
+    state = {
+      ...state,
+      queued: {
+        type: "queue_message",
+        text: "queued B",
+        mode: "base",
+        submission_id: submissionB,
+      },
+    };
+    rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
+    await user.clear(screen.getByRole("textbox", { name: "Message" }));
+    await user.type(screen.getByRole("textbox", { name: "Message" }), "edited D");
+    await user.click(screen.getByRole("button", { name: "Update queued message" }));
+    capturedSubmissionId(onSessionEvent, 2);
+
+    state = transcriptReducer(state, event("turn_completed", { sequence: 2, turn_id: "turn-a" }));
+    state = transcriptReducer(state, event("turn_started", {
+      sequence: 3,
+      turn_id: "turn-b",
+      submission_id: submissionB,
+    }));
+    rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
+    await act(async () => { await Promise.resolve(); });
+    state = transcriptReducer(state, event("turn_failed", { sequence: 4, turn_id: "turn-b" }));
+    rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
+
+    await user.click(await screen.findByRole("button", { name: "Retry" }));
+    expect(onSessionEvent).toHaveBeenLastCalledWith(active.session_id, expect.objectContaining({
+      type: "send_message",
+      text: "queued B",
+      mode: "base",
+    }));
+  });
+
+  it.each([
+    ["missing", undefined],
+    ["unknown", "submission-never-dispatched"],
+  ])("never guesses retry authority for a %s turn-start submission id", async (_case, submissionId) => {
+    const user = userEvent.setup();
+    const active = session();
+    const client = clientWithSessions([active]);
+    const onSessionEvent = vi.fn();
+    const props = { client, platformAdapter: platformAdapter(), sidebarStorage: storage, draftStorage: storage, onSessionEvent };
+    const { rerender } = render(<App {...props} transcriptBySession={{ [active.session_id]: emptyTranscript() }} />);
+    await user.type(await screen.findByRole("textbox", { name: "Message" }), "must stay unbound");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+    capturedSubmissionId(onSessionEvent, 0);
+    const startedEvent = {
+      ...event("turn_started", { sequence: 1, turn_id: "uncorrelated-turn" }),
+      ...(submissionId === undefined ? {} : { submission_id: submissionId }),
+    };
+    let state = transcriptReducer(emptyTranscript(), startedEvent as never);
+    rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
+    await act(async () => { await Promise.resolve(); });
+    state = transcriptReducer(state, event("turn_failed", { sequence: 2, turn_id: "uncorrelated-turn" }));
+    rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
+
+    expect(await screen.findByRole("alert")).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+  });
+
+  it("retires only a rejected direct attempt so its late start cannot gain retry authority", async () => {
+    const user = userEvent.setup();
+    const active = session();
+    const client = clientWithSessions([active]);
+    const onSessionEvent = vi.fn(() => Promise.reject(new Error("unsafe send detail")));
+    const props = { client, platformAdapter: platformAdapter(), sidebarStorage: storage, draftStorage: storage, onSessionEvent };
+    const { rerender } = render(<App {...props} transcriptBySession={{ [active.session_id]: emptyTranscript() }} />);
+    await user.type(await screen.findByRole("textbox", { name: "Message" }), "rejected direct");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+    const rejectedSubmission = capturedSubmissionId(onSessionEvent, 0);
+    expect(await screen.findByRole("status", { name: "Message status" })).toHaveTextContent(
+      "Message not sent",
+    );
+
+    let state = transcriptReducer(emptyTranscript(), event("turn_started", {
+      sequence: 1,
+      turn_id: "late-rejected-turn",
+      submission_id: rejectedSubmission,
+    }));
+    rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
+    await act(async () => { await Promise.resolve(); });
+    state = transcriptReducer(state, event("turn_failed", {
+      sequence: 2,
+      turn_id: "late-rejected-turn",
+    }));
+    rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
+
+    expect(await screen.findByRole("alert")).not.toHaveTextContent("unsafe send detail");
+    expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
   });
 
   it("replaces a queued retry candidate when the follow-up is edited", async () => {
@@ -717,35 +1034,49 @@ describe("App", () => {
     const { rerender } = render(<App {...props} transcriptBySession={{ [active.session_id]: emptyTranscript() }} />);
     await user.type(await screen.findByRole("textbox", { name: "Message" }), "turn A");
     await user.click(screen.getByRole("button", { name: "Send message" }));
-    let state = transcriptReducer(emptyTranscript(), event("turn_started", { sequence: 1, turn_id: "turn-a" }));
+    const submissionA = capturedSubmissionId(onSessionEvent, 0);
+    let state = transcriptReducer(emptyTranscript(), event("turn_started", {
+      sequence: 1,
+      turn_id: "turn-a",
+      submission_id: submissionA,
+    }));
     rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
     await act(async () => { await Promise.resolve(); });
     await user.type(screen.getByRole("textbox", { name: "Message" }), "queued B");
     await user.click(screen.getByRole("button", { name: "Queue message" }));
-    state = { ...state, queued: { type: "queue_message", text: "queued B", mode: "base" } };
+    const submissionB = capturedSubmissionId(onSessionEvent, 1);
+    state = {
+      ...state,
+      queued: { type: "queue_message", text: "queued B", mode: "base", submission_id: submissionB },
+    };
     rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
     await user.clear(screen.getByRole("textbox", { name: "Message" }));
     await user.type(screen.getByRole("textbox", { name: "Message" }), "edited C");
     await user.click(screen.getByRole("button", { name: "Update queued message" }));
+    const submissionC = capturedSubmissionId(onSessionEvent, 2);
 
     state = transcriptReducer(state, event("turn_completed", { sequence: 2, turn_id: "turn-a" }));
-    state = transcriptReducer(state, event("turn_started", { sequence: 3, turn_id: "turn-c" }));
+    state = transcriptReducer(state, event("turn_started", {
+      sequence: 3,
+      turn_id: "turn-c",
+      submission_id: submissionC,
+    }));
     rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
     await act(async () => { await Promise.resolve(); });
     state = transcriptReducer(state, event("turn_failed", { sequence: 4, turn_id: "turn-c" }));
     rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
 
     await user.click(await screen.findByRole("button", { name: "Retry" }));
-    expect(onSessionEvent).toHaveBeenLastCalledWith(active.session_id, {
+    expect(onSessionEvent).toHaveBeenLastCalledWith(active.session_id, expect.objectContaining({
       type: "send_message",
       text: "edited C",
       mode: "base",
-    });
-    expect(onSessionEvent).not.toHaveBeenLastCalledWith(active.session_id, {
+    }));
+    expect(onSessionEvent).not.toHaveBeenLastCalledWith(active.session_id, expect.objectContaining({
       type: "send_message",
       text: "queued B",
       mode: "base",
-    });
+    }));
   });
 
   it("restores the prior queued retry candidate when an edit is rejected", async () => {
@@ -761,30 +1092,43 @@ describe("App", () => {
     const { rerender } = render(<App {...props} transcriptBySession={{ [active.session_id]: emptyTranscript() }} />);
     await user.type(await screen.findByRole("textbox", { name: "Message" }), "turn A");
     await user.click(screen.getByRole("button", { name: "Send message" }));
-    let state = transcriptReducer(emptyTranscript(), event("turn_started", { sequence: 1, turn_id: "turn-a" }));
+    const submissionA = capturedSubmissionId(onSessionEvent, 0);
+    let state = transcriptReducer(emptyTranscript(), event("turn_started", {
+      sequence: 1,
+      turn_id: "turn-a",
+      submission_id: submissionA,
+    }));
     rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
     await act(async () => { await Promise.resolve(); });
     await user.type(screen.getByRole("textbox", { name: "Message" }), "queued B");
     await user.click(screen.getByRole("button", { name: "Queue message" }));
-    state = { ...state, queued: { type: "queue_message", text: "queued B", mode: "base" } };
+    const submissionB = capturedSubmissionId(onSessionEvent, 1);
+    state = {
+      ...state,
+      queued: { type: "queue_message", text: "queued B", mode: "base", submission_id: submissionB },
+    };
     rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
     await user.clear(screen.getByRole("textbox", { name: "Message" }));
     await user.type(screen.getByRole("textbox", { name: "Message" }), "edited C");
     await user.click(screen.getByRole("button", { name: "Update queued message" }));
 
     state = transcriptReducer(state, event("turn_completed", { sequence: 2, turn_id: "turn-a" }));
-    state = transcriptReducer(state, event("turn_started", { sequence: 3, turn_id: "turn-b" }));
+    state = transcriptReducer(state, event("turn_started", {
+      sequence: 3,
+      turn_id: "turn-b",
+      submission_id: submissionB,
+    }));
     rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
     await act(async () => { await Promise.resolve(); });
     state = transcriptReducer(state, event("turn_failed", { sequence: 4, turn_id: "turn-b" }));
     rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
 
     await user.click(await screen.findByRole("button", { name: "Retry" }));
-    expect(onSessionEvent).toHaveBeenLastCalledWith(active.session_id, {
+    expect(onSessionEvent).toHaveBeenLastCalledWith(active.session_id, expect.objectContaining({
       type: "send_message",
       text: "queued B",
       mode: "base",
-    });
+    }));
     expect(screen.getByRole("alert")).not.toHaveTextContent("unsafe queue update detail");
   });
 
@@ -802,7 +1146,12 @@ describe("App", () => {
     const { rerender } = render(<App {...props} transcriptBySession={{ [active.session_id]: emptyTranscript() }} />);
     await user.type(await screen.findByRole("textbox", { name: "Message" }), "retry me");
     await user.click(screen.getByRole("button", { name: "Send message" }));
-    let state = transcriptReducer(emptyTranscript(), event("turn_started", { sequence: 1, turn_id: "turn-a" }));
+    const submissionA = capturedSubmissionId(onSessionEvent, 0);
+    let state = transcriptReducer(emptyTranscript(), event("turn_started", {
+      sequence: 1,
+      turn_id: "turn-a",
+      submission_id: submissionA,
+    }));
     rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
     await act(async () => { await Promise.resolve(); });
     state = transcriptReducer(state, event("turn_failed", { sequence: 2, turn_id: "turn-a" }));
@@ -814,11 +1163,11 @@ describe("App", () => {
     expect(screen.getByRole("alert")).not.toHaveTextContent("secret-retry-detail");
     await user.click(screen.getByRole("button", { name: "Retry" }));
     expect(sends).toBe(3);
-    expect(onSessionEvent).toHaveBeenLastCalledWith(active.session_id, {
+    expect(onSessionEvent).toHaveBeenLastCalledWith(active.session_id, expect.objectContaining({
       type: "send_message",
       text: "retry me",
       mode: "base",
-    });
+    }));
   });
 
   it("does not offer a retained turn retry after the client or generation authority is replaced", async () => {
@@ -841,10 +1190,16 @@ describe("App", () => {
     );
     await user.type(await screen.findByRole("textbox", { name: "Message" }), "stale submission");
     await user.click(screen.getByRole("button", { name: "Send message" }));
+    const submission = capturedSubmissionId(onSessionEvent, 0);
 
     const generationOne = transcriptReducer(
       emptyTranscript(),
-      event("turn_started", { generation: 1, sequence: 1, turn_id: "generation-one" }),
+      event("turn_started", {
+        generation: 1,
+        sequence: 1,
+        turn_id: "generation-one",
+        submission_id: submission,
+      }),
     );
     rerender(
       <App
@@ -904,9 +1259,10 @@ describe("App", () => {
     );
     await user.type(await screen.findByRole("textbox", { name: "Message" }), "dispatcher-bound");
     await user.click(screen.getByRole("button", { name: "Send message" }));
+    const submission = capturedSubmissionId(firstDispatcher, 0);
     const started = transcriptReducer(
       emptyTranscript(),
-      event("turn_started", { sequence: 1, turn_id: "turn-a" }),
+      event("turn_started", { sequence: 1, turn_id: "turn-a", submission_id: submission }),
     );
     rerender(
       <App
@@ -953,9 +1309,10 @@ describe("App", () => {
     );
     await user.type(await screen.findByRole("textbox", { name: "Message" }), "accepted then replaced");
     await user.click(screen.getByRole("button", { name: "Send message" }));
+    const submission = capturedSubmissionId(firstDispatcher, 0);
     let state = transcriptReducer(
       emptyTranscript(),
-      event("turn_started", { sequence: 1, turn_id: "turn-a" }),
+      event("turn_started", { sequence: 1, turn_id: "turn-a", submission_id: submission }),
     );
     rerender(
       <App {...baseProps} client={firstClient} onSessionEvent={firstDispatcher} transcriptBySession={{ [active.session_id]: state }} />,
@@ -967,8 +1324,13 @@ describe("App", () => {
     );
     await user.click(await screen.findByRole("button", { name: "Retry" }));
     expect(firstDispatcher).toHaveBeenCalledTimes(2);
+    const retrySubmission = capturedSubmissionId(firstDispatcher, 1);
 
-    state = transcriptReducer(state, event("turn_started", { sequence: 3, turn_id: "turn-b" }));
+    state = transcriptReducer(state, event("turn_started", {
+      sequence: 3,
+      turn_id: "turn-b",
+      submission_id: retrySubmission,
+    }));
     rerender(
       <App
         {...baseProps}
@@ -1004,9 +1366,10 @@ describe("App", () => {
     );
     await user.type(await screen.findByRole("textbox", { name: "Message" }), "turn-bound");
     await user.click(screen.getByRole("button", { name: "Send message" }));
+    const submission = capturedSubmissionId(onSessionEvent, 0);
     const started = transcriptReducer(
       emptyTranscript(),
-      event("turn_started", { sequence: 1, turn_id: "turn-a" }),
+      event("turn_started", { sequence: 1, turn_id: "turn-a", submission_id: submission }),
     );
     rerender(<App {...props} transcriptBySession={{ [active.session_id]: started }} />);
     await act(async () => { await Promise.resolve(); });
@@ -1529,11 +1892,11 @@ describe("App", () => {
     await user.type(textbox, "routed message");
     await user.keyboard("{Meta>}{Enter}{/Meta}");
 
-    expect(onSessionEvent).toHaveBeenCalledWith("session-a", {
+    expect(onSessionEvent).toHaveBeenCalledWith("session-a", expect.objectContaining({
       type: "send_message",
       text: "routed message",
       mode: "base",
-    });
+    }));
     await waitFor(() => expect(textbox).toHaveValue(""));
     await user.type(textbox, "draft survives search");
     await act(async () => {
@@ -1933,11 +2296,11 @@ describe("App", () => {
       "Message not sent",
     );
     await user.click(screen.getByRole("button", { name: "Retry message" }));
-    expect(onSessionEvent).toHaveBeenLastCalledWith(sessionA.session_id, {
+    expect(onSessionEvent).toHaveBeenLastCalledWith(sessionA.session_id, expect.objectContaining({
       type: "send_message",
       text: "exact A plan",
       mode: "plan",
-    });
+    }));
     expect(deliveryAttempts).toBe(2);
   });
 

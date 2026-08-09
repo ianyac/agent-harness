@@ -5,11 +5,13 @@ export type JsonObject = { [key: string]: JsonValue };
 export type TurnMode = "base" | "plan";
 export type BaseMode = "default" | "acceptAll" | "readOnly";
 export type PermissionDecision = "yes" | "no" | "always";
+export type SubmissionId = string;
 
 export type UserMessage = {
   type: "send_message";
   text: string;
   mode: TurnMode;
+  submission_id?: SubmissionId;
 };
 
 export type SendMessage = UserMessage;
@@ -18,6 +20,7 @@ export type QueuedMessage = {
   type: "queue_message";
   text: string;
   mode: TurnMode;
+  submission_id?: SubmissionId | null;
 };
 
 export type CancelTurn = {
@@ -78,6 +81,7 @@ export type TurnStarted = EventEnvelope & {
   type: "turn_started";
   turn_id: string;
   mode: TurnMode;
+  submission_id?: SubmissionId | null;
 };
 
 export type AssistantDelta = EventEnvelope & {
@@ -245,6 +249,7 @@ export type TranscriptActiveTurn = {
   generation: number;
   sequence: number;
   turnId: string;
+  submissionId: SubmissionId | null;
 };
 
 export type TranscriptBoundary =

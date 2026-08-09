@@ -39,6 +39,13 @@ const isNonNegativeInteger: Validator = (value): value is number =>
 const isIdentifier: Validator = (value): value is string =>
   isString(value) && (value as string).trim().length > 0;
 const isNullableIdentifier: Validator = (value) => value === null || isIdentifier(value);
+const submissionIdPattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const isSubmissionId: Validator = (value): value is string => (
+  isString(value)
+  && (value as string).length <= 128
+  && submissionIdPattern.test(value as string)
+);
+const isNullableSubmissionId: Validator = (value) => value === null || isSubmissionId(value);
 const isTurnMode: Validator = (value) => value === "base" || value === "plan";
 const isPermissionDecision: Validator = (value) =>
   value === "yes" || value === "no" || value === "always";
@@ -84,10 +91,12 @@ const isMessageList: Validator = (value) =>
   Array.isArray(value) && value.every((message) => isJsonObject(message));
 
 function isQueuedMessage(value: unknown): value is QueuedMessage {
-  return matchesShape(value, {
+  return matchesShapeWithOptional(value, {
     type: (item) => item === "queue_message",
     text: (item) => isString(item) && (item as string).trim().length > 0,
     mode: isTurnMode,
+  }, {
+    submission_id: isNullableSubmissionId,
   });
 }
 
@@ -99,6 +108,24 @@ function matchesShape(value: unknown, shape: Record<string, Validator>): boolean
   const actual = Object.keys(value);
   if (actual.length !== expected.length || actual.some((key) => !(key in shape))) return false;
   return expected.every((key) => Object.prototype.hasOwnProperty.call(value, key) && shape[key](value[key]));
+}
+
+function matchesShapeWithOptional(
+  value: unknown,
+  shape: Record<string, Validator>,
+  optionalShape: Record<string, Validator>,
+): boolean {
+  if (!isPlainObject(value)) return false;
+  const required = Object.keys(shape);
+  const allowed = new Set([...required, ...Object.keys(optionalShape)]);
+  const actual = Object.keys(value);
+  if (actual.some((key) => !allowed.has(key))) return false;
+  if (!required.every((key) => Object.prototype.hasOwnProperty.call(value, key) && shape[key](value[key]))) {
+    return false;
+  }
+  return Object.entries(optionalShape).every(
+    ([key, validate]) => !Object.prototype.hasOwnProperty.call(value, key) || validate(value[key]),
+  );
 }
 
 const envelopeShape = {
@@ -233,7 +260,12 @@ export function parseServerEvent(input: unknown): ParseResult<ServerEvent> {
       return { ok: false, error: "Invalid server event envelope" };
     }
     const shape = shapes[input.type as ServerEvent["type"]];
-    if (shape === undefined || !matchesShape(input, shape)) {
+    const valid = input.type === "turn_started"
+      ? shape !== undefined && matchesShapeWithOptional(input, shape, {
+        submission_id: isNullableSubmissionId,
+      })
+      : shape !== undefined && matchesShape(input, shape);
+    if (!valid) {
       return { ok: false, error: "Invalid server event payload" };
     }
     return { ok: true, value: input as ServerEvent };

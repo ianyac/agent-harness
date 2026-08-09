@@ -13,11 +13,13 @@ describe("transcriptReducer", () => {
       generation: 1,
       sequence: 4,
       turn_id: "turn-current",
+      submission_id: "submission-current",
     }));
     expect(state.activeTurn).toEqual({
       generation: 1,
       sequence: 4,
       turnId: "turn-current",
+      submissionId: "submission-current",
     });
 
     state = transcriptReducer(state, event("turn_failed", {

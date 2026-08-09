@@ -270,7 +270,12 @@ class _SessionChannel:
         if isinstance(event, UserMessage):
             if self.running:
                 raise ClientStateViolation("a turn is already running")
-            self._start_turn(event.text, event.mode, connection.generation)
+            self._start_turn(
+                event.text,
+                event.mode,
+                connection.generation,
+                event.submission_id,
+            )
         elif isinstance(event, QueuedMessage):
             if not self.running:
                 raise ClientStateViolation("a follow-up requires a running turn")
@@ -317,6 +322,7 @@ class _SessionChannel:
         text: str,
         mode: str,
         owner_generation: int | None,
+        submission_id: str | None,
     ) -> None:
         if (
             self.running
@@ -336,7 +342,7 @@ class _SessionChannel:
         self.token = token
         self.runner = runner
         self.worker = asyncio.create_task(
-            self._run_turn(runner, text, mode, turn_id, token),
+            self._run_turn(runner, text, mode, turn_id, token, submission_id),
             name=f"session-turn-{self.session_id}-{turn_id}",
         )
 
@@ -347,6 +353,7 @@ class _SessionChannel:
         mode: str,
         turn_id: str,
         token: CancellationToken,
+        submission_id: str | None,
     ) -> None:
         try:
             await asyncio.to_thread(
@@ -356,6 +363,7 @@ class _SessionChannel:
                 turn_id,
                 self.relay,
                 token,
+                submission_id,
             )
         finally:
             durability_failed = getattr(
@@ -380,7 +388,12 @@ class _SessionChannel:
             self.queued_message = None
             if queued is not None and not self.shutting_down:
                 owner = self.current.generation if self.current is not None else None
-                self._start_turn(queued.text, queued.mode, owner)
+                self._start_turn(
+                    queued.text,
+                    queued.mode,
+                    owner,
+                    queued.submission_id,
+                )
 
     def begin_shutdown(self) -> None:
         if self.lifecycle == "active":

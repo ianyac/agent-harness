@@ -229,7 +229,14 @@ def test_websocket_sends_snapshot_before_turn_events(service):
             assert snapshot["running"] is False
             assert snapshot["queued_message"] is None
 
-            ws.send_json({"type": "send_message", "text": "hello", "mode": "base"})
+            ws.send_json(
+                {
+                    "type": "send_message",
+                    "text": "hello",
+                    "mode": "base",
+                    "submission_id": "submission-A",
+                }
+            )
             started = ws.receive_json()
             delta = ws.receive_json()
             done = ws.receive_json()
@@ -239,6 +246,7 @@ def test_websocket_sends_snapshot_before_turn_events(service):
                 "assistant_delta",
                 "turn_completed",
             ]
+            assert started["submission_id"] == "submission-A"
             assert [started["sequence"], delta["sequence"], done["sequence"]] == [
                 2,
                 3,
@@ -612,13 +620,34 @@ def test_queue_replacement_launches_only_the_latest_follow_up(service):
     with service(llm) as (client, session_id, _, app):
         with connect(client, session_id) as ws:
             ws.receive_json()
-            ws.send_json({"type": "send_message", "text": "first", "mode": "base"})
-            assert ws.receive_json()["type"] == "turn_started"
+            ws.send_json(
+                {
+                    "type": "send_message",
+                    "text": "first",
+                    "mode": "base",
+                    "submission_id": "submission-A",
+                }
+            )
+            first_started = ws.receive_json()
+            assert first_started["type"] == "turn_started"
+            assert first_started["submission_id"] == "submission-A"
             assert ws.receive_json()["type"] == "assistant_delta"
 
-            ws.send_json({"type": "queue_message", "text": "old", "mode": "base"})
             ws.send_json(
-                {"type": "queue_message", "text": "latest", "mode": "plan"}
+                {
+                    "type": "queue_message",
+                    "text": "old",
+                    "mode": "base",
+                    "submission_id": "submission-B",
+                }
+            )
+            ws.send_json(
+                {
+                    "type": "queue_message",
+                    "text": "latest",
+                    "mode": "plan",
+                    "submission_id": "submission-D",
+                }
             )
             channel = app.state.session_manager._channels[session_id]
             for _ in range(1000):
@@ -633,18 +662,29 @@ def test_queue_replacement_launches_only_the_latest_follow_up(service):
             assert channel.queued_message is not None
             assert channel.queued_message.text == "latest"
             assert channel.queued_message.mode == "plan"
-            llm.release.set()
+            assert channel.queued_message.submission_id == "submission-D"
+            with connect(client, session_id) as healed:
+                snapshot = healed.receive_json()
+                assert snapshot["running"] is True
+                assert snapshot["queued_message"] == {
+                    "type": "queue_message",
+                    "text": "latest",
+                    "mode": "plan",
+                    "submission_id": "submission-D",
+                }
+                llm.release.set()
 
-            _, first_done = receive_until(ws, "turn_completed")
-            assert first_done["messages"][-1]["content"] == "first done"
-            second_started = ws.receive_json()
-            assert second_started["type"] == "turn_started"
-            assert second_started["mode"] == "plan"
-            _, second_done = receive_until(ws, "turn_completed")
-            assert second_done["messages"][-2:] == [
-                {"role": "user", "content": "latest"},
-                {"role": "assistant", "content": "second done"},
-            ]
+                _, first_done = receive_until(healed, "turn_completed")
+                assert first_done["messages"][-1]["content"] == "first done"
+                second_started = healed.receive_json()
+                assert second_started["type"] == "turn_started"
+                assert second_started["mode"] == "plan"
+                assert second_started["submission_id"] == "submission-D"
+                _, second_done = receive_until(healed, "turn_completed")
+                assert second_done["messages"][-2:] == [
+                    {"role": "user", "content": "latest"},
+                    {"role": "assistant", "content": "second done"},
+                ]
 
 
 def test_clear_queued_message_prevents_follow_up_and_snapshot_heals_queue(service):

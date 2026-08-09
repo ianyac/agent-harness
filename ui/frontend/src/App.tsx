@@ -29,16 +29,11 @@ import type { ClientEvent, SendMessage, TranscriptState, TranscriptTerminal } fr
 const emptyTranscriptState = emptyTranscript();
 
 type SubmissionCandidate = {
+  readonly submissionId: string;
   readonly client: ApiClient;
   readonly dispatcher: AppProps["onSessionEvent"];
   readonly generation: number;
   readonly event: SendMessage;
-};
-
-type PendingSubmissions = {
-  readonly direct?: SubmissionCandidate;
-  readonly queued?: SubmissionCandidate;
-  readonly clearing?: SubmissionCandidate;
 };
 
 type BoundSubmission = SubmissionCandidate & {
@@ -62,6 +57,10 @@ type BootstrapLifecycle = {
 
 function terminalKey(sessionId: string, terminal: TranscriptTerminal): string {
   return `${sessionId}:${terminal.generation}:${terminal.sequence}:${terminal.turnId}`;
+}
+
+function newSubmissionId(): string {
+  return globalThis.crypto.randomUUID();
 }
 
 type AppProps = {
@@ -118,7 +117,8 @@ export function App({
   );
   const [, setRetryRevision] = useState(0);
   const composerDraftMemory = useRef(new Map<string, string>());
-  const pendingSubmissionRef = useRef(new Map<string, PendingSubmissions>());
+  const pendingSubmissionRef = useRef(new Map<string, Map<string, SubmissionCandidate>>());
+  const queuedSubmissionRef = useRef(new Map<string, string>());
   const boundSubmissionRef = useRef(new Map<string, BoundSubmission>());
   const observedTurnRef = useRef(new Map<string, string>());
   const submissionOwnerRef = useRef<{ readonly client: ApiClient | null; readonly dispatcher: AppProps["onSessionEvent"] } | null>(null);
@@ -204,36 +204,25 @@ export function App({
   const retireCandidate = (sessionId: string, candidate: SubmissionCandidate) => {
     const pending = pendingSubmissionRef.current.get(sessionId);
     if (pending === undefined) return false;
-    const retired = pending.direct === candidate
-      || pending.queued === candidate
-      || pending.clearing === candidate;
-    if (!retired) return false;
-    const next = {
-      direct: pending.direct === candidate ? undefined : pending.direct,
-      queued: pending.queued === candidate ? undefined : pending.queued,
-      clearing: pending.clearing === candidate ? undefined : pending.clearing,
-    };
-    if (
-      next.direct === undefined
-      && next.queued === undefined
-      && next.clearing === undefined
-    ) {
-      pendingSubmissionRef.current.delete(sessionId);
-    } else {
-      pendingSubmissionRef.current.set(sessionId, next);
-    }
+    if (pending.get(candidate.submissionId) !== candidate) return false;
+    pending.delete(candidate.submissionId);
+    if (pending.size === 0) pendingSubmissionRef.current.delete(sessionId);
     return true;
   };
   const routeSessionEvent = (sessionId: string, clientEvent: ClientEvent) => {
     let candidate: SubmissionCandidate | undefined;
-    let previousQueued: SubmissionCandidate | undefined;
-    let clearingCandidate: SubmissionCandidate | undefined;
+    let previousQueuedId: string | undefined;
+    let clearingCandidateId: string | undefined;
+    let outboundEvent = clientEvent;
     if (
       (clientEvent.type === "send_message" || clientEvent.type === "queue_message")
       && connection.client !== null
     ) {
       const transcript = transcriptBySession[sessionId] ?? emptyTranscriptState;
+      const submissionId = newSubmissionId();
+      outboundEvent = { ...clientEvent, submission_id: submissionId };
       candidate = {
+        submissionId,
         client: connection.client,
         dispatcher: onSessionEvent,
         generation: transcript.generation,
@@ -241,42 +230,42 @@ export function App({
           type: "send_message",
           text: clientEvent.text,
           mode: clientEvent.mode,
+          submission_id: submissionId,
         },
       };
-      const pending = pendingSubmissionRef.current.get(sessionId) ?? {};
-      if (clientEvent.type === "queue_message") previousQueued = pending.queued;
-      pendingSubmissionRef.current.set(sessionId, clientEvent.type === "send_message"
-        ? { ...pending, direct: candidate, clearing: undefined }
-        : { ...pending, queued: candidate, clearing: undefined });
-    } else if (clientEvent.type === "clear_queued_message") {
-      const pending = pendingSubmissionRef.current.get(sessionId);
-      clearingCandidate = pending?.queued;
-      if (clearingCandidate !== undefined) {
-        pendingSubmissionRef.current.set(sessionId, {
-          direct: pending?.direct,
-          clearing: clearingCandidate,
-        });
+      const pending = pendingSubmissionRef.current.get(sessionId) ?? new Map();
+      pending.set(submissionId, candidate);
+      pendingSubmissionRef.current.set(sessionId, pending);
+      if (clientEvent.type === "queue_message") {
+        previousQueuedId = queuedSubmissionRef.current.get(sessionId);
+        queuedSubmissionRef.current.set(sessionId, submissionId);
       }
+    } else if (clientEvent.type === "clear_queued_message") {
+      clearingCandidateId = queuedSubmissionRef.current.get(sessionId);
+      if (clearingCandidateId !== undefined) queuedSubmissionRef.current.delete(sessionId);
     }
     const rollbackCandidate = () => {
       if (candidate !== undefined) {
-        if (retireCandidate(sessionId, candidate) && previousQueued !== undefined) {
-          const pending = pendingSubmissionRef.current.get(sessionId) ?? {};
-          pendingSubmissionRef.current.set(sessionId, { ...pending, queued: previousQueued });
+        if (
+          retireCandidate(sessionId, candidate)
+          && queuedSubmissionRef.current.get(sessionId) === candidate.submissionId
+        ) {
+          if (previousQueuedId === undefined) queuedSubmissionRef.current.delete(sessionId);
+          else queuedSubmissionRef.current.set(sessionId, previousQueuedId);
         }
         return;
       }
-      if (clearingCandidate === undefined) return;
+      if (clearingCandidateId === undefined) return;
       const pending = pendingSubmissionRef.current.get(sessionId);
-      if (pending?.clearing !== clearingCandidate) return;
-      pendingSubmissionRef.current.set(sessionId, {
-        direct: pending.direct,
-        queued: clearingCandidate,
-      });
+      if (
+        queuedSubmissionRef.current.has(sessionId)
+        || pending?.has(clearingCandidateId) !== true
+      ) return;
+      queuedSubmissionRef.current.set(sessionId, clearingCandidateId);
     };
     try {
-      const result = onSessionEvent(sessionId, clientEvent);
-      if (candidate === undefined && clearingCandidate === undefined) return result;
+      const result = onSessionEvent(sessionId, outboundEvent);
+      if (candidate === undefined && clearingCandidateId === undefined) return result;
       return Promise.resolve(result).catch((error: unknown) => {
         rollbackCandidate();
         throw error;
@@ -290,24 +279,40 @@ export function App({
     const owner = submissionOwnerRef.current;
     if (owner?.client !== connection.client || owner.dispatcher !== onSessionEvent) {
       pendingSubmissionRef.current.clear();
+      queuedSubmissionRef.current.clear();
       boundSubmissionRef.current.clear();
       observedTurnRef.current.clear();
       submissionOwnerRef.current = { client: connection.client, dispatcher: onSessionEvent };
     }
     for (const [sessionId, transcript] of Object.entries(transcriptBySession)) {
+      const pendingForGeneration = pendingSubmissionRef.current.get(sessionId);
+      if (
+        pendingForGeneration !== undefined
+        && [...pendingForGeneration.values()].some(
+          (candidate) => candidate.generation !== transcript.generation,
+        )
+      ) {
+        pendingSubmissionRef.current.delete(sessionId);
+        queuedSubmissionRef.current.delete(sessionId);
+        boundSubmissionRef.current.delete(sessionId);
+        observedTurnRef.current.delete(sessionId);
+      }
       const bound = boundSubmissionRef.current.get(sessionId);
       if (bound !== undefined && bound.generation !== transcript.generation) {
         boundSubmissionRef.current.delete(sessionId);
         pendingSubmissionRef.current.delete(sessionId);
+        queuedSubmissionRef.current.delete(sessionId);
         observedTurnRef.current.delete(sessionId);
       }
       const activeTurn = transcript.activeTurn;
       if (activeTurn === null) continue;
-      const identity = `${activeTurn.generation}:${activeTurn.sequence}:${activeTurn.turnId}`;
+      const identity = `${activeTurn.generation}:${activeTurn.sequence}:${activeTurn.turnId}:${activeTurn.submissionId ?? "legacy"}`;
       if (observedTurnRef.current.get(sessionId) === identity) continue;
       observedTurnRef.current.set(sessionId, identity);
       const pending = pendingSubmissionRef.current.get(sessionId);
-      const candidate = pending?.direct ?? pending?.queued ?? pending?.clearing;
+      const candidate = activeTurn.submissionId === null
+        ? undefined
+        : pending?.get(activeTurn.submissionId);
       if (
         candidate === undefined
         || candidate.client !== connection.client
@@ -318,14 +323,8 @@ export function App({
         continue;
       }
       boundSubmissionRef.current.set(sessionId, { ...candidate, turnId: activeTurn.turnId });
-      if (pending?.direct === candidate) {
-        if (pending.queued === undefined) pendingSubmissionRef.current.delete(sessionId);
-        else pendingSubmissionRef.current.set(sessionId, { queued: pending.queued });
-      } else if (pending?.queued === candidate) {
-        pendingSubmissionRef.current.delete(sessionId);
-      } else if (pending?.clearing === candidate) {
-        pendingSubmissionRef.current.delete(sessionId);
-      }
+      pendingSubmissionRef.current.delete(sessionId);
+      queuedSubmissionRef.current.delete(sessionId);
     }
   }, [connection.client, onSessionEvent, transcriptBySession]);
   const retryAuthority = (() => {
@@ -373,21 +372,24 @@ export function App({
       || retained.turnId !== authority.terminal.turnId
       || retrySubmittedRef.current.has(authority.key)
     ) return;
+    const submissionId = newSubmissionId();
+    const retryEvent: SendMessage = {
+      ...authority.event,
+      submission_id: submissionId,
+    };
     const candidate: SubmissionCandidate = {
+      submissionId,
       client: authority.client,
       dispatcher: authority.dispatcher,
       generation: authority.terminal.generation,
-      event: authority.event,
+      event: retryEvent,
     };
-    const pending = pendingSubmissionRef.current.get(authority.sessionId) ?? {};
-    pendingSubmissionRef.current.set(authority.sessionId, {
-      ...pending,
-      direct: candidate,
-      clearing: undefined,
-    });
+    const pending = pendingSubmissionRef.current.get(authority.sessionId) ?? new Map();
+    pending.set(submissionId, candidate);
+    pendingSubmissionRef.current.set(authority.sessionId, pending);
     retrySubmittedRef.current.add(authority.key);
     try {
-      await authority.dispatcher?.(authority.sessionId, authority.event);
+      await authority.dispatcher?.(authority.sessionId, retryEvent);
       setRetryRevision((revision) => revision + 1);
     } catch (error) {
       retireCandidate(authority.sessionId, candidate);

@@ -108,6 +108,43 @@ const completeEvents = [
 ] as const;
 
 describe("parseServerEvent", () => {
+  it("accepts bounded nullable submission correlation on turn starts and queued snapshots", () => {
+    const started = {
+      ...completeEvents[1],
+      submission_id: "submission-A_123",
+    };
+    const queued = {
+      ...completeEvents[0],
+      queued_message: {
+        type: "queue_message",
+        text: "later",
+        mode: "plan",
+        submission_id: "submission-B_456",
+      },
+    };
+
+    expect(parseServerEvent(started)).toEqual({ ok: true, value: started });
+    expect(parseServerEvent({ ...started, submission_id: null })).toEqual({
+      ok: true,
+      value: { ...started, submission_id: null },
+    });
+    expect(parseServerEvent(queued)).toEqual({ ok: true, value: queued });
+    expect(parseServerEvent(completeEvents[1])).toEqual({
+      ok: true,
+      value: completeEvents[1],
+    });
+  });
+
+  it.each(["", "has spaces", "x".repeat(129), "bad\ud800id"])(
+    "rejects malformed or overlong submission correlation %p",
+    (submissionId) => {
+      expect(parseServerEvent({
+        ...completeEvents[1],
+        submission_id: submissionId,
+      }).ok).toBe(false);
+    },
+  );
+
   it("accepts and preserves every server event discriminant and field", () => {
     for (const input of completeEvents) {
       expect(parseServerEvent(input)).toEqual({ ok: true, value: input });

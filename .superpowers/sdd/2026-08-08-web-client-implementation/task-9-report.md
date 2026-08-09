@@ -247,3 +247,72 @@ authorized for this round and supersedes the original frontend-only scope note.
 - `git diff --check`: passed.
 - No browser, Playwright, Tauri host, deployment, Task 10, controller-ledger, or
   deferred-Minor work was performed.
+
+## Fix round 4/5 — exact submission correlation
+
+The remaining fix-round-3 queue-authority race is closed with one opaque,
+bounded correlation id assigned by App to every accepted direct, queue/edit,
+and failed-turn Retry dispatch. The service preserves a queued id through the
+automatic follow-up launch and echoes it on the authoritative `turn_started`;
+App binds retry authority only by exact echoed id.
+
+### RED checkpoints
+
+1. Wire parsing and reducer retention
+
+   `npm test -- --run src/protocol/parse.test.ts src/protocol/reducer.test.ts`
+
+   Initial result: 2 failed and 54 passed. The strict parser rejected the new
+   field and the reducer discarded it.
+
+   `uv run pytest tests/test_protocol.py -q`
+
+   Initial result: 1 failed and 27 passed. Strict Pydantic client/server models
+   rejected `submission_id` as an extra field.
+
+2. Direct, queued, and reconnect snapshot propagation
+
+   Focused websocket tests initially both failed with close code 1008 because
+   the new client field was invalid. They now prove a direct id is echoed, a
+   replacement queue retains only D's id, a reconnect snapshot contains D's
+   id, and the automatic D turn echoes that same id.
+
+3. Exact App authority
+
+   Focused App runs initially failed every adversarial ordering: a queued B
+   failure replayed later direct C, missing and unknown ids were guessed, Retry
+   had no fresh id, and a stale B start was bound to edited D. Those tests were
+   kept as behavior tests and the older recovery fixtures were migrated to
+   echo their actual dispatched ids.
+
+### Implemented contracts
+
+- `submission_id` is 1–128 ASCII characters in the shared
+  `[A-Za-z0-9._-]` alphabet, starts alphanumeric, is opaque, and carries no
+  prompt or credential data. Missing or null server values remain parseable for
+  compatibility but never gain Retry authority.
+- App allocates a fresh id before each direct, queue/edit, or Retry dispatch.
+  Pending candidates are keyed by exact id; queue rollback tracks only the
+  current queue pointer, so an older B remains available if B wins a clear race
+  while later C or Retry is also in flight.
+- A correlated `turn_started` binds only its matching candidate and retires the
+  other pending candidates. Unknown, malformed, missing, rejected, replaced,
+  wrong-generation, wrong-client, and wrong-dispatcher attempts cannot bind.
+- Queue edits and clear rejection restore only their exact prior queue pointer.
+  Direct, queue, and Retry rejection retire only the rejected attempt. Accepted
+  Retry stages a new correlated candidate, preserving repeated-failure support
+  and duplicate-click suppression.
+- The server protocol, session channel, queued snapshot, TurnRunner, and
+  `turn_started` event preserve the id without interpreting it. Legacy clients
+  receive an explicit null echo and remain supported.
+
+### Final verification after fix round 4
+
+- App recovery/integration suite: 49 tests passed.
+- Full frontend: 25 files, 310 tests passed.
+- Full UI server: 394 tests passed.
+- `npm run typecheck`: passed with no diagnostics.
+- `npm run build`: passed; main application `394.99 kB`, markdown vendor
+  `165.72 kB`.
+- `git diff --check`: passed.
+- No browser or Playwright run was used, as required.

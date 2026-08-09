@@ -199,11 +199,12 @@ class TurnRunner:
         turn_id: str,
         sink: EventSink,
         token: CancellationToken,
+        submission_id: str | None = None,
     ) -> None:
         if mode not in ("base", "plan"):
             raise ValueError(f"invalid turn mode: {mode!r}")
         with self._turn_lock:
-            self._run_locked(text, mode, turn_id, sink, token)
+            self._run_locked(text, mode, turn_id, sink, token, submission_id)
 
     def _run_locked(
         self,
@@ -212,6 +213,7 @@ class TurnRunner:
         turn_id: str,
         sink: EventSink,
         token: CancellationToken,
+        submission_id: str | None,
     ) -> None:
         runtime = self.runtime
         context: _TurnContext | None = None
@@ -230,7 +232,12 @@ class TurnRunner:
             turn_context = _current_turn.set(context)
             activity_context = _current_activity.set(None)
             runtime.bind_plan_reviewer(self._review_plan)
-            sink.emit("turn_started", turn_id=turn_id, mode=mode)
+            sink.emit(
+                "turn_started",
+                turn_id=turn_id,
+                mode=mode,
+                submission_id=submission_id,
+            )
             reply = run_turn(
                 runtime.messages,
                 text,

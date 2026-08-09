@@ -1,7 +1,9 @@
 import { cleanup, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
+import "../../styles/tokens.css";
+import "../../styles/global.css";
 import type { HarnessMessage, TranscriptState } from "../../protocol/types";
 import { Conversation } from "./Conversation";
 
@@ -15,6 +17,7 @@ function state(messages: HarnessMessage[]): TranscriptState {
     streamingText: "",
     activities: {},
     activityOrder: [],
+    timeline: [],
     permission: null,
     planReview: null,
     running: false,
@@ -98,5 +101,70 @@ describe("Conversation search", () => {
     await user.keyboard("{Escape}");
     expect(screen.queryByRole("search", { name: "Conversation search" })).not.toBeInTheDocument();
     expect(screen.getByRole("article", { name: "User message" })).toHaveFocus();
+  });
+
+  it("scrolls each active match into view while keeping the search input focused", async () => {
+    const user = userEvent.setup();
+    render(
+      <Conversation
+        state={state([
+          { role: "user", content: "First needle" },
+          { role: "assistant", content: "Second needle" },
+        ])}
+        openInspector={() => {}}
+      />,
+    );
+    const userMessage = screen.getByRole("article", { name: "User message" });
+    const assistantMessage = screen.getByRole("article", { name: "Assistant message" });
+    const scrollUser = vi.fn();
+    const scrollAssistant = vi.fn();
+    userMessage.scrollIntoView = scrollUser;
+    assistantMessage.scrollIntoView = scrollAssistant;
+
+    await user.keyboard("{Meta>}f{/Meta}");
+    const search = screen.getByRole("searchbox", { name: "Search conversation" });
+    await user.type(search, "needle");
+    expect(scrollUser).toHaveBeenLastCalledWith({ block: "center", behavior: "auto" });
+    expect(search).toHaveFocus();
+
+    await user.click(screen.getByRole("button", { name: "Next match" }));
+    expect(scrollAssistant).toHaveBeenLastCalledWith({ block: "center", behavior: "auto" });
+    expect(search).toHaveFocus();
+    await user.click(screen.getByRole("button", { name: "Previous match" }));
+    expect(scrollUser).toHaveBeenCalledTimes(2);
+    expect(search).toHaveFocus();
+  });
+
+  it("counts the literal query including leading and trailing spaces", async () => {
+    const user = userEvent.setup();
+    render(
+      <Conversation
+        state={state([
+          { role: "user", content: "Keep-alpha-without padding." },
+          { role: "assistant", content: "Only this has one exact  alpha  occurrence." },
+        ])}
+        openInspector={() => {}}
+      />,
+    );
+
+    await user.keyboard("{Meta>}f{/Meta}");
+    await user.type(screen.getByRole("searchbox", { name: "Search conversation" }), " alpha ");
+
+    expect(screen.getByRole("status", { name: "Search result position" })).toHaveTextContent("1 of 1");
+  });
+
+  it("keeps a visible focus ring on the keyboard-focused search box", async () => {
+    const user = userEvent.setup();
+    render(
+      <Conversation
+        state={state([{ role: "assistant", content: "Searchable" }])}
+        openInspector={() => {}}
+      />,
+    );
+
+    await user.keyboard("{Meta>}f{/Meta}");
+    const search = screen.getByRole("searchbox", { name: "Search conversation" });
+    expect(search).toHaveFocus();
+    expect(getComputedStyle(search).outlineStyle).toBe("solid");
   });
 });

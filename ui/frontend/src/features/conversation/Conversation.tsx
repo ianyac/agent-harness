@@ -3,7 +3,12 @@ import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "re
 
 import { ActivityCard } from "../activity/ActivityCard";
 import { groupActivities } from "../activity/groupActivities";
-import type { TranscriptState } from "../../protocol/types";
+import type {
+  ActivityGroup,
+  GroupedTimelineItem,
+  TimelineMarker,
+} from "../activity/groupActivities";
+import type { ActivityItem, TranscriptState } from "../../protocol/types";
 import type { CopyText } from "./CodeBlock";
 import { ConversationSearch } from "./ConversationSearch";
 import type { SearchableMessage } from "./ConversationSearch";
@@ -22,6 +27,10 @@ function isNearBottom(element: HTMLElement): boolean {
   return element.scrollHeight - element.clientHeight - element.scrollTop <= NEAR_BOTTOM_PX;
 }
 
+function isActivityGroup(item: GroupedTimelineItem): item is ActivityGroup {
+  return Array.isArray(item);
+}
+
 export function Conversation({ state, openInspector, copyText }: ConversationProps) {
   const instanceId = useId().replaceAll(":", "");
   const scrollerRef = useRef<HTMLDivElement>(null);
@@ -32,19 +41,48 @@ export function Conversation({ state, openInspector, copyText }: ConversationPro
   const [searchOpen, setSearchOpen] = useState(false);
   const [announcement, setAnnouncement] = useState("");
   const visibleMessages = useMemo(
-    () => state.messages.map(visibleMessage).filter((message) => message !== null),
+    () => state.messages.flatMap((message, messageIndex) => {
+      const visible = visibleMessage(message);
+      return visible === null ? [] : [{ ...visible, messageIndex }];
+    }),
     [state.messages],
+  );
+  const reservedMessageIndices = new Set(state.timeline.flatMap((item) =>
+    item.kind === "assistant" && item.messageIndex !== null ? [item.messageIndex] : [],
+  ));
+  const ordinaryMessages = visibleMessages.filter(
+    (message) => !reservedMessageIndices.has(message.messageIndex),
   );
   const orderedActivities = state.activityOrder.flatMap((id) => {
     const item = state.activities[id];
     return item === undefined ? [] : [item];
   });
-  const activityGroups = groupActivities(orderedActivities);
-  const searchMessages: SearchableMessage[] = visibleMessages.map((message, index) => ({
-    id: `${instanceId}-message-${index}`,
+  const resolvedTimeline: Array<ActivityItem | TimelineMarker> = [];
+  for (const item of state.timeline) {
+    if (item.kind !== "activity") {
+      resolvedTimeline.push(item);
+      continue;
+    }
+    const activity = state.activities[item.activityId];
+    if (activity !== undefined) resolvedTimeline.push(activity);
+  }
+  const timelineItems: GroupedTimelineItem[] = state.timeline.length === 0
+    ? groupActivities(orderedActivities)
+    : groupActivities(resolvedTimeline);
+  const timelineAssistants = timelineItems.flatMap((item, timelineIndex) =>
+    isActivityGroup(item) || item.kind !== "assistant"
+      ? []
+      : [{ ...item, timelineIndex }],
+  );
+  const searchMessages: SearchableMessage[] = ordinaryMessages.map((message) => ({
+    id: `${instanceId}-message-${message.messageIndex}`,
     text: message.content,
   }));
-  if (state.streamingText !== "") {
+  searchMessages.push(...timelineAssistants.map((item) => ({
+    id: `${instanceId}-timeline-${item.timelineIndex}`,
+    text: item.text,
+  })));
+  if (state.timeline.length === 0 && state.streamingText !== "") {
     searchMessages.push({ id: `${instanceId}-streaming`, text: state.streamingText });
   }
   const contentVersion = `${state.generation}:${state.lastSequence}:${visibleMessages.length}:${state.streamingText.length}:${state.activityOrder.length}`;
@@ -116,19 +154,38 @@ export function Conversation({ state, openInspector, copyText }: ConversationPro
         }}
       >
         <div className={styles.transcript}>
-          {visibleMessages.map((message, index) => (
+          {ordinaryMessages.map((message) => (
             <Message
-              key={`${index}-${message.role}`}
-              id={`${instanceId}-message-${index}`}
+              key={`${message.messageIndex}-${message.role}`}
+              id={`${instanceId}-message-${message.messageIndex}`}
               role={message.role}
               content={message.content}
               copyText={copyText}
             />
           ))}
-          {activityGroups.map((group) => (
-            <ActivityCard key={group[0].activityId} activities={group} openInspector={openInspector} />
-          ))}
-          {state.streamingText === "" ? null : (
+          {timelineItems.map((item, timelineIndex) => {
+            if (isActivityGroup(item)) {
+              return (
+                <ActivityCard
+                  key={item[0].activityId}
+                  activities={item}
+                  openInspector={openInspector}
+                />
+              );
+            }
+            if (item.kind === "boundary") return null;
+            return (
+              <Message
+                key={`timeline-${timelineIndex}`}
+                id={`${instanceId}-timeline-${timelineIndex}`}
+                role="assistant"
+                content={item.text}
+                streaming={item.messageIndex === null && state.running}
+                copyText={copyText}
+              />
+            );
+          })}
+          {state.timeline.length === 0 && state.streamingText !== "" ? (
             <Message
               id={`${instanceId}-streaming`}
               role="assistant"
@@ -136,7 +193,7 @@ export function Conversation({ state, openInspector, copyText }: ConversationPro
               streaming
               copyText={copyText}
             />
-          )}
+          ) : null}
         </div>
       </div>
       <span className={styles.srOnly} role="status" aria-label="Conversation update">

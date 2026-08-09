@@ -47,7 +47,7 @@ function diffLineType(line: string): "addition" | "removal" | "hunk" | "meta" | 
 }
 
 export function CodeBlock({ code, language = "text", copyText = copyToClipboard }: CodeBlockProps) {
-  const [copied, setCopied] = useState(false);
+  const [copyStatus, setCopyStatus] = useState<"idle" | "copied" | "error">("idle");
   const normalizedLanguage = language.toLocaleLowerCase();
   const label = languageLabels[normalizedLanguage] ?? `${language} code`;
   const regionLabel = normalizedLanguage === "diff" ? "Diff" : label.endsWith("code") ? label : `${label} code`;
@@ -55,9 +55,9 @@ export function CodeBlock({ code, language = "text", copyText = copyToClipboard 
   const copy = async () => {
     try {
       await copyText(code);
-      setCopied(true);
+      setCopyStatus("copied");
     } catch {
-      setCopied(false);
+      setCopyStatus("error");
     }
   };
 
@@ -65,14 +65,30 @@ export function CodeBlock({ code, language = "text", copyText = copyToClipboard 
     <section className={styles.codeBlock} aria-label={regionLabel}>
       <div className={styles.codeToolbar}>
         <span>{normalizedLanguage === "text" ? "Code" : label}</span>
+        <span
+          className={styles.copyFeedback}
+          data-status={copyStatus}
+          role="status"
+          aria-label="Code copy status"
+          aria-live="polite"
+          aria-atomic="true"
+        >
+          {copyStatus === "copied" ? "Copied" : copyStatus === "error" ? "Copy failed. Try again." : ""}
+        </span>
         <button
           type="button"
           className={styles.copyButton}
-          aria-label={copied ? "Code copied" : "Copy code"}
+          aria-label={
+            copyStatus === "copied"
+              ? "Code copied"
+              : copyStatus === "error"
+                ? "Retry copy code"
+                : "Copy code"
+          }
           onClick={() => void copy()}
         >
-          {copied ? <Check aria-hidden="true" size={15} /> : <Copy aria-hidden="true" size={15} />}
-          <span aria-hidden="true">{copied ? "Copied" : "Copy"}</span>
+          {copyStatus === "copied" ? <Check aria-hidden="true" size={15} /> : <Copy aria-hidden="true" size={15} />}
+          <span aria-hidden="true">{copyStatus === "copied" ? "Copied" : copyStatus === "error" ? "Retry" : "Copy"}</span>
         </button>
       </div>
       {normalizedLanguage === "diff" ? (

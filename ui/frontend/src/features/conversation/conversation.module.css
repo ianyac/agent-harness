@@ -175,6 +175,16 @@
   font-size: 11px;
 }
 
+.copyFeedback {
+  margin-inline-start: auto;
+  color: var(--color-ink-small);
+  font-size: 11px;
+}
+
+.copyFeedback[data-status="error"] {
+  color: var(--color-danger);
+}
+
 .copyButton {
   display: inline-flex;
   min-height: 32px;
@@ -324,7 +334,9 @@
 }
 
 .search input:focus-visible {
-  box-shadow: none;
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
+  box-shadow: var(--focus-ring);
 }
 
 .searchPosition {
@@ -415,5 +427,9 @@
   .search,
   .newMessages {
     border-width: 2px;
+  }
+
+  .search input:focus-visible {
+    outline-width: 3px;
   }
 }

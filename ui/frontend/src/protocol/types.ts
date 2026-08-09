@@ -234,6 +234,29 @@ export type RecoverableError = {
   message: string;
 };
 
+export type TranscriptBoundary = "permission" | "plan_review" | "error" | "turn_completion";
+
+export type TranscriptActivityTimelineItem = {
+  kind: "activity";
+  activityId: string;
+};
+
+export type TranscriptAssistantTimelineItem = {
+  kind: "assistant";
+  text: string;
+  messageIndex: number | null;
+};
+
+export type TranscriptBoundaryTimelineItem = {
+  kind: "boundary";
+  boundary: TranscriptBoundary;
+};
+
+export type TranscriptTimelineItem =
+  | TranscriptActivityTimelineItem
+  | TranscriptAssistantTimelineItem
+  | TranscriptBoundaryTimelineItem;
+
 export type TranscriptState = {
   generation: number;
   lastSequence: number;
@@ -241,6 +264,7 @@ export type TranscriptState = {
   streamingText: string;
   activities: Record<string, ActivityItem>;
   activityOrder: string[];
+  timeline: TranscriptTimelineItem[];
   permission: PermissionRequest | null;
   planReview: PlanReviewRequest | null;
   running: boolean;

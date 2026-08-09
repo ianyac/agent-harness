@@ -1,13 +1,23 @@
-import type { ActivityItem } from "../../protocol/types";
+import type {
+  ActivityItem,
+  TranscriptAssistantTimelineItem,
+  TranscriptBoundaryTimelineItem,
+} from "../../protocol/types";
 
 export type ActivityGroup = readonly ActivityItem[];
+export type TimelineMarker = TranscriptAssistantTimelineItem | TranscriptBoundaryTimelineItem;
+export type GroupedTimelineItem = ActivityGroup | TimelineMarker;
 
 function isRoutineActivity(activity: ActivityItem): boolean {
   return activity.actor === "tool" && activity.status !== "error" && activity.isError !== true;
 }
 
-export function groupActivities(activities: readonly ActivityItem[]): ActivityGroup[] {
-  const groups: ActivityItem[][] = [];
+export function groupActivities(activities: readonly ActivityItem[]): ActivityGroup[];
+export function groupActivities(items: readonly (ActivityItem | TimelineMarker)[]): GroupedTimelineItem[];
+export function groupActivities(
+  activities: readonly (ActivityItem | TimelineMarker)[],
+): GroupedTimelineItem[] {
+  const groups: GroupedTimelineItem[] = [];
   let routineGroup: ActivityItem[] = [];
 
   const finishRoutineGroup = () => {
@@ -16,6 +26,11 @@ export function groupActivities(activities: readonly ActivityItem[]): ActivityGr
   };
 
   for (const activity of activities) {
+    if (!("activityId" in activity)) {
+      finishRoutineGroup();
+      groups.push(activity);
+      continue;
+    }
     if (!isRoutineActivity(activity)) {
       finishRoutineGroup();
       groups.push([activity]);

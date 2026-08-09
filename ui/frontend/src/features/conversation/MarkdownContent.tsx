@@ -1,7 +1,7 @@
 import { Check, Copy } from "lucide-react";
-import { Children, cloneElement, isValidElement, useState } from "react";
-import type { ComponentPropsWithoutRef, ReactElement, ReactNode } from "react";
-import ReactMarkdown from "react-markdown";
+import { Children, isValidElement, useState } from "react";
+import type { ReactElement, ReactNode } from "react";
+import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 import { CodeBlock, copyToClipboard } from "./CodeBlock";
@@ -13,36 +13,72 @@ type MarkdownContentProps = {
   readonly copyText?: CopyText;
 };
 
+function readableHref(href: string): string {
+  try {
+    return decodeURIComponent(href);
+  } catch {
+    return href;
+  }
+}
+
 function isLocalPath(href: string): boolean {
-  return href.startsWith("/") || href.startsWith("~/") || href.startsWith("file://");
+  const path = readableHref(href);
+  return /^file:\/\//i.test(path) ||
+    (path.startsWith("/") && !path.startsWith("//")) ||
+    path.startsWith("~/") ||
+    path.startsWith("./") ||
+    path.startsWith("../") ||
+    /^[A-Za-z]:[\\/]/.test(path);
 }
 
 function isExternalLink(href: string): boolean {
-  return /^https?:\/\//i.test(href);
+  return /^https?:\/\//i.test(href) || href.startsWith("//");
+}
+
+function safeUrlTransform(url: string, key: string): string {
+  if (key === "href" && isLocalPath(url)) return url;
+  return defaultUrlTransform(url);
 }
 
 function LocalPath({ href, copyText }: { readonly href: string; readonly copyText: CopyText }) {
-  const [copied, setCopied] = useState(false);
+  const path = readableHref(href);
+  const [copyStatus, setCopyStatus] = useState<"idle" | "copied" | "error">("idle");
   const copy = async () => {
     try {
-      await copyText(href);
-      setCopied(true);
+      await copyText(path);
+      setCopyStatus("copied");
     } catch {
-      setCopied(false);
+      setCopyStatus("error");
     }
   };
 
   return (
     <span className={styles.localPath}>
-      <code>{href}</code>
+      <code>{path}</code>
       <button
         type="button"
         className={styles.inlineCopyButton}
-        aria-label={copied ? "Path copied" : "Copy path"}
+        aria-label={
+          copyStatus === "copied"
+            ? "Path copied"
+            : copyStatus === "error"
+              ? "Retry copy path"
+              : "Copy path"
+        }
         onClick={() => void copy()}
       >
-        {copied ? <Check aria-hidden="true" size={14} /> : <Copy aria-hidden="true" size={14} />}
+        {copyStatus === "copied" ? <Check aria-hidden="true" size={14} /> : <Copy aria-hidden="true" size={14} />}
       </button>
+      <span
+        className={styles.copyFeedback}
+        data-status={copyStatus}
+        role="status"
+        aria-label="Path copy status"
+        aria-live="polite"
+        aria-atomic="true"
+      >
+        {copyStatus === "copied" ? "Copied" : copyStatus === "error" ? "Copy failed. Try again." : ""}
+      </span>
     </span>
   );
 }
@@ -56,8 +92,10 @@ export function MarkdownContent({ content, copyText = copyToClipboard }: Markdow
     <div className={styles.markdown}>
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
+        urlTransform={safeUrlTransform}
         components={{
-          a({ href = "", children, ...props }: ComponentPropsWithoutRef<"a">) {
+          a({ href = "", children, node: _node, ...props }) {
+            if (href === "") return <span>{children}</span>;
             if (isLocalPath(href)) return <LocalPath href={href} copyText={copyText} />;
             return (
               <a

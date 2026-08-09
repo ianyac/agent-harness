@@ -1,11 +1,14 @@
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { ActivityItem, HarnessMessage, TranscriptState } from "../../protocol/types";
 import { Conversation } from "./Conversation";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.useRealTimers();
+});
 
 function activity(overrides: Partial<ActivityItem> = {}): ActivityItem {
   return {
@@ -32,6 +35,7 @@ function transcript(overrides: Partial<TranscriptState> = {}): TranscriptState {
     streamingText: "",
     activities: {},
     activityOrder: [],
+    timeline: [],
     permission: null,
     planReview: null,
     running: false,
@@ -114,6 +118,58 @@ describe("Conversation", () => {
     expect(screen.getByRole("button", { name: "Path copied" })).toBeVisible();
   });
 
+  it("distinguishes safe local path forms, protocol-relative links, and unsafe schemes", async () => {
+    const user = userEvent.setup();
+    const copied: string[] = [];
+    render(
+      <Conversation
+        state={transcript({
+          messages: messages({
+            role: "assistant",
+            content: [
+              "[file URL](<file:///tmp/a.ts>)",
+              "[network path](//example.com/docs)",
+              "[dot path](./src/a.ts)",
+              "[parent path](../README.md)",
+              String.raw`[Windows path](<C:\work\app.ts>)`,
+              "[unsafe script](javascript:alert(1))",
+              "[unsafe data](data:text/html,boom)",
+            ].join("\n\n"),
+          }),
+        })}
+        openInspector={() => {}}
+        copyText={(text) => {
+          copied.push(text);
+        }}
+      />,
+    );
+
+    const external = screen.getByRole("link", { name: "network path" });
+    expect(external).toHaveAttribute("href", "//example.com/docs");
+    expect(external).toHaveAttribute("target", "_blank");
+    expect(external).toHaveAttribute("rel", "noreferrer");
+    expect(screen.queryByRole("link", { name: "file URL" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: "dot path" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: "parent path" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: "Windows path" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: "unsafe script" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: "unsafe data" })).not.toBeInTheDocument();
+    expect(screen.getByText("file:///tmp/a.ts")).toBeVisible();
+    expect(screen.getByText("./src/a.ts")).toBeVisible();
+    expect(screen.getByText("../README.md")).toBeVisible();
+    expect(screen.getByText(String.raw`C:\work\app.ts`)).toBeVisible();
+
+    const copyButtons = screen.getAllByRole("button", { name: "Copy path" });
+    expect(copyButtons).toHaveLength(4);
+    for (const button of copyButtons) await user.click(button);
+    expect(copied).toEqual([
+      "file:///tmp/a.ts",
+      "./src/a.ts",
+      "../README.md",
+      String.raw`C:\work\app.ts`,
+    ]);
+  });
+
   it("copies fenced code and gives diff additions, removals, and hunks semantic line classes", async () => {
     const user = userEvent.setup();
     const copyText = vi.fn().mockResolvedValue(undefined);
@@ -160,6 +216,58 @@ describe("Conversation", () => {
     expect(within(diff).getByText("+++ b/value.ts")).toHaveAttribute("data-diff-line", "meta");
   });
 
+  it("announces a rejected code copy and allows a successful retry", async () => {
+    const user = userEvent.setup();
+    let attempts = 0;
+    const copyText = async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("clipboard denied");
+    };
+    render(
+      <Conversation
+        state={transcript({
+          messages: messages({ role: "assistant", content: "```ts\nconst retry = true;\n```" }),
+        })}
+        openInspector={() => {}}
+        copyText={copyText}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "Copy code" }));
+    const codeStatus = screen.getByRole("status", { name: "Code copy status" });
+    expect(codeStatus).toHaveTextContent("Copy failed. Try again.");
+    expect(codeStatus).toHaveAttribute("aria-live", "polite");
+    await user.click(screen.getByRole("button", { name: "Retry copy code" }));
+    expect(screen.getByRole("button", { name: "Code copied" })).toBeVisible();
+    expect(screen.getByRole("status", { name: "Code copy status" })).toHaveTextContent("Copied");
+  });
+
+  it("announces a rejected path copy and allows a successful retry", async () => {
+    const user = userEvent.setup();
+    let attempts = 0;
+    const copyText = async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("clipboard denied");
+    };
+    render(
+      <Conversation
+        state={transcript({
+          messages: messages({ role: "assistant", content: "[file](./src/retry.ts)" }),
+        })}
+        openInspector={() => {}}
+        copyText={copyText}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "Copy path" }));
+    const pathStatus = screen.getByRole("status", { name: "Path copy status" });
+    expect(pathStatus).toHaveTextContent("Copy failed. Try again.");
+    expect(pathStatus).toHaveAttribute("aria-live", "polite");
+    await user.click(screen.getByRole("button", { name: "Retry copy path" }));
+    expect(screen.getByRole("button", { name: "Path copied" })).toBeVisible();
+    expect(screen.getByRole("status", { name: "Path copy status" })).toHaveTextContent("Copied");
+  });
+
   it("appends streaming text and then replaces it with the authoritative completed message", () => {
     const { rerender } = render(
       <Conversation
@@ -191,6 +299,51 @@ describe("Conversation", () => {
     expect(screen.queryByText("Draft answer")).not.toBeInTheDocument();
     expect(screen.getByText("Authoritative answer")).toBeVisible();
     expect(screen.getByRole("status", { name: "Conversation update" })).toHaveTextContent("Response complete");
+  });
+
+  it("keeps an authoritative replacement after the activity where its stream appeared", () => {
+    const work = activity({ activityId: "activity-order", result: "read complete" });
+    const running = {
+      ...transcript({
+        messages: messages({ role: "user", content: "Question" }),
+        activities: { [work.activityId]: work },
+        activityOrder: [work.activityId],
+        streamingText: "Draft answer",
+        running: true,
+      }),
+      timeline: [
+        { kind: "activity", activityId: work.activityId },
+        { kind: "assistant", text: "Draft answer", messageIndex: null },
+      ],
+    } as TranscriptState;
+    const { rerender } = render(<Conversation state={running} openInspector={() => {}} />);
+
+    const runningCard = screen.getByRole("button", { name: /Open activity/ });
+    const draft = screen.getByText("Draft answer").closest("article");
+    expect(runningCard.compareDocumentPosition(draft as Node) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+
+    const completed = {
+      ...transcript({
+        lastSequence: 2,
+        messages: messages(
+          { role: "user", content: "Question" },
+          { role: "assistant", content: "Authoritative answer" },
+        ),
+        activities: { [work.activityId]: work },
+        activityOrder: [work.activityId],
+      }),
+      timeline: [
+        { kind: "activity", activityId: work.activityId },
+        { kind: "assistant", text: "Authoritative answer", messageIndex: 1 },
+        { kind: "boundary", boundary: "turn_completion" },
+      ],
+    } as TranscriptState;
+    rerender(<Conversation state={completed} openInspector={() => {}} />);
+
+    const completedCard = screen.getByRole("button", { name: /Open activity/ });
+    const answer = screen.getByText("Authoritative answer").closest("article");
+    expect(completedCard.compareDocumentPosition(answer as Node) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+    expect(screen.queryByText("Draft answer")).not.toBeInTheDocument();
   });
 
   it("auto-scrolls only from near the bottom and otherwise offers New messages", async () => {
@@ -271,5 +424,48 @@ describe("Conversation", () => {
     expect(within(card).getByText(/x{100}/)).toHaveClass(/preview/);
     await user.click(card);
     expect(openInspector).toHaveBeenCalledWith("activity-1");
+  });
+
+  it("updates running activity elapsed time and cleans up its timer", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-08T00:00:05Z"));
+    const running = activity({
+      status: "running",
+      startedAt: "2026-08-08T00:00:00Z",
+      result: undefined,
+      isError: undefined,
+      durationMs: undefined,
+    });
+    const { unmount } = render(
+      <Conversation
+        state={transcript({
+          activities: { [running.activityId]: running },
+          activityOrder: [running.activityId],
+        })}
+        openInspector={() => {}}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: /Open activity/ })).toHaveTextContent("5s");
+    expect(vi.getTimerCount()).toBe(1);
+    act(() => vi.advanceTimersByTime(1_000));
+    expect(screen.getByRole("button", { name: /Open activity/ })).toHaveTextContent("6s");
+    unmount();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("shows a legitimate completed zero duration", () => {
+    const completed = activity({ durationMs: 0 });
+    render(
+      <Conversation
+        state={transcript({
+          activities: { [completed.activityId]: completed },
+          activityOrder: [completed.activityId],
+        })}
+        openInspector={() => {}}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: /Open activity/ })).toHaveTextContent("0ms");
   });
 });

@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import type { ActivityItem } from "../../protocol/types";
+import type {
+  ActivityItem,
+  TranscriptAssistantTimelineItem,
+  TranscriptBoundaryTimelineItem,
+} from "../../protocol/types";
 import { groupActivities } from "./groupActivities";
 
 function activity(
@@ -39,23 +43,58 @@ describe("groupActivities", () => {
     ]);
   });
 
-  it.each([
-    ["user-facing narration", activity("narration", "complete", { actor: "assistant" })],
-    ["permission", activity("permission_requested", "running", { actor: "permission" })],
-    ["plan review", activity("plan_review", "running", { actor: "plan" })],
-    ["subagent start or completion", activity("spawn_agent", "complete", { actor: "subagent" })],
-    ["turn completion", activity("turn_completed", "complete", { actor: "system" })],
-  ])("ends a routine group at a %s boundary", (_label, boundary) => {
+  it("ends groups at real narration, permission, plan-review, and turn boundaries", () => {
+    const narration: TranscriptAssistantTimelineItem = {
+      kind: "assistant",
+      text: "I checked this.",
+      messageIndex: null,
+    };
+    const permission: TranscriptBoundaryTimelineItem = { kind: "boundary", boundary: "permission" };
+    const planReview: TranscriptBoundaryTimelineItem = { kind: "boundary", boundary: "plan_review" };
+    const turnCompletion: TranscriptBoundaryTimelineItem = {
+      kind: "boundary",
+      boundary: "turn_completion",
+    };
     const grouped = groupActivities([
       activity("read_file"),
-      boundary,
+      narration,
       activity("list_dir"),
+      permission,
+      activity("read_file", "complete", { activityId: "read-after-permission" }),
+      planReview,
+      activity("list_dir", "complete", { activityId: "list-after-plan" }),
+      turnCompletion,
     ]);
 
-    expect(grouped).toHaveLength(3);
-    expect(grouped[0].map((item) => item.name)).toEqual(["read_file"]);
-    expect(grouped[1].map((item) => item.name)).toEqual([boundary.name]);
-    expect(grouped[2].map((item) => item.name)).toEqual(["list_dir"]);
+    expect(grouped).toEqual([
+      [expect.objectContaining({ name: "read_file" })],
+      narration,
+      [expect.objectContaining({ name: "list_dir" })],
+      permission,
+      [expect.objectContaining({ name: "read_file" })],
+      planReview,
+      [expect.objectContaining({ name: "list_dir" })],
+      turnCompletion,
+    ]);
+  });
+
+  it("keeps real subagent and error activities as standalone boundaries", () => {
+    const subagent = activity("spawn_agent", "complete", { actor: "subagent" });
+    const failed = activity("bash", "error");
+
+    expect(groupActivities([
+      activity("read_file"),
+      subagent,
+      activity("list_dir"),
+      failed,
+      activity("read_file", "complete", { activityId: "read-after-error" }),
+    ])).toEqual([
+      [expect.objectContaining({ name: "read_file" })],
+      [subagent],
+      [expect.objectContaining({ name: "list_dir" })],
+      [failed],
+      [expect.objectContaining({ name: "read_file" })],
+    ]);
   });
 
   it("does not group activities across turns or mutate the ordered input", () => {

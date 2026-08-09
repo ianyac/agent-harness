@@ -1,4 +1,5 @@
 import { CheckCircle2, CircleAlert, Clock3 } from "lucide-react";
+import { useEffect, useState } from "react";
 
 import type { ActivityItem, JsonValue } from "../../protocol/types";
 import styles from "../conversation/conversation.module.css";
@@ -34,6 +35,16 @@ function readableName(name: string): string {
 }
 
 export function ActivityCard({ activities, openInspector }: ActivityCardProps) {
+  const hasRunningActivity = activities.some((activity) => activity.status === "running");
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    if (!hasRunningActivity) return;
+    setNow(Date.now());
+    const timer = window.setInterval(() => setNow(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [hasRunningActivity]);
+
   const first = activities[0];
   if (first === undefined) return null;
 
@@ -42,7 +53,15 @@ export function ActivityCard({ activities, openInspector }: ActivityCardProps) {
   const status = hasError ? "error" : isRunning ? "running" : "complete";
   const statusLabel = status === "error" ? "Failed" : status === "running" ? "Working" : "Complete";
   const Icon = status === "error" ? CircleAlert : status === "running" ? Clock3 : CheckCircle2;
-  const durationMs = activities.reduce((total, activity) => total + (activity.durationMs ?? 0), 0);
+  const showsDuration = activities.some(
+    (activity) => activity.durationMs !== undefined || activity.status === "running",
+  );
+  const durationMs = activities.reduce((total, activity) => {
+    if (activity.durationMs !== undefined) return total + activity.durationMs;
+    if (activity.status !== "running") return total;
+    const started = Date.parse(activity.startedAt);
+    return total + (Number.isFinite(started) ? Math.max(0, now - started) : 0);
+  }, 0);
   const tests = testSummary(activities);
   const previewActivity = [...activities].reverse().find((activity) => activity.result !== undefined);
   const preview = previewActivity?.result === undefined ? "" : serializeResult(previewActivity.result);
@@ -52,7 +71,7 @@ export function ActivityCard({ activities, openInspector }: ActivityCardProps) {
     : `${readableName(first.name)} and ${activities.length - 1} more`;
   const accessibleSummary = [
     statusLabel,
-    durationMs > 0 ? formatDuration(durationMs) : null,
+    showsDuration ? formatDuration(durationMs) : null,
     actionLabel,
     tests,
   ].filter((part) => part !== null).join(", ");
@@ -71,7 +90,7 @@ export function ActivityCard({ activities, openInspector }: ActivityCardProps) {
       </span>
       <span className={styles.activityMeta}>
         <span>{statusLabel}</span>
-        {durationMs > 0 ? <span>{formatDuration(durationMs)}</span> : null}
+        {showsDuration ? <span>{formatDuration(durationMs)}</span> : null}
         <span>{actionLabel}</span>
         {tests === null ? null : <span>{tests}</span>}
       </span>

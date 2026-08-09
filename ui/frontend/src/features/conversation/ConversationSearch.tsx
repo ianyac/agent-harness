@@ -19,7 +19,7 @@ type SearchMatch = {
 };
 
 function findMatches(messages: readonly SearchableMessage[], query: string): SearchMatch[] {
-  const needle = query.trim().toLocaleLowerCase();
+  const needle = query.toLocaleLowerCase();
   if (needle === "") return [];
   return messages.flatMap((message) => {
     const haystack = message.text.toLocaleLowerCase();
@@ -38,6 +38,7 @@ function findMatches(messages: readonly SearchableMessage[], query: string): Sea
 export function ConversationSearch({ messages, onClose }: ConversationSearchProps) {
   const [query, setQuery] = useState("");
   const [activeIndex, setActiveIndex] = useState(0);
+  const [searchFocused, setSearchFocused] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const matches = useMemo(() => findMatches(messages, query), [messages, query]);
   const normalizedIndex = matches.length === 0 ? 0 : activeIndex % matches.length;
@@ -48,12 +49,17 @@ export function ConversationSearch({ messages, onClose }: ConversationSearchProp
   }, []);
 
   useEffect(() => {
-    setActiveIndex(0);
-  }, [query]);
+    if (activeMatch === null) return;
+    document.getElementById(activeMatch.messageId)?.scrollIntoView?.({
+      block: "center",
+      behavior: "auto",
+    });
+  }, [activeMatch?.messageId, activeMatch?.offset]);
 
   const move = (direction: 1 | -1) => {
     if (matches.length === 0) return;
     setActiveIndex((index) => (index + direction + matches.length) % matches.length);
+    inputRef.current?.focus();
   };
 
   const close = () => onClose(activeMatch?.messageId ?? null);
@@ -65,8 +71,14 @@ export function ConversationSearch({ messages, onClose }: ConversationSearchProp
         ref={inputRef}
         type="search"
         aria-label="Search conversation"
+        style={searchFocused ? { outlineStyle: "solid" } : undefined}
         value={query}
-        onChange={(event) => setQuery(event.target.value)}
+        onFocus={() => setSearchFocused(true)}
+        onBlur={() => setSearchFocused(false)}
+        onChange={(event) => {
+          setQuery(event.target.value);
+          setActiveIndex(0);
+        }}
         onKeyDown={(event) => {
           if (event.key === "Enter") {
             event.preventDefault();
@@ -83,10 +95,22 @@ export function ConversationSearch({ messages, onClose }: ConversationSearchProp
       <span className={styles.searchPosition} role="status" aria-label="Search result position">
         {matches.length === 0 ? "No matches" : `${normalizedIndex + 1} of ${matches.length}`}
       </span>
-      <button type="button" aria-label="Previous match" disabled={matches.length === 0} onClick={() => move(-1)}>
+      <button
+        type="button"
+        aria-label="Previous match"
+        disabled={matches.length === 0}
+        onMouseDown={(event) => event.preventDefault()}
+        onClick={() => move(-1)}
+      >
         <ChevronUp aria-hidden="true" size={16} />
       </button>
-      <button type="button" aria-label="Next match" disabled={matches.length === 0} onClick={() => move(1)}>
+      <button
+        type="button"
+        aria-label="Next match"
+        disabled={matches.length === 0}
+        onMouseDown={(event) => event.preventDefault()}
+        onClick={() => move(1)}
+      >
         <ChevronDown aria-hidden="true" size={16} />
       </button>
       <button type="button" aria-label="Close conversation search" onClick={close}>

@@ -2,8 +2,10 @@ import type {
   ActivityCompleted,
   ActivityItem,
   ActivityStarted,
+  HarnessMessage,
   ServerEvent,
   TranscriptState,
+  TranscriptTimelineItem,
 } from "./types";
 
 export function emptyTranscript(): TranscriptState {
@@ -14,6 +16,7 @@ export function emptyTranscript(): TranscriptState {
     streamingText: "",
     activities: {},
     activityOrder: [],
+    timeline: [],
     permission: null,
     planReview: null,
     running: false,
@@ -53,13 +56,119 @@ function completedActivity(event: ActivityCompleted): ActivityItem {
   };
 }
 
-function appendActivity(state: TranscriptState, item: ActivityItem): Pick<TranscriptState, "activities" | "activityOrder"> {
+function appendActivity(
+  state: TranscriptState,
+  item: ActivityItem,
+): Pick<TranscriptState, "activities" | "activityOrder" | "timeline"> {
+  const known = Object.prototype.hasOwnProperty.call(state.activities, item.activityId);
   return {
     activities: { ...state.activities, [item.activityId]: item },
-    activityOrder: Object.prototype.hasOwnProperty.call(state.activities, item.activityId)
-      ? state.activityOrder
-      : [...state.activityOrder, item.activityId],
+    activityOrder: known ? state.activityOrder : [...state.activityOrder, item.activityId],
+    timeline: known
+      ? state.timeline
+      : [...state.timeline, { kind: "activity", activityId: item.activityId }],
   };
+}
+
+function appendAssistantDelta(
+  timeline: readonly TranscriptTimelineItem[],
+  text: string,
+): TranscriptTimelineItem[] {
+  const last = timeline[timeline.length - 1];
+  if (last?.kind === "assistant" && last.messageIndex === null) {
+    return [
+      ...timeline.slice(0, -1),
+      { ...last, text: last.text + text },
+    ];
+  }
+  return [...timeline, { kind: "assistant", text, messageIndex: null }];
+}
+
+function resetActiveAssistant(timeline: readonly TranscriptTimelineItem[]): TranscriptTimelineItem[] {
+  const last = timeline[timeline.length - 1];
+  return last?.kind === "assistant" && last.messageIndex === null
+    ? timeline.slice(0, -1)
+    : [...timeline];
+}
+
+function streamedText(timeline: readonly TranscriptTimelineItem[]): string {
+  return timeline.flatMap((item) => item.kind === "assistant" ? [item.text] : []).join("");
+}
+
+function messageText(message: HarnessMessage): string | null {
+  if (message.role !== "assistant") return null;
+  if (typeof message.content === "string") return message.content === "" ? null : message.content;
+  if (!Array.isArray(message.content)) return null;
+  const parts = message.content.flatMap((part) => {
+    if (typeof part === "string") return [part];
+    if (part === null || Array.isArray(part) || typeof part !== "object") return [];
+    return typeof part.text === "string" ? [part.text] : [];
+  });
+  return parts.length === 0 ? null : parts.join("\n");
+}
+
+function reconcileAssistantTimeline(
+  timeline: readonly TranscriptTimelineItem[],
+  messages: readonly HarnessMessage[],
+  finalText: string,
+): TranscriptTimelineItem[] {
+  let latestUserIndex = -1;
+  messages.forEach((message, messageIndex) => {
+    if (message.role === "user") latestUserIndex = messageIndex;
+  });
+  const candidates = messages.flatMap((message, messageIndex) => {
+    if (messageIndex <= latestUserIndex) return [];
+    const text = messageText(message);
+    return text === null ? [] : [{ messageIndex, text }];
+  });
+  const used = new Set<number>();
+  let candidateCursor = 0;
+  const reconciled = timeline.map((item): TranscriptTimelineItem => {
+    if (item.kind !== "assistant") return item;
+    const matchOffset = candidates.slice(candidateCursor).findIndex(
+      (candidate) => candidate.text === item.text,
+    );
+    if (matchOffset === -1) return item;
+    const candidatePosition = candidateCursor + matchOffset;
+    const candidate = candidates[candidatePosition];
+    candidateCursor = candidatePosition + 1;
+    used.add(candidate.messageIndex);
+    return { ...item, text: candidate.text, messageIndex: candidate.messageIndex };
+  });
+
+  const finalCandidate = [...candidates].reverse().find(
+    (candidate) => candidate.text === finalText,
+  ) ?? candidates[candidates.length - 1];
+  if (finalCandidate === undefined || used.has(finalCandidate.messageIndex)) return reconciled;
+
+  for (let index = reconciled.length - 1; index >= 0; index -= 1) {
+    const item = reconciled[index];
+    if (item.kind === "assistant" && item.messageIndex === null) {
+      reconciled[index] = {
+        ...item,
+        text: finalCandidate.text,
+        messageIndex: finalCandidate.messageIndex,
+      };
+      return reconciled;
+    }
+  }
+  return [
+    ...reconciled,
+    { kind: "assistant", text: finalCandidate.text, messageIndex: finalCandidate.messageIndex },
+  ];
+}
+
+function boundary(
+  timeline: readonly TranscriptTimelineItem[],
+  value: "permission" | "plan_review" | "error" | "turn_completion",
+): TranscriptTimelineItem[] {
+  return [...timeline, { kind: "boundary", boundary: value }];
+}
+
+function discardUncommittedAssistants(
+  timeline: readonly TranscriptTimelineItem[],
+): TranscriptTimelineItem[] {
+  return timeline.filter((item) => item.kind !== "assistant" || item.messageIndex !== null);
 }
 
 function terminalState(state: TranscriptState): TranscriptState {
@@ -87,6 +196,7 @@ export function transcriptReducer(state: TranscriptState, event: ServerEvent): T
       streamingText: "",
       activities: {},
       activityOrder: [],
+      timeline: [],
       permission: null,
       planReview: null,
       running: event.running,
@@ -109,6 +219,7 @@ export function transcriptReducer(state: TranscriptState, event: ServerEvent): T
         streamingText: "",
         activities: {},
         activityOrder: [],
+        timeline: [],
         permission: null,
         planReview: null,
         running: true,
@@ -116,10 +227,14 @@ export function transcriptReducer(state: TranscriptState, event: ServerEvent): T
         queued: null,
         error: null,
       };
-    case "assistant_delta":
-      return { ...accepted, streamingText: state.streamingText + event.text };
-    case "stream_reset":
-      return { ...accepted, streamingText: "" };
+    case "assistant_delta": {
+      const timeline = appendAssistantDelta(state.timeline, event.text);
+      return { ...accepted, timeline, streamingText: streamedText(timeline) };
+    }
+    case "stream_reset": {
+      const timeline = resetActiveAssistant(state.timeline);
+      return { ...accepted, timeline, streamingText: streamedText(timeline) };
+    }
     case "activity_started":
       return { ...accepted, ...appendActivity(state, startedActivity(event)) };
     case "activity_completed":
@@ -127,6 +242,7 @@ export function transcriptReducer(state: TranscriptState, event: ServerEvent): T
     case "permission_requested":
       return {
         ...accepted,
+        timeline: boundary(state.timeline, "permission"),
         permission: {
           turnId: event.turn_id,
           requestId: event.request_id,
@@ -143,6 +259,7 @@ export function transcriptReducer(state: TranscriptState, event: ServerEvent): T
     case "plan_approval_requested":
       return {
         ...accepted,
+        timeline: boundary(state.timeline, "plan_review"),
         planReview: { turnId: event.turn_id, requestId: event.request_id, plan: event.plan },
       };
     case "plan_approval_resolved":
@@ -154,13 +271,25 @@ export function transcriptReducer(state: TranscriptState, event: ServerEvent): T
       return accepted;
     case "turn_stopping":
       return { ...accepted, running: true, stopping: true };
-    case "turn_completed":
-      return { ...terminalState(accepted), messages: event.messages, error: null };
+    case "turn_completed": {
+      const reconciled = reconcileAssistantTimeline(state.timeline, event.messages, event.final_text);
+      return {
+        ...terminalState(accepted),
+        messages: event.messages,
+        timeline: boundary(reconciled, "turn_completion"),
+        error: null,
+      };
+    }
     case "turn_cancelled":
-      return { ...terminalState(accepted), error: null };
+      return {
+        ...terminalState(accepted),
+        timeline: boundary(discardUncommittedAssistants(state.timeline), "turn_completion"),
+        error: null,
+      };
     case "turn_failed":
       return {
         ...terminalState(accepted),
+        timeline: boundary(discardUncommittedAssistants(state.timeline), "error"),
         error: { category: event.error_category, message: event.message },
       };
     case "safety_updated":

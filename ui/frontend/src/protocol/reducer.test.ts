@@ -8,6 +8,26 @@ function timelineOf(state: ReturnType<typeof emptyTranscript>): unknown[] | unde
 }
 
 describe("transcriptReducer", () => {
+  it("exposes only the current authoritative turn-start identity", () => {
+    let state = transcriptReducer(emptyTranscript(), event("turn_started", {
+      generation: 1,
+      sequence: 4,
+      turn_id: "turn-current",
+    }));
+    expect(state.activeTurn).toEqual({
+      generation: 1,
+      sequence: 4,
+      turnId: "turn-current",
+    });
+
+    state = transcriptReducer(state, event("turn_failed", {
+      generation: 1,
+      sequence: 5,
+      turn_id: "turn-current",
+    }));
+    expect(state.activeTurn).toBeNull();
+  });
+
   it("resets stale streamed text before a provider retry", () => {
     let state = transcriptReducer(emptyTranscript(), event("turn_started"));
     state = transcriptReducer(state, event("assistant_delta", { text: "stale" }));
@@ -807,6 +827,7 @@ describe("transcriptReducer", () => {
       latestContext: null,
       error: null,
       terminal: null,
+      activeTurn: null,
     });
   });
 });

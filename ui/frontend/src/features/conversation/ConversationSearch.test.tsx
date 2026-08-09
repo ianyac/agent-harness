@@ -27,6 +27,7 @@ function state(messages: HarnessMessage[]): TranscriptState {
     latestContext: null,
     error: null,
     terminal: null,
+    activeTurn: null,
   };
 }
 

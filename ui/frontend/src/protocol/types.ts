@@ -241,6 +241,12 @@ export type TranscriptTerminal = {
   turnId: string;
 };
 
+export type TranscriptActiveTurn = {
+  generation: number;
+  sequence: number;
+  turnId: string;
+};
+
 export type TranscriptBoundary =
   | "permission"
   | "plan_review"
@@ -318,4 +324,5 @@ export type TranscriptState = {
   latestContext: JsonObject | null;
   error: RecoverableError | null;
   terminal: TranscriptTerminal | null;
+  activeTurn: TranscriptActiveTurn | null;
 };

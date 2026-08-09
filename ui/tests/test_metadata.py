@@ -1,6 +1,7 @@
 from pathlib import Path
 import sqlite3
 import threading
+from uuid import UUID
 
 import pytest
 
@@ -10,6 +11,21 @@ from server.metadata import MetadataStore, NewSession
 
 class RecordConstructionInterrupted(BaseException):
     pass
+
+
+def test_service_identity_is_stable_per_database_and_distinct_between_databases(
+    tmp_path: Path,
+):
+    first_database = tmp_path / "first.sqlite3"
+    second_database = tmp_path / "second.sqlite3"
+
+    with MetadataStore(first_database) as first:
+        first_identity = first.service_id
+        assert str(UUID(first_identity)) == first_identity
+    with MetadataStore(first_database) as reopened:
+        assert reopened.service_id == first_identity
+    with MetadataStore(second_database) as second:
+        assert second.service_id != first_identity
 
 
 def test_session_rows_round_trip_without_message_content(tmp_path: Path):

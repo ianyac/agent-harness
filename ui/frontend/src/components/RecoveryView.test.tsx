@@ -93,7 +93,9 @@ describe("RecoveryView", () => {
     await user.click(screen.getByRole("button", { name: "Locate workspace" }));
     expect(onLocate).not.toHaveBeenCalled();
     await user.click(screen.getByRole("button", { name: "Locate workspace" }));
-    expect(await screen.findByRole("status", { name: "Recovery action failed" })).toHaveTextContent("Picker failed");
+    expect(await screen.findByRole("status", { name: "Recovery action failed" }))
+      .toHaveTextContent("The recovery action failed.");
+    expect(screen.getByRole("alert")).not.toHaveTextContent("Picker failed");
     expect(screen.getByRole("button", { name: "Locate workspace" })).toBeEnabled();
   });
 
@@ -139,7 +141,9 @@ describe("RecoveryView", () => {
     await user.dblClick(screen.getByRole("button", { name: "Restart service" }));
     expect(restartService).toHaveBeenCalledTimes(1);
     await act(async () => restart.reject(new Error("Restart failed")));
-    expect(await screen.findByRole("status", { name: "Recovery action failed" })).toHaveTextContent("Restart failed");
+    expect(await screen.findByRole("status", { name: "Recovery action failed" }))
+      .toHaveTextContent("The recovery action failed.");
+    expect(screen.getByRole("alert")).not.toHaveTextContent("Restart failed");
     await user.click(screen.getByRole("button", { name: "Open logs" }));
     await user.click(screen.getByRole("button", { name: "Quit" }));
     expect(openLogs).toHaveBeenCalledWith();

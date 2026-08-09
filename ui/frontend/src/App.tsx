@@ -16,7 +16,7 @@ import { ConversationHeader } from "./features/sessions/ConversationHeader";
 import { SessionSidebar } from "./features/sessions/SessionSidebar";
 import { SessionOperationRecovery } from "./features/sessions/SessionOperationRecovery";
 import type { ConnectionStatus } from "./features/sessions/SessionSidebar";
-import type { SessionRuntimeState } from "./features/sessions/useSessions";
+import type { ServiceHealth, SessionRuntimeState } from "./features/sessions/useSessions";
 import { useSessions } from "./features/sessions/useSessions";
 import { NotificationObserver } from "./features/settings/NotificationObserver";
 import { Settings } from "./features/settings/Settings";
@@ -28,11 +28,20 @@ import type { ClientEvent, SendMessage, TranscriptState, TranscriptTerminal } fr
 
 const emptyTranscriptState = emptyTranscript();
 
-type RetainedSubmission = {
+type SubmissionCandidate = {
   readonly client: ApiClient;
   readonly dispatcher: AppProps["onSessionEvent"];
   readonly generation: number;
   readonly event: SendMessage;
+};
+
+type PendingSubmissions = {
+  readonly direct?: SubmissionCandidate;
+  readonly queued?: SubmissionCandidate;
+};
+
+type BoundSubmission = SubmissionCandidate & {
+  readonly turnId: string;
 };
 
 type RetryAuthority = {
@@ -108,7 +117,10 @@ export function App({
   );
   const [, setRetryRevision] = useState(0);
   const composerDraftMemory = useRef(new Map<string, string>());
-  const retainedSubmissionRef = useRef(new Map<string, RetainedSubmission>());
+  const pendingSubmissionRef = useRef(new Map<string, PendingSubmissions>());
+  const boundSubmissionRef = useRef(new Map<string, BoundSubmission>());
+  const observedTurnRef = useRef(new Map<string, string>());
+  const submissionOwnerRef = useRef<{ readonly client: ApiClient | null; readonly dispatcher: AppProps["onSessionEvent"] } | null>(null);
   const retrySubmittedRef = useRef(new Set<string>());
   const bootstrapPendingRef = useRef(providedClient === undefined);
   const preferenceModel = usePreferences(preferenceStorage ?? sidebarStorage);
@@ -133,7 +145,7 @@ export function App({
         currentPlatform = platform;
         const service = await platform.getServiceConnection();
         const client = new ApiClient(service);
-        await client.get<{ readonly status: string }>("/api/health");
+        await client.get<ServiceHealth>("/api/health");
         return { platform, client };
       })
       .then(({ platform, client }) => {
@@ -165,7 +177,7 @@ export function App({
     setBootstrapAttempt((attempt) => attempt + 1);
   };
 
-  const sessionsModel = useSessions(connection.client);
+  const sessionsModel = useSessions(connection.client, sidebarStorage);
   const activeSession = useMemo(
     () =>
       sessionsModel.sessions.find(
@@ -188,18 +200,108 @@ export function App({
     transcriptBySession,
     dispatcher: onSessionEvent,
   };
+  const retireCandidate = (sessionId: string, candidate: SubmissionCandidate) => {
+    const pending = pendingSubmissionRef.current.get(sessionId);
+    if (pending === undefined) return false;
+    const retired = pending.direct === candidate || pending.queued === candidate;
+    if (!retired) return false;
+    const next = {
+      direct: pending.direct === candidate ? undefined : pending.direct,
+      queued: pending.queued === candidate ? undefined : pending.queued,
+    };
+    if (next.direct === undefined && next.queued === undefined) {
+      pendingSubmissionRef.current.delete(sessionId);
+    } else {
+      pendingSubmissionRef.current.set(sessionId, next);
+    }
+    return true;
+  };
   const routeSessionEvent = (sessionId: string, clientEvent: ClientEvent) => {
-    if (clientEvent.type === "send_message" && connection.client !== null) {
+    let candidate: SubmissionCandidate | undefined;
+    let previousQueued: SubmissionCandidate | undefined;
+    if (
+      (clientEvent.type === "send_message" || clientEvent.type === "queue_message")
+      && connection.client !== null
+    ) {
       const transcript = transcriptBySession[sessionId] ?? emptyTranscriptState;
-      retainedSubmissionRef.current.set(sessionId, {
+      candidate = {
         client: connection.client,
         dispatcher: onSessionEvent,
         generation: transcript.generation,
-        event: { ...clientEvent },
-      });
+        event: {
+          type: "send_message",
+          text: clientEvent.text,
+          mode: clientEvent.mode,
+        },
+      };
+      const pending = pendingSubmissionRef.current.get(sessionId) ?? {};
+      if (clientEvent.type === "queue_message") previousQueued = pending.queued;
+      pendingSubmissionRef.current.set(sessionId, clientEvent.type === "send_message"
+        ? { ...pending, direct: candidate }
+        : { ...pending, queued: candidate });
+    } else if (clientEvent.type === "clear_queued_message") {
+      const pending = pendingSubmissionRef.current.get(sessionId);
+      if (pending?.direct === undefined) pendingSubmissionRef.current.delete(sessionId);
+      else pendingSubmissionRef.current.set(sessionId, { direct: pending.direct });
     }
-    return onSessionEvent(sessionId, clientEvent);
+    try {
+      const result = onSessionEvent(sessionId, clientEvent);
+      if (candidate === undefined) return result;
+      return Promise.resolve(result).catch((error: unknown) => {
+        if (retireCandidate(sessionId, candidate!) && previousQueued !== undefined) {
+          const pending = pendingSubmissionRef.current.get(sessionId) ?? {};
+          pendingSubmissionRef.current.set(sessionId, { ...pending, queued: previousQueued });
+        }
+        throw error;
+      });
+    } catch (error) {
+      if (candidate !== undefined && retireCandidate(sessionId, candidate) && previousQueued !== undefined) {
+        const pending = pendingSubmissionRef.current.get(sessionId) ?? {};
+        pendingSubmissionRef.current.set(sessionId, { ...pending, queued: previousQueued });
+      }
+      throw error;
+    }
   };
+  useEffect(() => {
+    const owner = submissionOwnerRef.current;
+    if (owner?.client !== connection.client || owner.dispatcher !== onSessionEvent) {
+      pendingSubmissionRef.current.clear();
+      boundSubmissionRef.current.clear();
+      observedTurnRef.current.clear();
+      submissionOwnerRef.current = { client: connection.client, dispatcher: onSessionEvent };
+    }
+    for (const [sessionId, transcript] of Object.entries(transcriptBySession)) {
+      const bound = boundSubmissionRef.current.get(sessionId);
+      if (bound !== undefined && bound.generation !== transcript.generation) {
+        boundSubmissionRef.current.delete(sessionId);
+        pendingSubmissionRef.current.delete(sessionId);
+        observedTurnRef.current.delete(sessionId);
+      }
+      const activeTurn = transcript.activeTurn;
+      if (activeTurn === null) continue;
+      const identity = `${activeTurn.generation}:${activeTurn.sequence}:${activeTurn.turnId}`;
+      if (observedTurnRef.current.get(sessionId) === identity) continue;
+      observedTurnRef.current.set(sessionId, identity);
+      const pending = pendingSubmissionRef.current.get(sessionId);
+      const candidate = pending?.direct ?? pending?.queued;
+      if (
+        candidate === undefined
+        || candidate.client !== connection.client
+        || candidate.dispatcher !== onSessionEvent
+        || candidate.generation !== activeTurn.generation
+      ) {
+        boundSubmissionRef.current.delete(sessionId);
+        continue;
+      }
+      boundSubmissionRef.current.set(sessionId, { ...candidate, turnId: activeTurn.turnId });
+      if (pending?.direct === candidate) {
+        if (pending.queued === undefined) pendingSubmissionRef.current.delete(sessionId);
+        else pendingSubmissionRef.current.set(sessionId, { queued: pending.queued });
+      } else if (pending?.queued === candidate) {
+        pendingSubmissionRef.current.delete(sessionId);
+      }
+    }
+  }, [connection.client, onSessionEvent, transcriptBySession]);
   const retryAuthority = (() => {
     if (
       connection.client === null
@@ -208,12 +310,13 @@ export function App({
       || activeTranscript.error === null
       || activeTranscript.terminal?.kind !== "failed"
     ) return null;
-    const retained = retainedSubmissionRef.current.get(activeSession.session_id);
+    const retained = boundSubmissionRef.current.get(activeSession.session_id);
     if (
       retained === undefined
       || retained.client !== connection.client
       || retained.dispatcher !== onSessionEvent
       || retained.generation !== activeTranscript.terminal.generation
+      || retained.turnId !== activeTranscript.terminal.turnId
     ) return null;
     const key = terminalKey(activeSession.session_id, activeTranscript.terminal);
     if (retrySubmittedRef.current.has(key)) return null;
@@ -231,7 +334,7 @@ export function App({
     const latest = latestRetryContextRef.current;
     const transcript = latest.transcriptBySession[authority.sessionId];
     const currentTerminal = transcript?.terminal;
-    const retained = retainedSubmissionRef.current.get(authority.sessionId);
+    const retained = boundSubmissionRef.current.get(authority.sessionId);
     if (
       latest.client !== authority.client
       || latest.dispatcher !== authority.dispatcher
@@ -241,6 +344,7 @@ export function App({
       || retained?.client !== authority.client
       || retained.dispatcher !== authority.dispatcher
       || retained.generation !== authority.terminal.generation
+      || retained.turnId !== authority.terminal.turnId
       || retrySubmittedRef.current.has(authority.key)
     ) return;
     retrySubmittedRef.current.add(authority.key);
@@ -370,7 +474,12 @@ export function App({
           />
         )}
         <main aria-label="Conversation" className="conversation-main">
-          {sessionsModel.operationError !== null ? (
+          {sessionsModel.cleanupError !== null ? (
+            <SessionOperationRecovery
+              failure={sessionsModel.cleanupError}
+              onRetry={sessionsModel.retryCleanup}
+            />
+          ) : sessionsModel.operationError !== null ? (
             <SessionOperationRecovery
               failure={sessionsModel.operationError}
               onRetry={sessionsModel.retryOperation}

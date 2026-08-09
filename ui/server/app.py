@@ -238,8 +238,11 @@ def create_app(
         return request.app.state.session_manager
 
     @router.get("/health")
-    async def health() -> dict:
-        return {"status": "ok"}
+    async def health(request: Request) -> dict:
+        return {
+            "status": "ok",
+            "service_id": manager(request).metadata.service_id,
+        }
 
     @router.get("/config")
     async def config() -> dict:

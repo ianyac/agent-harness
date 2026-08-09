@@ -72,9 +72,9 @@ export function RecoveryView({
     const operation = ++operationRef.current;
     try {
       await action();
-    } catch (value) {
+    } catch {
       if (operationRef.current === operation) {
-        setActionError(value instanceof Error ? value.message : "The recovery action failed.");
+        setActionError("The recovery action failed.");
       }
     } finally {
       if (operationRef.current === operation) {

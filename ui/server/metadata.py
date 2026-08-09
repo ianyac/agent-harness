@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 import sqlite3
 from typing import Iterator
+from uuid import uuid4
 
 from harness.permissions import STARTUP_MODES
 
@@ -141,10 +142,35 @@ class MetadataStore:
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS service_identity (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    service_id TEXT NOT NULL UNIQUE
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO service_identity (singleton, service_id)
+                VALUES (1, ?)
+                """,
+                (str(uuid4()),),
+            )
 
     @staticmethod
     def _now() -> str:
         return datetime.now(UTC).isoformat(timespec="microseconds")
+
+    @property
+    def service_id(self) -> str:
+        """Return the non-secret identity of this metadata database."""
+        row = self._connection.execute(
+            "SELECT service_id FROM service_identity WHERE singleton = 1"
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("metadata service identity is missing")
+        return str(row["service_id"])
 
     @staticmethod
     def _validated_session(session: NewSession) -> NewSession:

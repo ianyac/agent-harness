@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import textwrap
+from uuid import UUID
 import warnings
 
 import pytest
@@ -186,7 +187,10 @@ def test_health_and_config_are_authenticated_and_describe_public_choices(
     config = client.get("/api/config")
 
     assert health.status_code == 200
-    assert health.json() == {"status": "ok"}
+    health_payload = health.json()
+    assert set(health_payload) == {"status", "service_id"}
+    assert health_payload["status"] == "ok"
+    assert str(UUID(health_payload["service_id"])) == health_payload["service_id"]
     assert config.status_code == 200
     assert config.json() == {
         "base_workspace": str(workspace.resolve()),

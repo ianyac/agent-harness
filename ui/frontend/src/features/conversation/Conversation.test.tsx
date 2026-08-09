@@ -48,6 +48,7 @@ function transcript(overrides: Partial<TranscriptState> = {}): TranscriptState {
     ...overrides,
     latestContext: overrides.latestContext ?? null,
     terminal: overrides.terminal ?? null,
+    activeTurn: overrides.activeTurn ?? null,
   };
 }
 

@@ -2,21 +2,30 @@ import { RefreshCw } from "lucide-react";
 import { useRef, useState } from "react";
 
 import { ApiError } from "../../api/http";
-import type { SessionOperationError } from "./useSessions";
+import type { SessionCleanupError, SessionOperationError } from "./useSessions";
 import styles from "../../components/recovery.module.css";
 
 type SessionOperationRecoveryProps = {
-  readonly failure: SessionOperationError;
+  readonly failure: SessionOperationError | SessionCleanupError;
   readonly onRetry: () => void | Promise<void>;
 };
 
-function operationName(kind: SessionOperationError["kind"]): string {
+function operationName(kind: SessionOperationError["kind"] | SessionCleanupError["kind"]): string {
   if (kind === "create") return "New chat";
   if (kind === "rename") return "Rename";
+  if (kind === "cleanup") return "cleanup";
   return "Archive";
 }
 
-function copy(failure: SessionOperationError): { readonly title: string; readonly body: string } {
+function copy(
+  failure: SessionOperationError | SessionCleanupError,
+): { readonly title: string; readonly body: string } {
+  if (failure.kind === "cleanup") {
+    return {
+      title: "Cleanup needs another try",
+      body: "An unused session is hidden until cleanup is confirmed.",
+    };
+  }
   const category = failure.error instanceof ApiError ? failure.error.category : "unknown";
   if (category === "credential_prerequisite") {
     return { title: "Sign in required", body: "Run codex login, then retry." };

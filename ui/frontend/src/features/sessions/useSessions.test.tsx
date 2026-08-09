@@ -1,10 +1,11 @@
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { useRef } from "react";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { ApiClient } from "../../api/http";
 import type { SessionRecord } from "./useSessions";
-import { useSessions } from "./useSessions";
+import { createSessionAuthority, useSessions } from "./useSessions";
 
 const connection = {
   baseUrl: "http://127.0.0.1:4010",
@@ -50,6 +51,7 @@ function SessionsHarness({ api }: { api: ApiClient }) {
   return (
     <>
       <output aria-label="Session titles">{model.sessions.map((item) => item.title).join("|")}</output>
+      <output aria-label="Session readiness">{model.loading ? "loading" : "ready"}</output>
       <output aria-label="Active session">{model.activeSessionId ?? "none"}</output>
       <output aria-label="Refresh error">{model.refreshError?.message ?? "none"}</output>
       <output aria-label="Operation error">
@@ -86,9 +88,175 @@ function SessionsHarness({ api }: { api: ApiClient }) {
   );
 }
 
+type LedgerStorage = {
+  readonly getItem: (key: string) => string | null;
+  readonly setItem: (key: string, value: string) => void;
+};
+
+function CleanupHarness({ api, storage }: { api: ApiClient; storage: LedgerStorage }) {
+  const authority = useRef(createSessionAuthority());
+  const model = useSessions(api, storage);
+  return (
+    <>
+      <output aria-label="Session titles">{model.sessions.map((item) => item.title).join("|")}</output>
+      <output aria-label="Session readiness">{model.loading ? "loading" : "ready"}</output>
+      <output aria-label="Refresh error">{model.refreshError?.message ?? "none"}</output>
+      <output aria-label="Cleanup status">
+        {model.cleanupError === null ? "none" : `cleanup:${model.cleanupError.sessionId}`}
+      </output>
+      <button type="button" onClick={() => void model.createSession({
+        workspace: "/work/stale",
+        mode: "default",
+        contextMode: "compaction",
+        title: "Stale create",
+      }, authority.current)}>Create stale</button>
+      <button type="button" onClick={() => model.invalidateCreate(authority.current)}>Supersede</button>
+      <button type="button" onClick={() => void model.renameSession("current", "Current renamed")}>Rename current</button>
+      <button type="button" onClick={() => void model.refresh()}>Refresh</button>
+      <button type="button" onClick={() => void model.retryCleanup()}>Retry cleanup</button>
+    </>
+  );
+}
+
 afterEach(cleanup);
 
 describe("useSessions async authority", () => {
+  it("persists failed superseded-create cleanup, suppresses the exact row, and retries only its DELETE", async () => {
+    const user = userEvent.setup();
+    const staleCreate = deferred<Response>();
+    const values = new Map<string, string>();
+    const storage: LedgerStorage = {
+      getItem: (key) => values.get(key) ?? null,
+      setItem: (key, value) => { values.set(key, value); },
+    };
+    const deletes: string[] = [];
+    let archived = false;
+    let staleExists = false;
+    let healthAvailable = true;
+    const api = client(async (input, init) => {
+      const path = new URL(input instanceof Request ? input.url : input.toString()).pathname;
+      if (path === "/api/health") {
+        return healthAvailable
+          ? Response.json({ status: "ok", service_id: "11111111-1111-4111-8111-111111111111" })
+          : new Response(null, { status: 503 });
+      }
+      if (path === "/api/config") return Response.json(config);
+      if (path === "/api/sessions" && init?.method === "GET") {
+        return Response.json([
+          ...(staleExists && !archived ? [session("stale", "Stale create")] : []),
+          session("current", "Current"),
+        ]);
+      }
+      if (path === "/api/sessions" && init?.method === "POST") return staleCreate.promise;
+      if (path === "/api/sessions/current" && init?.method === "PATCH") {
+        return Response.json(session("current", "Current renamed"));
+      }
+      if (init?.method === "DELETE") {
+        deletes.push(path);
+        if (deletes.length === 1) return new Response(null, { status: 503 });
+        archived = true;
+        return new Response(null, { status: 204 });
+      }
+      return new Response(null, { status: 404 });
+    });
+    const rendered = render(<CleanupHarness api={api} storage={storage} />);
+    await screen.findByText("Current", { selector: "output" });
+
+    await user.click(screen.getByRole("button", { name: "Create stale" }));
+    await user.click(screen.getByRole("button", { name: "Supersede" }));
+    staleExists = true;
+    staleCreate.resolve(Response.json(session("stale", "Stale create"), { status: 201 }));
+    expect(await screen.findByRole("status", { name: "Cleanup status" }))
+      .toHaveTextContent("cleanup:stale");
+    expect(deletes).toEqual(["/api/sessions/stale"]);
+    expect([...values.keys()].join("|")).not.toContain(connection.token);
+    expect([...values.values()].join("|")).not.toContain("/work/stale");
+
+    healthAvailable = false;
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    await waitFor(() => expect(screen.getByRole("status", { name: "Session titles" }))
+      .toHaveTextContent("Current"));
+    expect(screen.getByRole("status", { name: "Session titles" })).not.toHaveTextContent("Stale create");
+    expect(await screen.findByRole("status", { name: "Refresh error" }))
+      .toHaveTextContent("identity could not be confirmed");
+    healthAvailable = true;
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    await waitFor(() => expect(screen.getByRole("status", { name: "Refresh error" }))
+      .toHaveTextContent("none"));
+    expect(screen.getByRole("status", { name: "Session titles" })).not.toHaveTextContent("Stale create");
+    await user.click(screen.getByRole("button", { name: "Rename current" }));
+    expect(await screen.findByText("Current renamed", { selector: "output" })).toBeVisible();
+    expect(screen.getByRole("status", { name: "Cleanup status" })).toHaveTextContent("cleanup:stale");
+
+    rendered.unmount();
+    render(<CleanupHarness api={api} storage={storage} />);
+    await screen.findByText("Current", { selector: "output" });
+    expect(screen.getByRole("status", { name: "Session titles" })).not.toHaveTextContent("Stale create");
+    expect(screen.getByRole("status", { name: "Cleanup status" })).toHaveTextContent("cleanup:stale");
+
+    await user.dblClick(screen.getByRole("button", { name: "Retry cleanup" }));
+    expect(deletes).toEqual(["/api/sessions/stale", "/api/sessions/stale"]);
+    await waitFor(() => expect(screen.getByRole("status", { name: "Cleanup status" }))
+      .toHaveTextContent("none"));
+  });
+
+  it("scopes cleanup suppression and late DELETE results to the stable service authority", async () => {
+    const user = userEvent.setup();
+    const staleCreate = deferred<Response>();
+    const staleDelete = deferred<Response>();
+    const values = new Map<string, string>();
+    const storage: LedgerStorage = {
+      getItem: (key) => values.get(key) ?? null,
+      setItem: (key, value) => { values.set(key, value); },
+    };
+    const deleted: string[] = [];
+    const serviceA = client(async (input, init) => {
+      const path = new URL(input instanceof Request ? input.url : input.toString()).pathname;
+      if (path === "/api/health") {
+        return Response.json({ status: "ok", service_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" });
+      }
+      if (path === "/api/config") return Response.json(config);
+      if (path === "/api/sessions" && init?.method === "GET") return Response.json([]);
+      if (path === "/api/sessions" && init?.method === "POST") return staleCreate.promise;
+      if (init?.method === "DELETE") {
+        deleted.push(`A:${path}`);
+        return staleDelete.promise;
+      }
+      return new Response(null, { status: 404 });
+    });
+    const serviceB = client(async (input) => {
+      const path = new URL(input instanceof Request ? input.url : input.toString()).pathname;
+      if (path === "/api/health") {
+        return Response.json({ status: "ok", service_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" });
+      }
+      if (path === "/api/config") return Response.json(config);
+      if (path === "/api/sessions") return Response.json([session("stale", "Current on B")]);
+      return new Response(null, { status: 404 });
+    });
+    const rendered = render(<CleanupHarness api={serviceA} storage={storage} />);
+    await screen.findByText("ready", { selector: "output" });
+    await user.click(screen.getByRole("button", { name: "Create stale" }));
+    await user.click(screen.getByRole("button", { name: "Supersede" }));
+    staleCreate.resolve(Response.json(session("stale", "Stale on A"), { status: 201 }));
+    await waitFor(() => expect(deleted).toEqual(["A:/api/sessions/stale"]));
+
+    rendered.rerender(<CleanupHarness api={serviceB} storage={storage} />);
+    expect(await screen.findByText("Current on B", { selector: "output" })).toBeVisible();
+    staleDelete.resolve(new Response(null, { status: 503 }));
+    await act(async () => { await Promise.resolve(); });
+    expect(screen.getByRole("status", { name: "Cleanup status" })).toHaveTextContent("none");
+    expect(deleted).toEqual(["A:/api/sessions/stale"]);
+
+    rendered.rerender(<CleanupHarness api={serviceA} storage={storage} />);
+    await waitFor(() => expect(screen.getByRole("status", { name: "Cleanup status" }))
+      .toHaveTextContent("cleanup:stale"));
+    await user.click(screen.getByRole("button", { name: "Retry cleanup" }));
+    expect(deleted).toEqual([
+      "A:/api/sessions/stale",
+      "A:/api/sessions/stale",
+    ]);
+  });
+
   it("preserves a typed rename failure apart from refresh readiness and retries its exact request", async () => {
     const user = userEvent.setup();
     const titles: string[] = [];

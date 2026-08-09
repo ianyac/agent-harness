@@ -176,3 +176,74 @@ All five Important findings from `task-9-review.md` are addressed.
 - `npm run build`: passed without warnings; main application `389.23 kB`, markdown vendor `165.72 kB`.
 - `git diff --check`: passed.
 - No browser or Playwright run was used.
+
+## Fix round 2/5 — authoritative queued retry and durable stale-create cleanup
+
+The two remaining Important findings from the fix-round-1 re-review are now
+addressed. The narrow server identity seam described below was explicitly
+authorized for this round and supersedes the original frontend-only scope note.
+
+### RED checkpoints
+
+1. Exact direct/queued turn binding
+
+   `npm test -- --run src/App.test.tsx src/protocol/reducer.test.ts`
+
+   Initial result: App had 2 failed and 29 passed; the queued-B failure retried
+   direct turn A, and clearing B still left a Retry action. The reducer contract
+   separately failed 1 of 29 because it exposed no authoritative active turn.
+   A later rejection test failed 1 of 33 because the raw Retry exception was
+   rendered, and the rejected queue-edit test failed because the prior queued
+   candidate was not restored.
+
+2. Stable service authority
+
+   `.venv/bin/pytest -q tests/test_metadata.py::test_service_identity_is_stable_per_database_and_distinct_between_databases tests/test_app_rest.py::test_health_and_config_are_authenticated_and_describe_public_choices`
+
+   Initial result: 2 failed. `MetadataStore` had no stable `service_id`, and the
+   authenticated health payload exposed only `{status: "ok"}`.
+
+3. Durable cleanup ledger
+
+   `npm test -- --run src/features/sessions/useSessions.test.tsx`
+
+   Initial result: 2 failed and 13 passed. The model had neither retained
+   cleanup failure authority nor an exact manual cleanup retry.
+
+### Implemented contracts
+
+- Reducer state exposes the current authoritative `turn_started` identity and
+  clears it at a terminal boundary. App keeps separate direct and queued
+  candidates, replaces or clears queued candidates with the real queue
+  lifecycle, restores the prior candidate when a queue edit is rejected, and
+  binds a candidate only when its own authoritative turn starts.
+- Failed-turn Retry requires exact session, client, dispatcher, generation, and
+  turn-id agreement. It sends the bound submission once while pending;
+  rejected retries restore the same action and every recovery action uses
+  stable copy rather than raw host/provider exceptions.
+- Each metadata database owns one non-secret UUID `service_id`, stable across
+  reopening that database and distinct for another database. Authenticated
+  `GET /api/health` exposes only `status` plus that identity; unauthenticated
+  access remains rejected.
+- The frontend keeps a versioned, bounded cleanup ledger keyed by `service_id`
+  and exact session id. A superseded successful create is recorded before its
+  exact DELETE is attempted. Failed cleanup remains suppressed from later list
+  and selection commits across refresh and remount, and receives a safe,
+  duplicate-suppressed `Retry cleanup` action until DELETE or same-authority
+  404 confirms absence.
+- Unrelated rename/archive operations cannot clear cleanup authority. Service
+  replacement activates only the new service's ledger; a late result for A
+  cannot hide or delete B, even when B has the same session id. Storage payloads
+  contain no connection token, workspace, transcript, or tool content.
+
+### Final verification after fix round 2
+
+- Focused recovery/authority gate: 5 files, 95 tests passed.
+- Full frontend: 25 files, 291 tests passed.
+- Server metadata + REST gate: 144 tests passed.
+- `npm run typecheck`: passed with no diagnostics.
+- `npm run build`: passed without warnings; main application `394.57 kB`,
+  markdown vendor `165.72 kB`.
+- `git diff --check`: passed.
+- No browser, Playwright, Tauri host, deployment, Task 10, controller-ledger, or
+  deferred-Minor work was performed.

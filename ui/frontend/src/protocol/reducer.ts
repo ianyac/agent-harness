@@ -29,6 +29,7 @@ export function emptyTranscript(): TranscriptState {
     latestContext: null,
     error: null,
     terminal: null,
+    activeTurn: null,
   };
 }
 
@@ -191,6 +192,7 @@ function terminalState(state: TranscriptState): TranscriptState {
     running: false,
     stopping: false,
     queued: null,
+    activeTurn: null,
   };
 }
 
@@ -217,6 +219,7 @@ export function transcriptReducer(state: TranscriptState, event: ServerEvent): T
       latestContext: null,
       error: null,
       terminal: null,
+      activeTurn: null,
     };
   }
 
@@ -240,6 +243,11 @@ export function transcriptReducer(state: TranscriptState, event: ServerEvent): T
         queued: null,
         error: null,
         terminal: null,
+        activeTurn: {
+          generation: event.generation,
+          sequence: event.sequence,
+          turnId: event.turn_id,
+        },
       };
     case "assistant_delta": {
       const timeline = appendAssistantDelta(state.timeline, event.text);

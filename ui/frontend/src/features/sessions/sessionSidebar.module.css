@@ -41,25 +41,32 @@
   min-width: 0;
   gap: 5px;
   margin-inline-start: auto;
-  color: var(--color-ink-muted);
+  color: var(--color-ink-small);
   font-size: 11px;
   font-weight: 500;
 }
 
-.connectionDot {
-  flex: 0 0 8px;
-  width: 8px;
-  height: 8px;
+.connectionMark {
+  display: grid;
+  flex: 0 0 16px;
+  width: 16px;
+  height: 16px;
+  box-sizing: border-box;
+  border: 2px solid currentColor;
   border-radius: 50%;
-  background: var(--color-attention);
+  background: var(--color-sidebar);
+  font-size: 10px;
+  font-weight: 800;
+  line-height: 1;
+  place-items: center;
 }
 
-.connectionStatus[data-status="connected"] .connectionDot {
-  background: var(--color-success);
+.connectionStatus[data-status="connected"] .connectionMark {
+  border-radius: 4px;
 }
 
-.connectionStatus[data-status="disconnected"] .connectionDot {
-  background: var(--color-danger-strong);
+.connectionStatus[data-status="disconnected"] .connectionMark {
+  border-radius: 1px;
 }
 
 .primaryAction,
@@ -91,7 +98,7 @@
 .shortcut {
   margin-inline-start: auto;
   border: 0;
-  color: var(--color-ink-muted);
+  color: var(--color-ink-small);
   background: transparent;
   font-family: var(--font-sans);
   font-size: 11px;
@@ -111,7 +118,7 @@
 .groupHeading,
 .commandHeading {
   margin: 14px 8px 5px;
-  color: var(--color-ink-muted);
+  color: var(--color-ink-small);
   font-size: 11px;
   font-weight: 650;
   letter-spacing: 0.04em;
@@ -170,8 +177,33 @@
 
 .workspace,
 .statusText {
-  color: var(--color-ink-muted);
+  color: var(--color-ink-small);
   font-size: 11px;
+}
+
+.sessionTooltip {
+  z-index: 70;
+  display: grid;
+  max-width: min(280px, calc(100vw - 24px));
+  gap: 2px;
+  padding: 7px 9px;
+  border: 1px solid var(--color-ink-small);
+  border-radius: var(--radius-control);
+  color: var(--color-ink);
+  background: var(--color-surface);
+  box-shadow: 0 8px 24px color-mix(in srgb, #000 18%, transparent);
+  font-size: 11px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  pointer-events: none;
+}
+
+.sessionTooltip strong {
+  font-size: 12px;
+}
+
+.sessionTooltip span {
+  color: var(--color-ink-small);
 }
 
 .statusIcon {
@@ -487,7 +519,7 @@
 
 .command kbd,
 .command small {
-  color: var(--color-ink-muted);
+  color: var(--color-ink-small);
   font-size: 11px;
 }
 

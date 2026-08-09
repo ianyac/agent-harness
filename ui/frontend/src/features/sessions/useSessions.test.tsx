@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -51,8 +51,11 @@ function SessionsHarness({ api }: { api: ApiClient }) {
     <>
       <output aria-label="Session titles">{model.sessions.map((item) => item.title).join("|")}</output>
       <output aria-label="Active session">{model.activeSessionId ?? "none"}</output>
+      <output aria-label="Session error">{model.error?.message ?? "none"}</output>
       <button type="button" onClick={() => void model.refresh()}>Refresh</button>
       <button type="button" onClick={() => void model.createSession()}>Create</button>
+      <button type="button" onClick={() => model.selectSession("session-1")}>Select session-1</button>
+      <button type="button" onClick={() => model.selectSession("session-2")}>Select session-2</button>
       <button type="button" onClick={() => void model.renameSession("session-1", "First rename")}>
         First rename
       </button>
@@ -205,5 +208,217 @@ describe("useSessions async authority", () => {
       ),
     );
     expect(screen.getByRole("status", { name: "Active session" })).toHaveTextContent("none");
+  });
+
+  it("keeps an earlier confirmed rename when a later rename fails", async () => {
+    const user = userEvent.setup();
+    const first = deferred<Response>();
+    const second = deferred<Response>();
+    let patches = 0;
+    const api = client(async (input, init) => {
+      const path = new URL(input instanceof Request ? input.url : input.toString()).pathname;
+      if (path === "/api/config") return Response.json(config);
+      if (path === "/api/sessions" && init?.method === "GET") {
+        return Response.json([session("session-1", "Original")]);
+      }
+      if (init?.method === "PATCH") {
+        patches += 1;
+        return patches === 1 ? first.promise : second.promise;
+      }
+      return new Response(null, { status: 404 });
+    });
+    render(<SessionsHarness api={api} />);
+    await screen.findByText("Original", { selector: "output" });
+
+    await user.click(screen.getByRole("button", { name: "First rename" }));
+    await user.click(screen.getByRole("button", { name: "Second rename" }));
+    first.resolve(Response.json(session("session-1", "First confirmed")));
+    expect(await screen.findByText("First confirmed", { selector: "output" })).toBeVisible();
+    second.resolve(new Response(null, { status: 500 }));
+
+    await waitFor(() =>
+      expect(screen.getByRole("status", { name: "Session error" })).not.toHaveTextContent("none"),
+    );
+    expect(screen.getByRole("status", { name: "Session titles" })).toHaveTextContent(
+      "First confirmed",
+    );
+  });
+
+  it("applies an earlier confirmed duplicate archive when the later archive fails", async () => {
+    const user = userEvent.setup();
+    const first = deferred<Response>();
+    const second = deferred<Response>();
+    let deletes = 0;
+    const api = client(async (input, init) => {
+      const path = new URL(input instanceof Request ? input.url : input.toString()).pathname;
+      if (path === "/api/config") return Response.json(config);
+      if (path === "/api/sessions" && init?.method === "GET") {
+        return Response.json([session("session-1")]);
+      }
+      if (init?.method === "DELETE") {
+        deletes += 1;
+        return deletes === 1 ? first.promise : second.promise;
+      }
+      return new Response(null, { status: 404 });
+    });
+    render(<SessionsHarness api={api} />);
+    await waitFor(() =>
+      expect(screen.getByRole("status", { name: "Session titles" })).toHaveTextContent(
+        "session-1",
+      ),
+    );
+
+    await user.click(screen.getByRole("button", { name: "Archive" }));
+    await user.click(screen.getByRole("button", { name: "Archive" }));
+    first.resolve(new Response(null, { status: 204 }));
+    await waitFor(() =>
+      expect(screen.getByRole("status", { name: "Session titles" })).toBeEmptyDOMElement(),
+    );
+    await act(async () => {
+      second.resolve(new Response(null, { status: 404 }));
+    });
+
+    await waitFor(() =>
+      expect(screen.getByRole("status", { name: "Active session" })).toHaveTextContent("none"),
+    );
+    expect(screen.getByRole("status", { name: "Session titles" })).toBeEmptyDOMElement();
+  });
+
+  it("keeps a confirmed rename when a later cross-kind archive fails", async () => {
+    const user = userEvent.setup();
+    const rename = deferred<Response>();
+    const archive = deferred<Response>();
+    const api = client(async (input, init) => {
+      const path = new URL(input instanceof Request ? input.url : input.toString()).pathname;
+      if (path === "/api/config") return Response.json(config);
+      if (path === "/api/sessions" && init?.method === "GET") {
+        return Response.json([session("session-1", "Original")]);
+      }
+      if (init?.method === "PATCH") return rename.promise;
+      if (init?.method === "DELETE") return archive.promise;
+      return new Response(null, { status: 404 });
+    });
+    render(<SessionsHarness api={api} />);
+    await screen.findByText("Original", { selector: "output" });
+
+    await user.click(screen.getByRole("button", { name: "First rename" }));
+    await user.click(screen.getByRole("button", { name: "Archive" }));
+    rename.resolve(Response.json(session("session-1", "Confirmed rename")));
+    expect(await screen.findByText("Confirmed rename", { selector: "output" })).toBeVisible();
+    archive.resolve(new Response(null, { status: 500 }));
+
+    await waitFor(() =>
+      expect(screen.getByRole("status", { name: "Session error" })).not.toHaveTextContent("none"),
+    );
+    expect(screen.getByRole("status", { name: "Session titles" })).toHaveTextContent(
+      "Confirmed rename",
+    );
+  });
+
+  it("lets a confirmed archive dominate a later stale rename success", async () => {
+    const user = userEvent.setup();
+    const archive = deferred<Response>();
+    const rename = deferred<Response>();
+    const api = client(async (input, init) => {
+      const path = new URL(input instanceof Request ? input.url : input.toString()).pathname;
+      if (path === "/api/config") return Response.json(config);
+      if (path === "/api/sessions" && init?.method === "GET") {
+        return Response.json([session("session-1", "Original")]);
+      }
+      if (init?.method === "DELETE") return archive.promise;
+      if (init?.method === "PATCH") return rename.promise;
+      return new Response(null, { status: 404 });
+    });
+    render(<SessionsHarness api={api} />);
+    await screen.findByText("Original", { selector: "output" });
+
+    await user.click(screen.getByRole("button", { name: "Archive" }));
+    await user.click(screen.getByRole("button", { name: "First rename" }));
+    archive.resolve(new Response(null, { status: 204 }));
+    await waitFor(() =>
+      expect(screen.getByRole("status", { name: "Session titles" })).toBeEmptyDOMElement(),
+    );
+    await act(async () => {
+      rename.resolve(Response.json(session("session-1", "Stale rename")));
+    });
+
+    await waitFor(() =>
+      expect(screen.getByRole("status", { name: "Session titles" })).not.toHaveTextContent(
+        "Stale rename",
+      ),
+    );
+    expect(screen.getByRole("status", { name: "Active session" })).toHaveTextContent("none");
+  });
+
+  it("does not let an older concurrent create response steal selection", async () => {
+    const user = userEvent.setup();
+    const first = deferred<Response>();
+    const second = deferred<Response>();
+    let creates = 0;
+    const api = client(async (input, init) => {
+      const path = new URL(input instanceof Request ? input.url : input.toString()).pathname;
+      if (path === "/api/config") return Response.json(config);
+      if (path === "/api/sessions" && init?.method === "GET") {
+        return Response.json([session("session-1")]);
+      }
+      if (path === "/api/sessions" && init?.method === "POST") {
+        creates += 1;
+        return creates === 1 ? first.promise : second.promise;
+      }
+      return new Response(null, { status: 404 });
+    });
+    render(<SessionsHarness api={api} />);
+    await waitFor(() =>
+      expect(screen.getByRole("status", { name: "Session titles" })).toHaveTextContent(
+        "session-1",
+      ),
+    );
+
+    await user.click(screen.getByRole("button", { name: "Create" }));
+    await user.click(screen.getByRole("button", { name: "Create" }));
+    second.resolve(Response.json(session("created-2", "Newer create"), { status: 201 }));
+    await waitFor(() =>
+      expect(screen.getByRole("status", { name: "Active session" })).toHaveTextContent(
+        "created-2",
+      ),
+    );
+    first.resolve(Response.json(session("created-1", "Older create"), { status: 201 }));
+
+    await waitFor(() =>
+      expect(screen.getByRole("status", { name: "Session titles" })).toHaveTextContent(
+        "Older create",
+      ),
+    );
+    expect(screen.getByRole("status", { name: "Active session" })).toHaveTextContent(
+      "created-2",
+    );
+  });
+
+  it("preserves a later explicit selection while create is pending", async () => {
+    const user = userEvent.setup();
+    const create = deferred<Response>();
+    const api = client(async (input, init) => {
+      const path = new URL(input instanceof Request ? input.url : input.toString()).pathname;
+      if (path === "/api/config") return Response.json(config);
+      if (path === "/api/sessions" && init?.method === "GET") {
+        return Response.json([session("session-1"), session("session-2")]);
+      }
+      if (path === "/api/sessions" && init?.method === "POST") return create.promise;
+      return new Response(null, { status: 404 });
+    });
+    render(<SessionsHarness api={api} />);
+    await screen.findByText("session-1|session-2", { selector: "output" });
+
+    await user.click(screen.getByRole("button", { name: "Create" }));
+    await user.click(screen.getByRole("button", { name: "Select session-2" }));
+    expect(screen.getByRole("status", { name: "Active session" })).toHaveTextContent("session-2");
+    create.resolve(Response.json(session("created", "Created later"), { status: 201 }));
+
+    await waitFor(() =>
+      expect(screen.getByRole("status", { name: "Session titles" })).toHaveTextContent(
+        "Created later",
+      ),
+    );
+    expect(screen.getByRole("status", { name: "Active session" })).toHaveTextContent("session-2");
   });
 });

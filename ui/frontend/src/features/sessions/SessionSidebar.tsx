@@ -1,3 +1,4 @@
+import * as Tooltip from "@radix-ui/react-tooltip";
 import {
   Bot,
   ChevronLeft,
@@ -105,13 +106,19 @@ export function SessionSidebar({
     connected: "Connected",
     disconnected: "Disconnected",
   }[connectionStatus];
+  const connectionMark = {
+    connecting: "…",
+    connected: "✓",
+    disconnected: "!",
+  }[connectionStatus];
 
   return (
-    <nav
-      aria-label="Sessions"
-      className={`session-sidebar ${styles.sidebar}`}
-      data-collapsed={collapsed}
-    >
+    <Tooltip.Provider delayDuration={0} skipDelayDuration={0}>
+      <nav
+        aria-label="Sessions"
+        className={`session-sidebar ${styles.sidebar}`}
+        data-collapsed={collapsed}
+      >
       <div className={styles.identity}>
         <Bot aria-hidden="true" size={20} />
         <span className={styles.collapseCopy}>Agent Harness</span>
@@ -122,7 +129,14 @@ export function SessionSidebar({
           aria-label={connectionLabel}
           title={connectionLabel}
         >
-          <span className={styles.connectionDot} aria-hidden="true" />
+          <span
+            className={styles.connectionMark}
+            data-connection-mark=""
+            data-state-symbol={connectionStatus}
+            aria-hidden="true"
+          >
+            {connectionMark}
+          </span>
           <span className={styles.connectionCopy}>{connectionCopy}</span>
         </span>
       </div>
@@ -198,6 +212,7 @@ export function SessionSidebar({
           )}
         </button>
       </div>
-    </nav>
+      </nav>
+    </Tooltip.Provider>
   );
 }

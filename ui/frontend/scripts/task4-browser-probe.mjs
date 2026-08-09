@@ -136,6 +136,63 @@ async function sidebarWidth(page) {
   );
 }
 
+const connectionLabels = {
+  connecting: "Local service connecting",
+  connected: "Local service connected",
+  disconnected: "Local service disconnected",
+};
+
+async function verifyConnectionTreatment(page, state, symbol, theme) {
+  await page.locator("html").evaluate((element, value) => {
+    element.dataset.theme = value;
+  }, theme);
+  const sidebar = page.getByRole("navigation", { name: "Sessions" });
+  const status = page.getByRole("status", { name: connectionLabels[state] });
+  const mark = status.locator("[data-connection-mark]");
+  await mark.waitFor();
+  assert.equal((await mark.textContent())?.trim(), symbol, `${state} must have a distinct mark`);
+  const box = await mark.boundingBox();
+  assert(box && box.width >= 14 && box.height >= 14, `${state} mark must remain visible in the rail`);
+  const [border, background] = await Promise.all([
+    mark.evaluate((element) => getComputedStyle(element).borderTopColor),
+    sidebar.evaluate((element) => getComputedStyle(element).backgroundColor),
+  ]);
+  assert(
+    contrast(border, background) >= 3,
+    `${theme} ${state} mark must meet 3:1 against the sidebar`,
+  );
+}
+
+async function prepareDisconnectedPage(context, width) {
+  const page = await context.newPage();
+  await page.setViewportSize({ width, height: 800 });
+  await page.goto(origin);
+  await page.getByRole("status", { name: connectionLabels.disconnected }).waitFor();
+  return page;
+}
+
+async function prepareConnectingPage(context, width) {
+  const page = await context.newPage();
+  let releasePlatform;
+  const platformGate = new Promise((resolve) => {
+    releasePlatform = resolve;
+  });
+  await page.setViewportSize({ width, height: 800 });
+  await page.route("**/src/platform/index.ts", async (route) => {
+    await platformGate;
+    await route.continue();
+  });
+  await page.goto(appUrl);
+  await page.getByRole("status", { name: connectionLabels.connecting }).waitFor();
+  return {
+    page,
+    release: async () => {
+      releasePlatform();
+      await page.unrouteAll({ behavior: "ignoreErrors" });
+    },
+  };
+}
+
 async function verifyContrast(page, theme) {
   await page.locator("html").evaluate((element, value) => {
     element.dataset.theme = value;
@@ -219,7 +276,15 @@ try {
   const connection = wide.getByRole("status", { name: "Local service connected" });
   assert((await connection.boundingBox())?.width, "connection status must remain visible in the rail");
   const sessionButton = wide.getByRole("button", { name: /Ship navigation.*\/work\/acme/i });
-  assert.match(await sessionButton.getAttribute("title"), /Ship navigation.*\/work\/acme/i);
+  await sessionButton.focus();
+  const focusedIdentity = wide.getByRole("tooltip");
+  await focusedIdentity.waitFor({ timeout: 3_000 });
+  assert.match(await focusedIdentity.innerText(), /Ship navigation.*\/work\/acme/is);
+  await verifyConnectionTreatment(wide, "connected", "✓", "light");
+  await verifyConnectionTreatment(wide, "connected", "✓", "dark");
+  await wide.locator("html").evaluate((element) => {
+    element.dataset.theme = "light";
+  });
   const more = wide.getByRole("button", { name: "More actions for Ship navigation" });
   await more.click();
   await wide.getByRole("menuitem", { name: "Rename" }).click();
@@ -246,7 +311,27 @@ try {
     (await narrow.getByRole("status", { name: "Local service connected" }).boundingBox())?.width,
     "connection status must remain visible in the automatic rail",
   );
+  const narrowSession = narrow.getByRole("button", { name: /Ship navigation.*\/work\/acme/i });
+  await narrowSession.hover();
+  const hoveredIdentity = narrow.getByRole("tooltip");
+  await hoveredIdentity.waitFor({ timeout: 3_000 });
+  assert.match(await hoveredIdentity.innerText(), /Ship navigation.*\/work\/acme/is);
   await narrowContext.close();
+
+  const connectingContext = await browser.newContext();
+  await connectingContext.addInitScript(() => localStorage.clear());
+  const connecting = await prepareConnectingPage(connectingContext, 900);
+  await verifyConnectionTreatment(connecting.page, "connecting", "…", "light");
+  await verifyConnectionTreatment(connecting.page, "connecting", "…", "dark");
+  await connecting.release();
+  await connectingContext.close();
+
+  const disconnectedContext = await browser.newContext();
+  await disconnectedContext.addInitScript(() => localStorage.clear());
+  const disconnected = await prepareDisconnectedPage(disconnectedContext, 900);
+  await verifyConnectionTreatment(disconnected, "disconnected", "!", "light");
+  await verifyConnectionTreatment(disconnected, "disconnected", "!", "dark");
+  await disconnectedContext.close();
   console.log("Task 4 browser probe passed at 1100px and 900px.");
 } finally {
   await browser?.close();

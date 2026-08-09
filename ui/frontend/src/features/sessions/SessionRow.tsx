@@ -1,5 +1,6 @@
 import * as Dialog from "@radix-ui/react-dialog";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
+import * as Tooltip from "@radix-ui/react-tooltip";
 import { Circle, MoreHorizontal, Save, X } from "lucide-react";
 import { useRef, useState } from "react";
 
@@ -71,27 +72,37 @@ export function SessionRow({
 
   return (
     <li className={styles.row} data-active={active || undefined}>
-      <button
-        type="button"
-        className={styles.sessionButton}
-        aria-label={accessibleName}
-        aria-current={active ? "page" : undefined}
-        title={accessibleName}
-        onClick={() => onSelect(session.session_id)}
-      >
-        <Circle
-          className={styles.statusIcon}
-          data-status={runtime?.status ?? "idle"}
-          aria-hidden="true"
-          size={12}
-          fill="currentColor"
-        />
-        <span className={styles.sessionCopy} aria-hidden="true">
-          <span className={styles.sessionTitle}>{session.title}</span>
-          <span className={styles.workspace}>{workspace}</span>
-          {status === null ? null : <span className={styles.statusText}>{status}</span>}
-        </span>
-      </button>
+      <Tooltip.Root>
+        <Tooltip.Trigger asChild>
+          <button
+            type="button"
+            className={styles.sessionButton}
+            aria-label={accessibleName}
+            aria-current={active ? "page" : undefined}
+            onClick={() => onSelect(session.session_id)}
+          >
+            <Circle
+              className={styles.statusIcon}
+              data-status={runtime?.status ?? "idle"}
+              aria-hidden="true"
+              size={12}
+              fill="currentColor"
+            />
+            <span className={styles.sessionCopy} aria-hidden="true">
+              <span className={styles.sessionTitle}>{session.title}</span>
+              <span className={styles.workspace}>{workspace}</span>
+              {status === null ? null : <span className={styles.statusText}>{status}</span>}
+            </span>
+          </button>
+        </Tooltip.Trigger>
+        <Tooltip.Portal>
+          <Tooltip.Content className={styles.sessionTooltip} side="right" sideOffset={8}>
+            <strong>{session.title}</strong>
+            <span>{session.workspace}</span>
+            {status === null ? null : <span>{status}</span>}
+          </Tooltip.Content>
+        </Tooltip.Portal>
+      </Tooltip.Root>
       <Dialog.Root open={renaming} onOpenChange={changeRenameOpen}>
         <DropdownMenu.Root>
           <DropdownMenu.Trigger asChild>

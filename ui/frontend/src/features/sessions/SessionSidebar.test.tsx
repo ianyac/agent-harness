@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -102,7 +102,14 @@ describe("SessionSidebar", () => {
     render(
       <SessionSidebar
         {...{ connectionStatus: "disconnected" }}
-        sessions={[session()]}
+        sessions={[
+          session(),
+          session({
+            session_id: "session-2",
+            workspace: "/work/other",
+            title: "Review release",
+          }),
+        ]}
         activeSessionId="session-1"
         runtimeBySession={{}}
         now={new Date("2026-08-09T12:00:00+08:00")}
@@ -125,10 +132,18 @@ describe("SessionSidebar", () => {
     expect(screen.getByRole("button", { name: "Search sessions" })).toBeVisible();
     expect(screen.getByRole("button", { name: "Settings" })).toBeVisible();
     expect(screen.getByRole("status", { name: "Local service disconnected" })).toBeVisible();
-    expect(screen.getByRole("button", { name: /Ship navigation.*\/work\/acme/i })).toHaveAttribute(
-      "title",
-      expect.stringMatching(/Ship navigation.*\/work\/acme/i),
-    );
+    const shipSession = screen.getByRole("button", { name: /Ship navigation.*\/work\/acme/i });
+    await user.hover(shipSession);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent("Ship navigation");
+    expect(screen.getByRole("tooltip")).toHaveTextContent("/work/acme");
+    await user.unhover(shipSession);
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByRole("tooltip")).not.toBeInTheDocument());
+
+    const reviewSession = screen.getByRole("button", { name: /Review release.*\/work\/other/i });
+    act(() => reviewSession.focus());
+    expect(await screen.findByRole("tooltip")).toHaveTextContent("Review release");
+    expect(screen.getByRole("tooltip")).toHaveTextContent("/work/other");
     expect(screen.getByRole("button", { name: /More actions for Ship navigation/i })).toBeVisible();
 
     await user.click(screen.getByRole("button", { name: /More actions for Ship navigation/i }));
@@ -138,6 +153,39 @@ describe("SessionSidebar", () => {
     await user.keyboard("{Escape}");
     expect(rename).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: /More actions for Ship navigation/i })).toHaveFocus();
+  });
+
+  it("uses distinct visible marks for every connection state in the rail", async () => {
+    const user = userEvent.setup();
+    const props = {
+      sessions: [session()],
+      activeSessionId: "session-1",
+      runtimeBySession: {},
+      now: new Date("2026-08-09T12:00:00+08:00"),
+      storage: sidebarStorage,
+      onCreate: () => {},
+      onSelect: () => {},
+      onRename: () => {},
+      onArchive: () => {},
+      onSearch: () => {},
+      onOpenSettings: () => {},
+    } as const;
+    const { rerender } = render(
+      <SessionSidebar {...props} connectionStatus="connecting" />,
+    );
+    await user.click(screen.getByRole("button", { name: "Collapse sidebar" }));
+
+    expect(
+      within(screen.getByRole("status", { name: "Local service connecting" })).getByText("…"),
+    ).toBeVisible();
+    rerender(<SessionSidebar {...props} connectionStatus="connected" />);
+    expect(
+      within(screen.getByRole("status", { name: "Local service connected" })).getByText("✓"),
+    ).toBeVisible();
+    rerender(<SessionSidebar {...props} connectionStatus="disconnected" />);
+    expect(
+      within(screen.getByRole("status", { name: "Local service disconnected" })).getByText("!"),
+    ).toBeVisible();
   });
 
   it("uses local midnight boundaries for Today and Yesterday", () => {

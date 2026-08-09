@@ -70,7 +70,12 @@ export function useSessions(client: ApiClient | null): SessionsModel {
   const clientEpochRef = useRef(0);
   const refreshRequestRef = useRef(0);
   const mutationVersionRef = useRef(0);
-  const sessionMutationRef = useRef(new Map<string, number>());
+  const sessionOperationRef = useRef(new Map<string, number>());
+  const confirmedArchiveRef = useRef(new Set<string>());
+  const confirmedRenameRef = useRef(
+    new Map<string, { readonly operation: number; readonly record: SessionRecord }>(),
+  );
+  const selectionIntentRef = useRef(0);
 
   const commitSessions = useCallback((next: SessionRecord[]) => {
     sessionsRef.current = next;
@@ -133,7 +138,10 @@ export function useSessions(client: ApiClient | null): SessionsModel {
     clientEpochRef.current += 1;
     refreshRequestRef.current += 1;
     mutationVersionRef.current += 1;
-    sessionMutationRef.current.clear();
+    sessionOperationRef.current.clear();
+    confirmedArchiveRef.current.clear();
+    confirmedRenameRef.current.clear();
+    selectionIntentRef.current += 1;
   }, [client]);
 
   useEffect(() => {
@@ -154,6 +162,7 @@ export function useSessions(client: ApiClient | null): SessionsModel {
     if (client === null || serviceConfig === null) return;
     const requestClient = client;
     const epoch = clientEpochRef.current;
+    const selectionIntent = ++selectionIntentRef.current;
     mutationVersionRef.current += 1;
     try {
       const created = await requestClient.post<SessionRecord>("/api/sessions", {
@@ -168,7 +177,9 @@ export function useSessions(client: ApiClient | null): SessionsModel {
         created,
         ...sessionsRef.current.filter((item) => item.session_id !== created.session_id),
       ]);
-      commitActiveSession(created.session_id);
+      if (selectionIntentRef.current === selectionIntent) {
+        commitActiveSession(created.session_id);
+      }
       setError(null);
     } catch (value) {
       if (isCurrentClient(requestClient, epoch)) setError(errorFrom(value));
@@ -178,6 +189,7 @@ export function useSessions(client: ApiClient | null): SessionsModel {
   const selectSession = useCallback(
     (sessionId: string) => {
       if (sessionsRef.current.some((record) => record.session_id === sessionId)) {
+        selectionIntentRef.current += 1;
         commitActiveSession(sessionId);
       }
     },
@@ -189,30 +201,29 @@ export function useSessions(client: ApiClient | null): SessionsModel {
       if (client === null) return;
       const requestClient = client;
       const epoch = clientEpochRef.current;
-      const mutation = (sessionMutationRef.current.get(sessionId) ?? 0) + 1;
-      sessionMutationRef.current.set(sessionId, mutation);
+      const operation = (sessionOperationRef.current.get(sessionId) ?? 0) + 1;
+      sessionOperationRef.current.set(sessionId, operation);
       mutationVersionRef.current += 1;
       try {
         const renamed = await requestClient.patch<SessionRecord>(
           `/api/sessions/${encodeURIComponent(sessionId)}`,
           { title },
         );
-        if (
-          !isCurrentClient(requestClient, epoch) ||
-          sessionMutationRef.current.get(sessionId) !== mutation
-        ) return;
+        if (!isCurrentClient(requestClient, epoch)) return;
         mutationVersionRef.current += 1;
-        commitSessions(
-          sessionsRef.current.map((record) =>
-            record.session_id === sessionId ? renamed : record,
-          ),
-        );
+        if (confirmedArchiveRef.current.has(sessionId)) return;
+        const confirmed = confirmedRenameRef.current.get(sessionId);
+        if (confirmed === undefined || operation > confirmed.operation) {
+          confirmedRenameRef.current.set(sessionId, { operation, record: renamed });
+          commitSessions(
+            sessionsRef.current.map((record) =>
+              record.session_id === sessionId ? renamed : record,
+            ),
+          );
+        }
         setError(null);
       } catch (value) {
-        if (
-          isCurrentClient(requestClient, epoch) &&
-          sessionMutationRef.current.get(sessionId) === mutation
-        ) {
+        if (isCurrentClient(requestClient, epoch) && !confirmedArchiveRef.current.has(sessionId)) {
           setError(errorFrom(value));
         }
       }
@@ -225,16 +236,15 @@ export function useSessions(client: ApiClient | null): SessionsModel {
       if (client === null) return;
       const requestClient = client;
       const epoch = clientEpochRef.current;
-      const mutation = (sessionMutationRef.current.get(sessionId) ?? 0) + 1;
-      sessionMutationRef.current.set(sessionId, mutation);
+      const operation = (sessionOperationRef.current.get(sessionId) ?? 0) + 1;
+      sessionOperationRef.current.set(sessionId, operation);
       mutationVersionRef.current += 1;
       try {
         await requestClient.delete(`/api/sessions/${encodeURIComponent(sessionId)}`);
-        if (
-          !isCurrentClient(requestClient, epoch) ||
-          sessionMutationRef.current.get(sessionId) !== mutation
-        ) return;
+        if (!isCurrentClient(requestClient, epoch)) return;
         mutationVersionRef.current += 1;
+        confirmedArchiveRef.current.add(sessionId);
+        confirmedRenameRef.current.delete(sessionId);
         const remaining = sessionsRef.current.filter((record) => record.session_id !== sessionId);
         commitSessions(remaining);
         if (activeSessionIdRef.current === sessionId) {
@@ -242,10 +252,7 @@ export function useSessions(client: ApiClient | null): SessionsModel {
         }
         setError(null);
       } catch (value) {
-        if (
-          isCurrentClient(requestClient, epoch) &&
-          sessionMutationRef.current.get(sessionId) === mutation
-        ) {
+        if (isCurrentClient(requestClient, epoch) && !confirmedArchiveRef.current.has(sessionId)) {
           setError(errorFrom(value));
         }
       }

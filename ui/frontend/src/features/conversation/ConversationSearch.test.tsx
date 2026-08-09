@@ -24,6 +24,7 @@ function state(messages: HarnessMessage[]): TranscriptState {
     stopping: false,
     queued: null,
     safety: null,
+    latestContext: null,
     error: null,
   };
 }

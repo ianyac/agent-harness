@@ -220,4 +220,28 @@ describe("groupActivities", () => {
     expect(state.timeline.filter((item) => item.kind === "activity" && item.activityId === "failed"))
       .toHaveLength(1);
   });
+
+  it("ends routine activity grouping at an exact context-management marker", () => {
+    let state = transcriptReducer(
+      emptyTranscript(),
+      event("activity_started", { sequence: 1, activity_id: "before-context", name: "read_file" }),
+    );
+    state = transcriptReducer(state, event("context_updated", {
+      sequence: 2,
+      context: { mode: "compaction", summarized_messages: 2 },
+    }));
+    state = transcriptReducer(
+      state,
+      event("activity_started", { sequence: 3, activity_id: "after-context", name: "list_dir" }),
+    );
+
+    expect(groupTimeline(state)).toEqual([
+      [expect.objectContaining({ activityId: "before-context" })],
+      expect.objectContaining({
+        kind: "context",
+        context: { mode: "compaction", summarized_messages: 2 },
+      }),
+      [expect.objectContaining({ activityId: "after-context" })],
+    ]);
+  });
 });

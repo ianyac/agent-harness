@@ -2,6 +2,7 @@ import type {
   ActivityItem,
   TranscriptAssistantTimelineItem,
   TranscriptBoundaryTimelineItem,
+  TranscriptContextTimelineItem,
   TranscriptPermissionTimelineItem,
   TranscriptPlanReviewTimelineItem,
 } from "../../protocol/types";
@@ -10,6 +11,7 @@ export type ActivityGroup = readonly ActivityItem[];
 export type TimelineMarker =
   | TranscriptAssistantTimelineItem
   | TranscriptBoundaryTimelineItem
+  | TranscriptContextTimelineItem
   | TranscriptPermissionTimelineItem
   | TranscriptPlanReviewTimelineItem;
 export type GroupedTimelineItem = ActivityGroup | TimelineMarker;

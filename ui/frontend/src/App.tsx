@@ -5,6 +5,10 @@ import { CommandPalette } from "./components/CommandPalette";
 import { Composer } from "./features/conversation/Composer";
 import type { DraftStorage } from "./features/conversation/useDraft";
 import { Conversation } from "./features/conversation/Conversation";
+import { ActivityInspector } from "./features/inspector/ActivityInspector";
+import { useInspector } from "./features/inspector/useInspector";
+import type { InspectorStorage } from "./features/inspector/useInspector";
+import type { CopyText } from "./features/conversation/CodeBlock";
 import { ConversationHeader } from "./features/sessions/ConversationHeader";
 import { SessionSidebar } from "./features/sessions/SessionSidebar";
 import type { ConnectionStatus } from "./features/sessions/SessionSidebar";
@@ -26,6 +30,8 @@ type AppProps = {
   readonly onToggleActivity?: () => void;
   readonly sidebarStorage?: Pick<Storage, "getItem" | "setItem">;
   readonly draftStorage?: DraftStorage;
+  readonly inspectorStorage?: InspectorStorage;
+  readonly inspectorCopyText?: CopyText;
 };
 
 export function App({
@@ -39,6 +45,8 @@ export function App({
   onToggleActivity = () => {},
   sidebarStorage,
   draftStorage,
+  inspectorStorage,
+  inspectorCopyText,
 }: AppProps) {
   const [connection, setConnection] = useState<{
     readonly client: ApiClient | null;
@@ -82,6 +90,17 @@ export function App({
   const activeTranscript = activeSession === null
     ? null
     : transcriptBySession[activeSession.session_id] ?? emptyTranscriptState;
+  const inspector = useInspector({
+    sessionId: activeSession?.session_id ?? null,
+    storage: inspectorStorage ?? sidebarStorage,
+  });
+  const activeElement = () => document.activeElement instanceof HTMLElement
+    ? document.activeElement
+    : null;
+  const openInspectorOverview = () => {
+    onToggleActivity();
+    inspector.openOverview(activeElement());
+  };
 
   return (
     <div className="app-shell">
@@ -111,7 +130,7 @@ export function App({
             branch={branchBySession[activeSession.session_id] ?? null}
             mode={activeSession.mode}
             onSetSessionMode={(event) => onSessionEvent(activeSession.session_id, event)}
-            onToggleActivity={onToggleActivity}
+            onToggleActivity={openInspectorOverview}
           />
         )}
         <main aria-label="Conversation" className="conversation-main">
@@ -119,7 +138,10 @@ export function App({
             <Conversation
               key={`conversation-${activeSession?.session_id}`}
               state={activeTranscript}
-              openInspector={() => onToggleActivity()}
+              openInspector={(activityId) => {
+                onToggleActivity();
+                inspector.openActivity(activityId, activeElement());
+              }}
               ownsSearchShortcut
               onSessionEvent={(event) => activeSession === null
                 ? undefined
@@ -140,13 +162,29 @@ export function App({
           />
         ) : null}
       </div>
+      {activeSession !== null && activeTranscript !== null ? (
+        <ActivityInspector
+          open={inspector.open}
+          narrow={inspector.narrow}
+          width={inspector.width}
+          pinned={inspector.pinned}
+          contextMode={activeSession.context_mode}
+          state={activeTranscript}
+          selectedActivityId={inspector.selectedActivityId}
+          onClose={inspector.close}
+          onPinnedChange={inspector.setPinned}
+          onSelectActivity={inspector.selectActivity}
+          onWidthChange={inspector.setWidth}
+          copyText={inspectorCopyText}
+        />
+      ) : null}
       <CommandPalette
         open={paletteOpen}
         onOpenChange={setPaletteOpen}
         sessions={sessionsModel.sessions}
         onNewChat={sessionsModel.createSession}
         onOpenSettings={onOpenSettings}
-        onToggleActivity={onToggleActivity}
+        onToggleActivity={openInspectorOverview}
         onSelectSession={sessionsModel.selectSession}
       />
     </div>

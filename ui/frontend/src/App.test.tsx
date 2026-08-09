@@ -79,6 +79,88 @@ async function selectSession(user: ReturnType<typeof userEvent.setup>, title: st
 afterEach(cleanup);
 
 describe("App", () => {
+  it("opens selected activity detail from the transcript and overview from the header", async () => {
+    const user = userEvent.setup();
+    const active = session();
+    const transcript = {
+      ...emptyTranscript(),
+      activities: {
+        "activity-app": {
+          activityId: "activity-app",
+          turnId: "turn-app",
+          parentActivityId: null,
+          actor: "tool",
+          name: "read_file",
+          args: { path: "README.md" },
+          startedAt: "2026-08-09T04:00:00Z",
+          status: "complete" as const,
+          result: "complete file contents",
+          isError: false,
+          durationMs: 12,
+        },
+      },
+      activityOrder: ["activity-app"],
+      timeline: [{ kind: "activity" as const, activityId: "activity-app" }],
+    };
+
+    render(
+      <App
+        client={clientWithSessions([active])}
+        sidebarStorage={storage}
+        draftStorage={storage}
+        transcriptBySession={{ [active.session_id]: transcript }}
+      />,
+    );
+
+    await user.click(await screen.findByRole("button", { name: /Open activity: read file/i }));
+    expect(screen.getByRole("dialog", { name: "Activity inspector" })).toBeVisible();
+    expect(screen.getByRole("region", { name: "Selected activity detail" })).toHaveTextContent(
+      "complete file contents",
+    );
+    await user.click(screen.getByRole("button", { name: "Close activity inspector" }));
+    await user.click(screen.getByRole("button", { name: "Activity" }));
+    expect(screen.getByRole("dialog", { name: "Activity inspector" })).toBeVisible();
+    expect(screen.queryByRole("region", { name: "Selected activity detail" })).not.toBeInTheDocument();
+  });
+
+  it("owns one exact inspector shortcut and isolates pinned open state by active session", async () => {
+    const user = userEvent.setup();
+    const sessionA = session({ session_id: "inspector-a", title: "Inspector A" });
+    const sessionB = session({ session_id: "inspector-b", title: "Inspector B" });
+    const values = new Map<string, string>();
+    const inspectorStorage = {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => { values.set(key, value); },
+    };
+    render(
+      <App
+        client={clientWithSessions([sessionA, sessionB])}
+        sidebarStorage={storage}
+        draftStorage={storage}
+        inspectorStorage={inspectorStorage}
+        transcriptBySession={{
+          [sessionA.session_id]: emptyTranscript(),
+          [sessionB.session_id]: emptyTranscript(),
+        }}
+      />,
+    );
+
+    await screen.findByRole("heading", { name: "project-a" });
+    fireEvent.keyDown(window, { key: "i", metaKey: true, shiftKey: true, repeat: true });
+    fireEvent.keyDown(window, { key: "i", metaKey: true, shiftKey: true, altKey: true });
+    expect(screen.queryByRole("dialog", { name: "Activity inspector" })).not.toBeInTheDocument();
+    fireEvent.keyDown(window, { key: "i", metaKey: true, shiftKey: true });
+    expect(screen.getAllByRole("dialog", { name: "Activity inspector" })).toHaveLength(1);
+    await user.click(screen.getByRole("button", { name: "Pin inspector" }));
+
+    await selectSession(user, sessionB.title);
+    expect(screen.queryByRole("dialog", { name: "Activity inspector" })).not.toBeInTheDocument();
+    await selectSession(user, sessionA.title);
+    expect(screen.getByRole("dialog", { name: "Activity inspector" })).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Close activity inspector" }));
+    expect(values.get("agent-harness:inspector-pinned:inspector-a")).toBe("false");
+  });
+
   it("renders the focused product shell and reports a failed bootstrap", async () => {
     render(
       <App

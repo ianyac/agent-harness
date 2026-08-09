@@ -185,6 +185,7 @@ export function Conversation({
               );
             }
             if (item.kind === "boundary") return null;
+            if (item.kind === "context") return null;
             if (item.kind === "permission") {
               return (
                 <PermissionCard

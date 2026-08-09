@@ -279,12 +279,20 @@ export type TranscriptPlanReviewTimelineItem = {
   resolution: PlanReviewResolution | null;
 };
 
+export type TranscriptContextTimelineItem = {
+  kind: "context";
+  turnId: string | null;
+  sequence: number;
+  context: JsonObject;
+};
+
 export type TranscriptTimelineItem =
   | TranscriptActivityTimelineItem
   | TranscriptAssistantTimelineItem
   | TranscriptBoundaryTimelineItem
   | TranscriptPermissionTimelineItem
-  | TranscriptPlanReviewTimelineItem;
+  | TranscriptPlanReviewTimelineItem
+  | TranscriptContextTimelineItem;
 
 export type TranscriptState = {
   generation: number;
@@ -300,5 +308,6 @@ export type TranscriptState = {
   stopping: boolean;
   queued: QueuedMessage | null;
   safety: SafetySnapshot | null;
+  latestContext: JsonObject | null;
   error: RecoverableError | null;
 };

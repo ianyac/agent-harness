@@ -46,6 +46,7 @@ function transcript(overrides: Partial<TranscriptState> = {}): TranscriptState {
     safety: null,
     error: null,
     ...overrides,
+    latestContext: overrides.latestContext ?? null,
   };
 }
 
@@ -73,6 +74,29 @@ describe("Conversation", () => {
     expect(assistantMessage).toHaveAttribute("data-message-role", "assistant");
     expect(userMessage).toHaveTextContent("Please inspect this.");
     expect(assistantMessage).toHaveTextContent("I found the cause.");
+  });
+
+  it("uses context markers as grouping boundaries without rendering them as assistant prose", () => {
+    let state = transcriptReducer(emptyTranscript(), event("activity_started", {
+      sequence: 1,
+      activity_id: "before-context",
+      name: "read_file",
+    }));
+    state = transcriptReducer(state, event("context_updated", {
+      sequence: 2,
+      context: { mode: "compaction", summarized_messages: 3 },
+    }));
+    state = transcriptReducer(state, event("activity_started", {
+      sequence: 3,
+      activity_id: "after-context",
+      name: "list_dir",
+    }));
+
+    render(<Conversation state={state} openInspector={() => {}} />);
+
+    expect(screen.getAllByRole("button", { name: /Open activity:/ })).toHaveLength(2);
+    expect(screen.queryByText(/summarized_messages/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("article", { name: "Assistant message" })).not.toBeInTheDocument();
   });
 
   it("renders safe Markdown links without executing raw HTML", () => {

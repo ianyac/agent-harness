@@ -26,6 +26,7 @@ export function emptyTranscript(): TranscriptState {
     stopping: false,
     queued: null,
     safety: null,
+    latestContext: null,
     error: null,
   };
 }
@@ -212,6 +213,7 @@ export function transcriptReducer(state: TranscriptState, event: ServerEvent): T
       stopping: false,
       queued: event.queued_message,
       safety: event.safety,
+      latestContext: null,
       error: null,
     };
   }
@@ -304,7 +306,19 @@ export function transcriptReducer(state: TranscriptState, event: ServerEvent): T
         planReview: state.planReview?.requestId === event.request_id ? null : state.planReview,
       };
     case "context_updated":
-      return accepted;
+      return {
+        ...accepted,
+        latestContext: event.context,
+        timeline: [
+          ...state.timeline,
+          {
+            kind: "context",
+            turnId: event.turn_id,
+            sequence: event.sequence,
+            context: event.context,
+          },
+        ],
+      };
     case "turn_stopping":
       return { ...accepted, running: true, stopping: true };
     case "turn_completed": {

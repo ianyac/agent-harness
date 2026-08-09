@@ -702,6 +702,62 @@ describe("transcriptReducer", () => {
     expect(state.streamingText).toBe("keep");
   });
 
+  it("retains exact context updates chronologically while the latest snapshot wins", () => {
+    let state = transcriptReducer(emptyTranscript(), event("turn_started", {
+      sequence: 1,
+      turn_id: "context-turn",
+    }));
+    state = transcriptReducer(state, event("context_updated", {
+      sequence: 2,
+      turn_id: "context-turn",
+      context: { mode: "compaction", summarized_messages: 4, opaque: { keep: true } },
+    }));
+    state = transcriptReducer(state, event("context_updated", {
+      sequence: 3,
+      turn_id: "context-turn",
+      context: { mode: "folding", used_tokens: 0 },
+    }));
+
+    expect(state.latestContext).toEqual({ mode: "folding", used_tokens: 0 });
+    expect(state.timeline).toEqual([
+      {
+        kind: "context",
+        turnId: "context-turn",
+        sequence: 2,
+        context: { mode: "compaction", summarized_messages: 4, opaque: { keep: true } },
+      },
+      {
+        kind: "context",
+        turnId: "context-turn",
+        sequence: 3,
+        context: { mode: "folding", used_tokens: 0 },
+      },
+    ]);
+  });
+
+  it("clears context authority on a newer snapshot but preserves terminal history", () => {
+    let state = transcriptReducer(emptyTranscript(), event("context_updated", {
+      sequence: 1,
+      context: { mode: "compaction", used_tokens: 91 },
+    }));
+    state = transcriptReducer(state, event("turn_failed", {
+      sequence: 2,
+      error_category: "provider",
+      message: "offline",
+    }));
+    expect(state.latestContext).toEqual({ mode: "compaction", used_tokens: 91 });
+    expect(state.timeline[0]).toEqual(expect.objectContaining({ kind: "context" }));
+
+    state = transcriptReducer(state, event("session_snapshot", {
+      generation: 2,
+      sequence: 1,
+      messages: [],
+      safety: {},
+    }));
+    expect(state.latestContext).toBeNull();
+    expect(state.timeline).toEqual([]);
+  });
+
   it("replaces all prior state from a newer authoritative snapshot", () => {
     let state = transcriptReducer(emptyTranscript(), event("turn_started", { sequence: 1 }));
     state = transcriptReducer(state, event("assistant_delta", { sequence: 2, text: "stale" }));
@@ -732,6 +788,7 @@ describe("transcriptReducer", () => {
       stopping: false,
       queued: null,
       safety: { mode: "default" },
+      latestContext: null,
       error: null,
     });
   });

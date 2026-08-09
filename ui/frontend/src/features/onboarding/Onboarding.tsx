@@ -29,6 +29,7 @@ type OnboardingProps = {
 };
 
 const ignoreInvalidation = () => {};
+const nativePickerError = "The folder picker is unavailable. Try again.";
 
 function browserPathError(path: string): string | null {
   if (path === "") return "Choose a workspace to continue.";
@@ -55,15 +56,19 @@ export function Onboarding({
   const [error, setError] = useState<string | null>(null);
   const [credentialRequest, setCredentialRequest] = useState<CreateSessionOptions | null>(null);
   const [pending, setPending] = useState(false);
+  const [pickerPending, setPickerPending] = useState(false);
   const [complete, setComplete] = useState(false);
   const authorityRef = useRef<CreateSessionAuthority>(createSessionAuthority());
   const pendingRef = useRef<CreateSessionAuthority | null>(null);
+  const pickerPendingRef = useRef(false);
 
   useLayoutEffect(() => {
     onInvalidateCreate(authorityRef.current);
     authorityRef.current = createSessionAuthority();
     pendingRef.current = null;
+    pickerPendingRef.current = false;
     setPending(false);
+    setPickerPending(false);
     setComplete(false);
     setCredentialRequest(null);
     setError(null);
@@ -127,15 +132,20 @@ export function Onboarding({
   }
 
   const chooseNativeWorkspace = async () => {
-    if (pendingRef.current !== null) return;
+    if (pendingRef.current !== null || pickerPendingRef.current) return;
+    pickerPendingRef.current = true;
+    setPickerPending(true);
     setError(null);
     try {
       const chosen = await platform.chooseWorkspace();
       if (chosen === null) return;
       invalidate();
       setWorkspace(chosen);
-    } catch (value) {
-      setError(value instanceof Error ? value.message : "The folder picker failed.");
+    } catch {
+      setError(nativePickerError);
+    } finally {
+      pickerPendingRef.current = false;
+      setPickerPending(false);
     }
   };
   const start = () => {
@@ -161,8 +171,16 @@ export function Onboarding({
         {platform.kind === "tauri" ? (
           <div className={styles.field}>
             <span>Workspace</span>
-            <button type="button" className={styles.secondaryButton} onClick={() => void chooseNativeWorkspace()}>
-              <FolderOpen aria-hidden="true" size={18} /> Choose folder
+            <button
+              type="button"
+              className={styles.secondaryButton}
+              disabled={pending || pickerPending}
+              onClick={() => void chooseNativeWorkspace()}
+            >
+              <FolderOpen aria-hidden="true" size={18} />
+              {pickerPending
+                ? "Choosing folder…"
+                : error === nativePickerError ? "Retry folder picker" : "Choose folder"}
             </button>
             {workspace === "" ? null : <code className={styles.workspace}>{workspace}</code>}
           </div>
@@ -204,7 +222,7 @@ export function Onboarding({
         </fieldset>
 
         {error === null ? null : <p role="alert" className={styles.error}>{error}</p>}
-        <button type="button" className={styles.primaryButton} disabled={pending} onClick={start}>
+        <button type="button" className={styles.primaryButton} disabled={pending || pickerPending} onClick={start}>
           {pending ? "Starting…" : "Start local session"}
         </button>
       </section>

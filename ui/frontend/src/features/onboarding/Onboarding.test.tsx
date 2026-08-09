@@ -24,8 +24,12 @@ function session(workspace = "/work/acme"): SessionRecord {
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((accept) => { resolve = accept; });
-  return { promise, resolve };
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((accept, decline) => {
+    resolve = accept;
+    reject = decline;
+  });
+  return { promise, resolve, reject };
 }
 
 function adapter(changes: Partial<PlatformAdapter> = {}): PlatformAdapter {
@@ -99,12 +103,64 @@ describe("Onboarding", () => {
     expect((await axe.run(container, { rules: { "color-contrast": { enabled: false } } })).violations).toEqual([]);
   });
 
-  it("uses only the native picker result and handles cancel and rejection", async () => {
+  it("keeps the mounted native picker single-flight with a visible disabled pending state", async () => {
+    const user = userEvent.setup();
+    const picker = deferred<string | null>();
+    const chooseWorkspace = vi.fn(() => picker.promise);
+    render(
+      <Onboarding
+        serviceStatus="ready"
+        platform={adapter({ kind: "tauri", chooseWorkspace })}
+        defaultWorkspace=""
+        defaultMode="default"
+        defaultContextMode="compaction"
+        onCreate={async () => success()}
+      />,
+    );
+
+    await user.dblClick(screen.getByRole("button", { name: "Choose folder" }));
+    expect(chooseWorkspace).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("button", { name: "Choosing folder…" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Start local session" })).toBeDisabled();
+
+    await act(async () => picker.resolve("/canonical/native-workspace"));
+    expect(screen.getByText("/canonical/native-workspace")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Choose folder" })).toBeEnabled();
+  });
+
+  it("contains native picker rejection behind generic retry and clears cleanly on cancel", async () => {
     const user = userEvent.setup();
     const chooseWorkspace = vi.fn()
-      .mockResolvedValueOnce(null)
-      .mockRejectedValueOnce(new Error("Picker unavailable"))
-      .mockResolvedValueOnce("/canonical/native-workspace");
+      .mockRejectedValueOnce(new Error("/private/workspace/native-dialog-detail"))
+      .mockResolvedValueOnce(null);
+    const onCreate = vi.fn(async () => success());
+    render(
+      <Onboarding
+        serviceStatus="ready"
+        platform={adapter({ kind: "tauri", chooseWorkspace })}
+        defaultWorkspace=""
+        defaultMode="default"
+        defaultContextMode="compaction"
+        onCreate={onCreate}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "Choose folder" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "The folder picker is unavailable. Try again.",
+    );
+    expect(screen.getByRole("alert")).not.toHaveTextContent(/private|workspace|native-dialog-detail/i);
+
+    await user.click(screen.getByRole("button", { name: "Retry folder picker" }));
+    expect(chooseWorkspace).toHaveBeenCalledTimes(2);
+    await waitFor(() => expect(screen.queryByRole("alert")).not.toBeInTheDocument());
+    expect(screen.queryByText(/canonical\//)).not.toBeInTheDocument();
+    expect(onCreate).not.toHaveBeenCalled();
+  });
+
+  it("uses only the successful native picker result for session creation", async () => {
+    const user = userEvent.setup();
+    const chooseWorkspace = vi.fn().mockResolvedValue("/canonical/native-workspace");
     const onCreate = vi.fn(async () => success("/canonical/native-workspace"));
     render(
       <Onboarding
@@ -118,10 +174,6 @@ describe("Onboarding", () => {
     );
 
     expect(screen.queryByRole("textbox", { name: "Workspace path" })).not.toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "Choose folder" }));
-    expect(onCreate).not.toHaveBeenCalled();
-    await user.click(screen.getByRole("button", { name: "Choose folder" }));
-    expect(await screen.findByRole("alert")).toHaveTextContent("Picker unavailable");
     await user.click(screen.getByRole("button", { name: "Choose folder" }));
     expect(screen.getByText("/canonical/native-workspace")).toBeVisible();
     await user.click(screen.getByRole("button", { name: "Start local session" }));

@@ -18,6 +18,29 @@ async function assertAxe(page: Parameters<Parameters<typeof test>[1]>[0]["page"]
   expect(violations).toEqual([]);
 }
 
+test("full sidebar identity keeps the visible connection status inside its available width", async ({ page, authority }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto(authority.entryPath);
+  await expect.poll(authority.socketConnections).toBe(1);
+  const connection = page.getByRole("status", { name: "Local service connected" });
+  await expect(connection.getByText("Connected", { exact: true })).toBeVisible();
+  const geometry = await connection.evaluate((status) => {
+    const identity = status.parentElement;
+    const copy = status.querySelector("span");
+    if (identity === null || copy === null) throw new Error("Missing identity status geometry");
+    const identityBox = identity.getBoundingClientRect();
+    const copyBox = copy.getBoundingClientRect();
+    return {
+      identityRight: identityBox.right,
+      copyRight: copyBox.right,
+      statusClientWidth: status.clientWidth,
+      statusScrollWidth: status.scrollWidth,
+    };
+  });
+  expect(geometry.copyRight).toBeLessThanOrEqual(geometry.identityRight);
+  expect(geometry.statusScrollWidth).toBeLessThanOrEqual(geometry.statusClientWidth);
+});
+
 for (const width of [1440, 1100, 900, 720]) {
   test(`responsive shell remains functional at ${width}px`, async ({ page, authority }) => {
     await page.setViewportSize({ width, height: 900 });

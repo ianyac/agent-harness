@@ -339,3 +339,73 @@ The browser matrix remains Playwright `1.62.1`, project `bundled-chromium`, pinn
 - The explicit browser artifact makes runs reproducible on this approved offline macOS ARM lane; a missing revision fails loudly rather than selecting another cache entry.
 - The pre-existing Node `localStorage` warning remains deferred exactly as requested and is not changed in this fix round.
 - `git diff --check` and final scope/status checks are required immediately before the fix commit.
+
+## Fix round 2 — unclipped sidebar identity
+
+### Root cause and strict RED/GREEN evidence
+
+The full 224 px sidebar left 204 px after outer padding. Its identity used one non-wrapping flex row containing the 20 px brand icon, two gaps, **Agent Harness**, and the icon-plus-text connection status. The status could shrink, but its text still painted past the identity boundary and was then clipped by the sidebar's `overflow: hidden`, leaving **Connected** truncated in every full-sidebar baseline.
+
+A Playwright regression test now measures the rendered identity geometry at `1440x900`, verifies the accessible status named **Local service connected**, verifies visible **Connected** text, and requires both the text box and status scroll width to remain within the identity. Before the production change:
+
+```text
+npx playwright test e2e/visual.spec.ts --grep "full sidebar identity"
+Expected: <= 213
+Received: 229.859375
+1 failed
+```
+
+The identity now uses an intentional two-row grid: the Bot icon spans the two rows, **Agent Harness** remains the visible product name, and the existing Lucide check plus **Connected** status occupies its own named row. The compact/collapsed layout retains its icon-only rail and right-aligned connection mark. Focused GREEN:
+
+```text
+npx playwright test e2e/visual.spec.ts --grep "full sidebar identity|responsive shell remains functional at 1440px"
+2 passed
+
+npx playwright test e2e/visual.spec.ts --grep "full sidebar identity|responsive shell|axe violations"
+8 passed
+```
+
+This covers every responsive width (`1440`, `1100`, `900`, and `720`), the full and rail status presentations, visible/non-color status semantics, accessible naming, required target sizes, and unsuppressed axe checks.
+
+### Visual review and baseline scope
+
+The first post-fix visual run identified the expected full-sidebar changes and also revealed a 50-pixel compact-rail alignment drift. Explicitly right-aligning the collapsed status restored the compact presentation; the `permission-900`, `primary-720-dark`, `first-run-720`, and `reduced-motion-900` baselines then passed unchanged.
+
+The old and new images for all remaining candidates were opened together at original resolution. Review confirmed a coherent two-line identity with the complete status and no unrelated content, inspector, conversation, composer, target, or rail movement. Only these four full-sidebar baselines were regenerated through the pinned Playwright project:
+
+- `primary-1440-light-bundled-chromium-darwin.png`
+- `streaming-1100-bundled-chromium-darwin.png`
+- `tool-failure-inspector-1440-bundled-chromium-darwin.png`
+- `reconnect-1100-bundled-chromium-darwin.png`
+
+Fresh visual verification passed all responsive, axe, motion, clipping, and approved-image cases:
+
+```text
+npx playwright test e2e/visual.spec.ts
+12 passed (8.5s)
+```
+
+### Fix-round-2 full regression and scope
+
+```text
+cd ui/frontend
+npm test -- --run
+Test Files  26 passed (26)
+Tests       313 passed (313)
+
+npm run typecheck
+exit 0
+
+npm run build
+1954 modules transformed
+exit 0
+
+npm run e2e
+28 passed (12.5s)
+
+cd ui
+uv run pytest -q
+398 passed in 9.73s
+```
+
+The browser remains Playwright `1.62.1`, project `bundled-chromium`, pinned offline revision `1223`, `Google Chrome for Testing 148.0.7778.96`. Production scope is limited to sidebar identity layout CSS; harness scope is one user-facing geometry regression assertion. No authentication, external network, axe suppression, private selector, root `harness/`, or `main.py` change was introduced. The pre-existing Node `localStorage` warning remains unchanged.

@@ -27,23 +27,40 @@
 }
 
 .identity {
-  display: flex;
+  display: grid;
+  grid-template-areas:
+    "brand name"
+    "brand status";
+  grid-template-columns: 20px minmax(0, 1fr);
   align-items: center;
-  gap: 9px;
+  column-gap: 9px;
+  row-gap: 1px;
   padding: 4px 8px 12px;
   font-weight: 650;
   white-space: nowrap;
 }
 
+.identity > svg {
+  grid-area: brand;
+}
+
+.identity > .collapseCopy {
+  grid-area: name;
+  line-height: 1.2;
+}
+
 .connectionStatus {
+  grid-area: status;
   display: flex;
   align-items: center;
+  justify-self: start;
+  max-width: 100%;
   min-width: 0;
   gap: 5px;
-  margin-inline-start: auto;
   color: var(--color-ink-small);
   font-size: 11px;
   font-weight: 500;
+  line-height: 1.2;
 }
 
 .connectionMark {
@@ -332,6 +349,17 @@
   place-items: center;
 }
 
+.sidebar[data-collapsed="true"] .identity {
+  grid-template-areas: "brand" "status";
+  grid-template-columns: 100%;
+  column-gap: 0;
+  row-gap: 9px;
+}
+
+.sidebar[data-collapsed="true"] .connectionStatus {
+  justify-self: end;
+}
+
 .sidebar[data-collapsed="true"] .sessionButton {
   grid-template-columns: 12px;
 }
@@ -558,6 +586,19 @@
     width: 44px;
     padding: 0;
     place-items: center;
+  }
+
+  .sidebar .identity,
+  .sidebar[data-collapsed="true"] .identity {
+    grid-template-areas: "brand" "status";
+    grid-template-columns: 100%;
+    column-gap: 0;
+    row-gap: 9px;
+  }
+
+  .sidebar .connectionStatus,
+  .sidebar[data-collapsed="true"] .connectionStatus {
+    justify-self: end;
   }
 
   .sidebar .primaryAction,

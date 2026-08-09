@@ -19,12 +19,15 @@ use tauri_plugin_shell::ShellExt as _;
 use tokio::sync::{Mutex, watch};
 
 use crate::{
-    readiness::{LOOPBACK_HOST, ReadinessAccumulator},
+    readiness::{LOOPBACK_HOST, MAX_READINESS_BYTES, ReadinessAccumulator},
     state::{LifecycleStatus, ServiceConnection, ServiceStateEvent},
 };
 
 pub const READINESS_TIMEOUT: Duration = Duration::from_secs(15);
 pub const PROCESS_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
+const PROCESS_DATA_CAPACITY: usize = 8;
+const MAX_CONSECUTIVE_OBSERVATION_FAILURES: usize = 3;
+const OBSERVER_CONTROL_CHECK_INTERVAL: Duration = Duration::from_millis(25);
 pub const SIDECAR_NAME: &str = "agent-harness-sidecar";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +89,35 @@ impl SpawnedSidecar {
     }
 }
 
+pub struct SpawnFailure {
+    error: LifecycleError,
+    process: Option<SpawnedSidecar>,
+}
+
+impl SpawnFailure {
+    pub fn new(error: LifecycleError) -> Self {
+        Self {
+            error,
+            process: None,
+        }
+    }
+
+    pub fn with_process(error: LifecycleError, process: SpawnedSidecar) -> Self {
+        Self {
+            error,
+            process: Some(process),
+        }
+    }
+
+    pub fn error(&self) -> LifecycleError {
+        self.error
+    }
+
+    fn into_parts(self) -> (LifecycleError, Option<SpawnedSidecar>) {
+        (self.error, self.process)
+    }
+}
+
 pub struct BootstrapInput {
     bytes: Vec<u8>,
 }
@@ -101,7 +133,7 @@ impl BootstrapInput {
 }
 
 pub trait SidecarSpawner: Send + Sync {
-    fn spawn(&self, bootstrap: BootstrapInput) -> Result<SpawnedSidecar, LifecycleError>;
+    fn spawn(&self, bootstrap: BootstrapInput) -> Result<SpawnedSidecar, SpawnFailure>;
 }
 
 pub trait TokenSource: Send + Sync {
@@ -148,6 +180,7 @@ impl<R: Runtime> TauriSidecarSpawner<R> {
 
 struct TauriSidecarChild {
     child: Arc<StdMutex<Child>>,
+    reap_sender: std::sync::mpsc::Sender<ObserverCommand>,
 }
 
 impl SidecarChild for TauriSidecarChild {
@@ -156,73 +189,160 @@ impl SidecarChild for TauriSidecarChild {
             .child
             .lock()
             .map_err(|_| LifecycleError::ProcessControlFailed)?;
-        match child
-            .try_wait()
-            .map_err(|_| LifecycleError::ProcessControlFailed)?
+        let already_terminated = match child.try_wait() {
+            Ok(Some(_)) => true,
+            Ok(None) | Err(_) => {
+                child
+                    .kill()
+                    .map_err(|_| LifecycleError::ProcessControlFailed)?;
+                false
+            }
+        };
+        drop(child);
+        if self
+            .reap_sender
+            .send(ObserverCommand::ReapAfterKill)
+            .is_err()
+            && !already_terminated
         {
-            Some(_) => Ok(()),
-            None => child
-                .kill()
-                .map_err(|_| LifecycleError::ProcessControlFailed),
+            spawn_fallback_reaper(Arc::clone(&self.child));
         }
+        Ok(())
     }
 }
 
 impl Drop for TauriSidecarChild {
     fn drop(&mut self) {
-        if let Ok(mut child) = self.child.lock()
-            && child.try_wait().ok().flatten().is_none()
-        {
-            let _ = child.kill();
-        }
+        let _ = self.kill();
     }
 }
 
+fn spawn_fallback_reaper(child: Arc<StdMutex<Child>>) {
+    thread::spawn(move || {
+        if let Ok(mut child) = child.lock() {
+            let _ = child.wait();
+        }
+    });
+}
+
 struct TauriSidecarEventStream {
-    receiver: tokio::sync::mpsc::UnboundedReceiver<ProcessEvent>,
+    data_receiver: tokio::sync::mpsc::Receiver<ProcessEvent>,
+    control_receiver: tokio::sync::mpsc::UnboundedReceiver<ProcessEvent>,
+}
+
+#[derive(Clone)]
+struct ProcessEventSenders {
+    data: tokio::sync::mpsc::Sender<ProcessEvent>,
+    control: tokio::sync::mpsc::UnboundedSender<ProcessEvent>,
+}
+
+impl ProcessEventSenders {
+    fn send_data(&self, event: ProcessEvent) -> bool {
+        match self.data.try_send(event) {
+            Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => true,
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }
+
+    fn send_control(&self, event: ProcessEvent) -> bool {
+        self.control.send(event).is_ok()
+    }
+}
+
+fn process_event_transport() -> (ProcessEventSenders, TauriSidecarEventStream) {
+    let (data, data_receiver) = tokio::sync::mpsc::channel(PROCESS_DATA_CAPACITY);
+    let (control, control_receiver) = tokio::sync::mpsc::unbounded_channel();
+    (
+        ProcessEventSenders { data, control },
+        TauriSidecarEventStream {
+            data_receiver,
+            control_receiver,
+        },
+    )
+}
+
+impl TauriSidecarEventStream {
+    #[cfg(test)]
+    fn pending_data_len(&self) -> usize {
+        self.data_receiver.len()
+    }
 }
 
 impl SidecarEventStream for TauriSidecarEventStream {
     fn next_event(&mut self) -> Pin<Box<dyn Future<Output = Option<ProcessEvent>> + Send + '_>> {
-        Box::pin(self.receiver.recv())
+        Box::pin(poll_fn(|context| {
+            let control_closed = match self.control_receiver.poll_recv(context) {
+                Poll::Ready(Some(event)) => return Poll::Ready(Some(event)),
+                Poll::Ready(None) => true,
+                Poll::Pending => false,
+            };
+            match self.data_receiver.poll_recv(context) {
+                Poll::Ready(Some(event)) => Poll::Ready(Some(event)),
+                Poll::Ready(None) if control_closed => Poll::Ready(None),
+                Poll::Ready(None) | Poll::Pending => Poll::Pending,
+            }
+        }))
     }
 }
 
 impl<R: Runtime> SidecarSpawner for TauriSidecarSpawner<R> {
-    fn spawn(&self, bootstrap: BootstrapInput) -> Result<SpawnedSidecar, LifecycleError> {
+    fn spawn(&self, bootstrap: BootstrapInput) -> Result<SpawnedSidecar, SpawnFailure> {
         let command = self
             .app
             .shell()
             .sidecar(SIDECAR_NAME)
-            .map_err(|_| LifecycleError::StartupFailed)?;
+            .map_err(|_| SpawnFailure::new(LifecycleError::StartupFailed))?;
         let mut command: std::process::Command = command.into();
-        validate_sidecar_command_transport(&command)?;
-        let mut child = command.spawn().map_err(|_| LifecycleError::StartupFailed)?;
-        let stdin = child.stdin.take().ok_or_else(|| {
-            terminate_unmanaged_child(&mut child);
-            LifecycleError::StartupFailed
-        })?;
-        if write_bootstrap_and_close(stdin, &bootstrap).is_err() {
-            terminate_unmanaged_child(&mut child);
-            return Err(LifecycleError::StartupFailed);
+        validate_sidecar_command_transport(&command).map_err(SpawnFailure::new)?;
+        let child = command
+            .spawn()
+            .map_err(|_| SpawnFailure::new(LifecycleError::StartupFailed))?;
+        adopt_spawned_child(child, bootstrap)
+    }
+}
+
+fn adopt_spawned_child(
+    mut child: Child,
+    bootstrap: BootstrapInput,
+) -> Result<SpawnedSidecar, SpawnFailure> {
+    let stdin = child.stdin.take();
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let mut setup_failed = false;
+    match stdin {
+        Some(stdin) => {
+            if write_bootstrap_and_close(stdin, &bootstrap).is_err() {
+                setup_failed = true;
+            }
         }
-        let stdout = child.stdout.take().ok_or_else(|| {
-            terminate_unmanaged_child(&mut child);
-            LifecycleError::StartupFailed
-        })?;
-        let stderr = child.stderr.take().ok_or_else(|| {
-            terminate_unmanaged_child(&mut child);
-            LifecycleError::StartupFailed
-        })?;
-        let child = Arc::new(StdMutex::new(child));
-        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-        spawn_output_reader(stdout, sender.clone(), ProcessEvent::Stdout);
-        spawn_output_reader(stderr, sender.clone(), ProcessEvent::Stderr);
-        spawn_process_waiter(Arc::clone(&child), sender);
-        Ok(SpawnedSidecar::new(
-            Box::new(TauriSidecarChild { child }),
-            Box::new(TauriSidecarEventStream { receiver }),
+        None => setup_failed = true,
+    }
+
+    let child = Arc::new(StdMutex::new(child));
+    let (senders, events) = process_event_transport();
+    match stdout {
+        Some(stdout) => spawn_stdout_reader(stdout, senders.clone()),
+        None => setup_failed = true,
+    }
+    match stderr {
+        Some(stderr) => spawn_output_reader(stderr, senders.clone(), ProcessEvent::Stderr),
+        None => setup_failed = true,
+    }
+    if setup_failed {
+        let _ = senders.send_control(ProcessEvent::OutputError);
+    }
+    let reap_sender = spawn_process_waiter(Arc::clone(&child), senders.control.clone());
+    let process = SpawnedSidecar::new(
+        Box::new(TauriSidecarChild { child, reap_sender }),
+        Box::new(events),
+    );
+    if setup_failed {
+        Err(SpawnFailure::with_process(
+            LifecycleError::StartupFailed,
+            process,
         ))
+    } else {
+        Ok(process)
     }
 }
 
@@ -245,16 +365,9 @@ fn validate_sidecar_command_transport(
     Ok(())
 }
 
-fn terminate_unmanaged_child(child: &mut Child) {
-    if child.try_wait().ok().flatten().is_none() {
-        let _ = child.kill();
-    }
-    let _ = child.wait();
-}
-
 fn spawn_output_reader(
     mut reader: impl Read + Send + 'static,
-    sender: tokio::sync::mpsc::UnboundedSender<ProcessEvent>,
+    senders: ProcessEventSenders,
     wrap: fn(Vec<u8>) -> ProcessEvent,
 ) {
     thread::spawn(move || {
@@ -263,12 +376,12 @@ fn spawn_output_reader(
             match reader.read(&mut buffer) {
                 Ok(0) => return,
                 Ok(length) => {
-                    if sender.send(wrap(buffer[..length].to_vec())).is_err() {
+                    if !senders.send_data(wrap(buffer[..length].to_vec())) {
                         return;
                     }
                 }
                 Err(_) => {
-                    let _ = sender.send(ProcessEvent::OutputError);
+                    let _ = senders.send_control(ProcessEvent::OutputError);
                     return;
                 }
             }
@@ -276,29 +389,166 @@ fn spawn_output_reader(
     });
 }
 
-fn spawn_process_waiter(
-    child: Arc<StdMutex<Child>>,
-    sender: tokio::sync::mpsc::UnboundedSender<ProcessEvent>,
-) {
+fn spawn_stdout_reader(mut reader: impl Read + Send + 'static, senders: ProcessEventSenders) {
     thread::spawn(move || {
+        let mut buffer = [0_u8; 4_096];
+        let mut readiness = Vec::with_capacity(MAX_READINESS_BYTES + 1);
+        let mut readiness_pending = true;
         loop {
-            let result = match child.lock() {
-                Ok(mut child) => child.try_wait(),
-                Err(poisoned) => poisoned.into_inner().try_wait(),
-            };
-            match result {
-                Ok(Some(_)) => {
-                    let _ = sender.send(ProcessEvent::Terminated);
+            match reader.read(&mut buffer) {
+                Ok(0) => {
+                    if readiness_pending
+                        && !readiness.is_empty()
+                        && !senders.send_control(ProcessEvent::Stdout(readiness))
+                    {
+                        return;
+                    }
                     return;
                 }
-                Ok(None) => thread::sleep(Duration::from_millis(10)),
+                Ok(length) if readiness_pending => {
+                    let chunk = &buffer[..length];
+                    let newline_end = chunk
+                        .iter()
+                        .position(|byte| *byte == b'\n')
+                        .map(|newline| newline + 1);
+                    let record_end = newline_end.unwrap_or(length);
+                    let remaining_capacity =
+                        (MAX_READINESS_BYTES + 1).saturating_sub(readiness.len());
+                    let captured = record_end.min(remaining_capacity);
+                    readiness.extend_from_slice(&chunk[..captured]);
+
+                    if newline_end.is_some() || readiness.len() > MAX_READINESS_BYTES {
+                        readiness_pending = false;
+                        if !senders
+                            .send_control(ProcessEvent::Stdout(std::mem::take(&mut readiness)))
+                        {
+                            return;
+                        }
+                        let consumed = if newline_end.is_some() {
+                            record_end
+                        } else {
+                            captured
+                        };
+                        if consumed < length
+                            && !senders.send_data(ProcessEvent::Stdout(chunk[consumed..].to_vec()))
+                        {
+                            return;
+                        }
+                    }
+                }
+                Ok(length) => {
+                    if !senders.send_data(ProcessEvent::Stdout(buffer[..length].to_vec())) {
+                        return;
+                    }
+                }
                 Err(_) => {
-                    let _ = sender.send(ProcessEvent::Error);
-                    thread::sleep(Duration::from_millis(10));
+                    let _ = senders.send_control(ProcessEvent::OutputError);
+                    return;
                 }
             }
         }
     });
+}
+
+enum ObserverCommand {
+    ReapAfterKill,
+}
+
+trait ProcessObserver: Send + 'static {
+    fn try_wait(&mut self) -> Result<bool, ()>;
+    fn wait_after_kill(&mut self) -> Result<(), ()>;
+}
+
+struct SharedChildObserver {
+    child: Arc<StdMutex<Child>>,
+}
+
+impl ProcessObserver for SharedChildObserver {
+    fn try_wait(&mut self) -> Result<bool, ()> {
+        let result = match self.child.lock() {
+            Ok(mut child) => child.try_wait(),
+            Err(poisoned) => poisoned.into_inner().try_wait(),
+        };
+        result.map(|status| status.is_some()).map_err(|_| ())
+    }
+
+    fn wait_after_kill(&mut self) -> Result<(), ()> {
+        match self.child.lock() {
+            Ok(mut child) => child.wait().map(|_| ()).map_err(|_| ()),
+            Err(poisoned) => poisoned.into_inner().wait().map(|_| ()).map_err(|_| ()),
+        }
+    }
+}
+
+fn spawn_process_waiter(
+    child: Arc<StdMutex<Child>>,
+    control: tokio::sync::mpsc::UnboundedSender<ProcessEvent>,
+) -> std::sync::mpsc::Sender<ObserverCommand> {
+    let (reap_sender, reap_receiver) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        run_process_observer(
+            SharedChildObserver { child },
+            control,
+            reap_receiver,
+            || thread::sleep(Duration::from_millis(10)),
+        );
+    });
+    reap_sender
+}
+
+fn run_process_observer(
+    mut observer: impl ProcessObserver,
+    control: tokio::sync::mpsc::UnboundedSender<ProcessEvent>,
+    reap_receiver: std::sync::mpsc::Receiver<ObserverCommand>,
+    mut pause: impl FnMut(),
+) {
+    let mut consecutive_failures = 0;
+    loop {
+        if control.is_closed() {
+            return;
+        }
+        match observer.try_wait() {
+            Ok(true) => {
+                let _ = control.send(ProcessEvent::Terminated);
+                return;
+            }
+            Ok(false) => {
+                consecutive_failures = 0;
+                pause();
+            }
+            Err(()) => {
+                consecutive_failures += 1;
+                if consecutive_failures < MAX_CONSECUTIVE_OBSERVATION_FAILURES {
+                    pause();
+                    continue;
+                }
+                if control.send(ProcessEvent::Error).is_err() || control.is_closed() {
+                    return;
+                }
+                if !await_owned_reap_or_control_disconnect(&control, &reap_receiver) {
+                    return;
+                }
+                if observer.wait_after_kill().is_ok() {
+                    let _ = control.send(ProcessEvent::Terminated);
+                }
+                return;
+            }
+        }
+    }
+}
+
+fn await_owned_reap_or_control_disconnect(
+    control: &tokio::sync::mpsc::UnboundedSender<ProcessEvent>,
+    reap_receiver: &std::sync::mpsc::Receiver<ObserverCommand>,
+) -> bool {
+    loop {
+        match reap_receiver.recv_timeout(OBSERVER_CONTROL_CHECK_INTERVAL) {
+            Ok(ObserverCommand::ReapAfterKill) => return true,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return false,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) if control.is_closed() => return false,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
 }
 
 pub struct TauriLifecycleEventSink<R: Runtime> {
@@ -595,8 +845,13 @@ impl ServiceLifecycle {
             };
             let SpawnedSidecar { child, mut events } = match self.inner.spawner.spawn(bootstrap) {
                 Ok(spawned) => spawned,
-                Err(error) => {
-                    self.finish_start_failure(generation).await;
+                Err(failure) => {
+                    let (error, process) = failure.into_parts();
+                    if let Some(SpawnedSidecar { child, events }) = process {
+                        self.cleanup_failed_launch(generation, child, events).await;
+                    } else {
+                        self.finish_start_failure(generation).await;
+                    }
                     return Err(error);
                 }
             };
@@ -782,13 +1037,58 @@ impl ServiceLifecycle {
                     let _ = termination_sender.send(true);
                     return;
                 }
-                ProcessEvent::Stdout(_)
-                | ProcessEvent::Stderr(_)
-                | ProcessEvent::OutputError
-                | ProcessEvent::Error => {}
+                ProcessEvent::Error => {
+                    self.fail_closed_process_observation(generation).await;
+                    self.monitor_failed_cleanup(generation, events, termination_sender)
+                        .await;
+                    return;
+                }
+                ProcessEvent::Stdout(_) | ProcessEvent::Stderr(_) | ProcessEvent::OutputError => {}
             }
         }
         self.mark_process_observation_failed(generation).await;
+    }
+
+    async fn fail_closed_process_observation(&self, generation: u64) {
+        let (mut active, event) = {
+            let mut state = self.inner.state.lock().await;
+            if state.generation != generation
+                || state
+                    .active
+                    .as_ref()
+                    .is_none_or(|active| active.generation != generation)
+            {
+                return;
+            }
+            state.status = LifecycleStatus::Failed;
+            state.operation = Some(Operation::ShuttingDown);
+            state.intentional_exit = false;
+            state.connection = None;
+            if state.restart_count >= 1 {
+                state.workspace = None;
+            }
+            (
+                state.active.take(),
+                ServiceStateEvent::transition(generation, LifecycleStatus::Failed),
+            )
+        };
+
+        if let Some(active) = active.as_mut() {
+            let _ = active.child.kill();
+        }
+
+        let displaced = {
+            let mut state = self.inner.state.lock().await;
+            if state.generation == generation && state.active.is_none() {
+                state.operation = None;
+                state.active = active.take();
+                None
+            } else {
+                active.take()
+            }
+        };
+        drop(displaced);
+        self.inner.event_sink.emit(event);
     }
 
     async fn monitor_failed_cleanup(
@@ -1104,6 +1404,78 @@ mod tests {
         }
     }
 
+    struct OneShotTransportSpawner {
+        launch: StdMutex<Option<SpawnedSidecar>>,
+    }
+
+    impl SidecarSpawner for OneShotTransportSpawner {
+        fn spawn(&self, _bootstrap: BootstrapInput) -> Result<SpawnedSidecar, SpawnFailure> {
+            self.launch
+                .lock()
+                .expect("transport launch lock")
+                .take()
+                .ok_or_else(|| SpawnFailure::new(LifecycleError::StartupFailed))
+        }
+    }
+
+    struct ControlTerminalChild {
+        senders: ProcessEventSenders,
+        kills: Arc<AtomicUsize>,
+    }
+
+    impl SidecarChild for ControlTerminalChild {
+        fn kill(&mut self) -> Result<(), LifecycleError> {
+            self.kills.fetch_add(1, Ordering::SeqCst);
+            assert!(self.senders.send_control(ProcessEvent::Terminated));
+            Ok(())
+        }
+    }
+
+    struct FloodReader {
+        prefix: Option<Vec<u8>>,
+        remaining_chunks: usize,
+        drained: Option<std::sync::mpsc::Sender<()>>,
+    }
+
+    impl Read for FloodReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if let Some(prefix) = self.prefix.take() {
+                assert!(prefix.len() <= buffer.len());
+                buffer[..prefix.len()].copy_from_slice(&prefix);
+                return Ok(prefix.len());
+            }
+            if self.remaining_chunks == 0 {
+                if let Some(drained) = self.drained.take() {
+                    let _ = drained.send(());
+                }
+                return Ok(0);
+            }
+            self.remaining_chunks -= 1;
+            buffer.fill(b'x');
+            Ok(buffer.len())
+        }
+    }
+
+    struct ScriptedProcessObserver {
+        outcomes: VecDeque<Result<bool, ()>>,
+        polls: Arc<AtomicUsize>,
+        blocking_waits: Arc<AtomicUsize>,
+    }
+
+    impl ProcessObserver for ScriptedProcessObserver {
+        fn try_wait(&mut self) -> Result<bool, ()> {
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            self.outcomes
+                .pop_front()
+                .expect("scripted observer requires one outcome per poll")
+        }
+
+        fn wait_after_kill(&mut self) -> Result<(), ()> {
+            self.blocking_waits.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
     struct FakeProcessControl {
         sender: tokio::sync::mpsc::UnboundedSender<ProcessEvent>,
         kills: AtomicUsize,
@@ -1140,6 +1512,7 @@ mod tests {
     struct FakeLaunch {
         child: FakeChild,
         events: FakeEventStream,
+        fail_after_spawn: bool,
     }
 
     #[derive(Default)]
@@ -1155,6 +1528,17 @@ mod tests {
 
         fn queue_with_kill_failure(&self) -> FakeProcess {
             self.queue_with_control(false, true)
+        }
+
+        fn queue_partial_spawn_failure(&self) -> FakeProcess {
+            let process = self.queue_with_control(false, true);
+            self.launches
+                .lock()
+                .expect("fake launch lock")
+                .back_mut()
+                .expect("partial spawn launch must be queued")
+                .fail_after_spawn = true;
+            process
         }
 
         fn queue_with_control(&self, terminate_on_kill: bool, kill_fails: bool) -> FakeProcess {
@@ -1175,6 +1559,7 @@ mod tests {
                         control: Arc::clone(&control),
                     },
                     events: FakeEventStream { receiver },
+                    fail_after_spawn: false,
                 });
             FakeProcess { control }
         }
@@ -1185,7 +1570,7 @@ mod tests {
     }
 
     impl SidecarSpawner for FakeSpawner {
-        fn spawn(&self, bootstrap: BootstrapInput) -> Result<SpawnedSidecar, LifecycleError> {
+        fn spawn(&self, bootstrap: BootstrapInput) -> Result<SpawnedSidecar, SpawnFailure> {
             self.bootstraps
                 .lock()
                 .expect("fake bootstrap lock")
@@ -1195,11 +1580,16 @@ mod tests {
                 .lock()
                 .expect("fake launch lock")
                 .pop_front()
-                .ok_or(LifecycleError::StartupFailed)?;
-            Ok(SpawnedSidecar::new(
-                Box::new(launch.child),
-                Box::new(launch.events),
-            ))
+                .ok_or_else(|| SpawnFailure::new(LifecycleError::StartupFailed))?;
+            let process = SpawnedSidecar::new(Box::new(launch.child), Box::new(launch.events));
+            if launch.fail_after_spawn {
+                Err(SpawnFailure::with_process(
+                    LifecycleError::StartupFailed,
+                    process,
+                ))
+            } else {
+                Ok(process)
+            }
         }
     }
 
@@ -1426,6 +1816,327 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn partial_spawn_adoption_returns_promptly_with_owned_process_for_later_control() {
+        tauri::async_runtime::block_on(async {
+            let child = std::process::Command::new("/bin/sh")
+                .args(["-c", "exec /bin/sleep 30"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("benign partial-spawn child must start");
+            let bootstrap = BootstrapInput {
+                bytes: b"one bootstrap line\n".to_vec(),
+            };
+            let started = Instant::now();
+
+            let failure = match adopt_spawned_child(child, bootstrap) {
+                Ok(_) => panic!("missing stdin must fail post-spawn setup"),
+                Err(failure) => failure,
+            };
+
+            assert!(started.elapsed() < Duration::from_millis(100));
+            let (error, process) = failure.into_parts();
+            assert!(matches!(error, LifecycleError::StartupFailed));
+            let SpawnedSidecar {
+                mut child,
+                mut events,
+            } = process.expect("post-spawn failure must retain child authority");
+            child
+                .kill()
+                .expect("retained child must remain controllable");
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    loop {
+                        match events.next_event().await {
+                            Some(ProcessEvent::Terminated) => break true,
+                            Some(_) => {}
+                            None => break false,
+                        }
+                    }
+                })
+                .await,
+                Ok(true)
+            ));
+        });
+    }
+
+    #[test]
+    fn output_flood_is_bounded_while_reader_drains_and_terminal_control_is_prioritized() {
+        tauri::async_runtime::block_on(async {
+            let (senders, mut events) = process_event_transport();
+            let (stdout_drained, stdout_drained_receiver) = std::sync::mpsc::channel();
+            spawn_stdout_reader(
+                FloodReader {
+                    prefix: Some(
+                        b"{\"type\":\"server-ready\",\"host\":\"127.0.0.1\",\"port\":49152}\n"
+                            .to_vec(),
+                    ),
+                    remaining_chunks: PROCESS_DATA_CAPACITY * 32,
+                    drained: Some(stdout_drained),
+                },
+                senders.clone(),
+            );
+            let (stderr_drained, stderr_drained_receiver) = std::sync::mpsc::channel();
+            spawn_output_reader(
+                FloodReader {
+                    prefix: None,
+                    remaining_chunks: PROCESS_DATA_CAPACITY * 32,
+                    drained: Some(stderr_drained),
+                },
+                senders.clone(),
+                ProcessEvent::Stderr,
+            );
+
+            stdout_drained_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("lossy stdout reader must continuously drain to EOF");
+            stderr_drained_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("lossy stderr reader must continuously drain to EOF");
+            assert!(events.pending_data_len() == PROCESS_DATA_CAPACITY);
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_millis(100), events.next_event()).await,
+                Ok(Some(ProcessEvent::Stdout(chunk))) if chunk.ends_with(b"\n")
+            ));
+            assert!(senders.send_control(ProcessEvent::Terminated));
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_millis(100), events.next_event()).await,
+                Ok(Some(ProcessEvent::Terminated))
+            ));
+            assert!(events.pending_data_len() == PROCESS_DATA_CAPACITY);
+        });
+    }
+
+    #[test]
+    fn saturated_data_transport_cannot_delay_readiness_timeout() {
+        tauri::async_runtime::block_on(async {
+            let (senders, mut events) = process_event_transport();
+            for _ in 0..PROCESS_DATA_CAPACITY * 8 {
+                assert!(senders.send_data(ProcessEvent::Stderr(vec![b'x'; 4_096])));
+            }
+            let mut timeout: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(future::ready(()));
+
+            assert!(matches!(
+                wait_for_event_or_timeout(events.next_event(), &mut timeout).await,
+                ReadinessWait::TimedOut
+            ));
+            assert!(events.pending_data_len() == PROCESS_DATA_CAPACITY);
+        });
+    }
+
+    #[test]
+    fn diagnostic_saturation_cannot_drop_the_single_readiness_record() {
+        tauri::async_runtime::block_on(async {
+            let (senders, events) = process_event_transport();
+            for _ in 0..PROCESS_DATA_CAPACITY * 8 {
+                assert!(senders.send_data(ProcessEvent::Stderr(vec![b'x'; 4_096])));
+            }
+            spawn_stdout_reader(
+                std::io::Cursor::new(
+                    b"{\"type\":\"server-ready\",\"host\":\"127.0.0.1\",\"port\":49152}\n".to_vec(),
+                ),
+                senders.clone(),
+            );
+            let kills = Arc::new(AtomicUsize::new(0));
+            let spawner = Arc::new(OneShotTransportSpawner {
+                launch: StdMutex::new(Some(SpawnedSidecar::new(
+                    Box::new(ControlTerminalChild {
+                        senders,
+                        kills: Arc::clone(&kills),
+                    }),
+                    Box::new(events),
+                ))),
+            });
+            let lifecycle = ServiceLifecycle::new(
+                spawner,
+                Arc::new(FakeTokenSource::new(["v".repeat(43)])),
+                Arc::new(FakeTimer::pending()),
+                Arc::new(FakeEventSink::default()),
+                canonical_workspace().join("sidecar-diagnostic.log"),
+            );
+
+            let connection = tokio::time::timeout(
+                Duration::from_secs(1),
+                lifecycle.start(canonical_workspace()),
+            )
+            .await
+            .expect("bounded readiness delivery must not stall")
+            .expect("diagnostic saturation must not discard readiness");
+
+            assert!(connection.base_url() == "http://127.0.0.1:49152");
+            lifecycle
+                .shutdown()
+                .await
+                .expect("test cleanup must stop child");
+            assert!(kills.load(Ordering::SeqCst) == 1);
+        });
+    }
+
+    #[test]
+    fn shutdown_consumes_terminal_control_promptly_despite_saturated_data() {
+        tauri::async_runtime::block_on(async {
+            let (senders, events) = process_event_transport();
+            assert!(senders.send_data(ready(49_152)));
+            for _ in 0..PROCESS_DATA_CAPACITY * 8 {
+                assert!(senders.send_data(ProcessEvent::Stderr(vec![b'x'; 4_096])));
+            }
+            let kills = Arc::new(AtomicUsize::new(0));
+            let spawner = Arc::new(OneShotTransportSpawner {
+                launch: StdMutex::new(Some(SpawnedSidecar::new(
+                    Box::new(ControlTerminalChild {
+                        senders,
+                        kills: Arc::clone(&kills),
+                    }),
+                    Box::new(events),
+                ))),
+            });
+            let lifecycle = ServiceLifecycle::new(
+                spawner,
+                Arc::new(FakeTokenSource::new(["f".repeat(43)])),
+                Arc::new(FakeTimer::pending()),
+                Arc::new(FakeEventSink::default()),
+                canonical_workspace().join("sidecar-diagnostic.log"),
+            );
+            lifecycle
+                .start(canonical_workspace())
+                .await
+                .expect("ready record at the head of bounded data must start");
+
+            tokio::time::timeout(Duration::from_millis(100), lifecycle.shutdown())
+                .await
+                .expect("terminal control must bypass saturated data")
+                .expect("terminal control must complete shutdown");
+
+            assert!(kills.load(Ordering::SeqCst) == 1);
+            assert!(lifecycle.status().await == LifecycleStatus::Stopped);
+        });
+    }
+
+    #[test]
+    fn persistent_observer_errors_fail_once_then_block_for_owned_reap_after_kill() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let blocking_waits = Arc::new(AtomicUsize::new(0));
+        let observer = ScriptedProcessObserver {
+            outcomes: [Err(()), Ok(false), Err(()), Err(()), Err(())]
+                .into_iter()
+                .collect(),
+            polls: Arc::clone(&polls),
+            blocking_waits: Arc::clone(&blocking_waits),
+        };
+        let (control, mut control_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (reap_sender, reap_receiver) = std::sync::mpsc::channel();
+        let (finished, finished_receiver) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            run_process_observer(observer, control, reap_receiver, || {});
+            let _ = finished.send(());
+        });
+
+        assert!(matches!(
+            control_receiver.blocking_recv(),
+            Some(ProcessEvent::Error)
+        ));
+        assert!(polls.load(Ordering::SeqCst) == 5);
+        assert!(blocking_waits.load(Ordering::SeqCst) == 0);
+        assert!(
+            finished_receiver
+                .recv_timeout(Duration::from_millis(20))
+                .is_err()
+        );
+
+        reap_sender
+            .send(ObserverCommand::ReapAfterKill)
+            .expect("successful kill must release owned blocking reap");
+        assert!(matches!(
+            control_receiver.blocking_recv(),
+            Some(ProcessEvent::Terminated)
+        ));
+        finished_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("observer thread must exit after terminal delivery");
+        assert!(blocking_waits.load(Ordering::SeqCst) == 1);
+    }
+
+    #[test]
+    fn process_observer_exits_without_polling_when_control_delivery_is_disconnected() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let observer = ScriptedProcessObserver {
+            outcomes: [Ok(false)].into_iter().collect(),
+            polls: Arc::clone(&polls),
+            blocking_waits: Arc::new(AtomicUsize::new(0)),
+        };
+        let (control, control_receiver) = tokio::sync::mpsc::unbounded_channel();
+        drop(control_receiver);
+        let (_reap_sender, reap_receiver) = std::sync::mpsc::channel();
+
+        run_process_observer(observer, control, reap_receiver, || {});
+
+        assert!(polls.load(Ordering::SeqCst) == 0);
+    }
+
+    #[test]
+    fn persistent_observer_stops_when_control_disconnects_while_awaiting_owned_reap() {
+        let observer = ScriptedProcessObserver {
+            outcomes: [Err(()), Err(()), Err(())].into_iter().collect(),
+            polls: Arc::new(AtomicUsize::new(0)),
+            blocking_waits: Arc::new(AtomicUsize::new(0)),
+        };
+        let (control, mut control_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (reap_sender, reap_receiver) = std::sync::mpsc::channel();
+        let (finished, finished_receiver) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            run_process_observer(observer, control, reap_receiver, || {});
+            let _ = finished.send(());
+        });
+
+        assert!(matches!(
+            control_receiver.blocking_recv(),
+            Some(ProcessEvent::Error)
+        ));
+        drop(control_receiver);
+        if finished_receiver
+            .recv_timeout(Duration::from_millis(250))
+            .is_err()
+        {
+            let _ = reap_sender.send(ObserverCommand::ReapAfterKill);
+            let _ = finished_receiver.recv_timeout(Duration::from_secs(1));
+            panic!("observer must stop after losing its control-event consumer");
+        }
+    }
+
+    #[test]
+    fn observer_failure_clears_ready_connection_and_retains_unkilled_child_authority() {
+        tauri::async_runtime::block_on(async {
+            let spawner = Arc::new(FakeSpawner::default());
+            let process = spawner.queue_with_kill_failure();
+            process.send(ready(49_152));
+            let events = Arc::new(FakeEventSink::default());
+            let lifecycle = lifecycle(
+                spawner,
+                ["o".repeat(43)],
+                Arc::new(FakeTimer::pending()),
+                Arc::clone(&events),
+            );
+            lifecycle
+                .start(canonical_workspace())
+                .await
+                .expect("ready sidecar must start");
+
+            process.send(ProcessEvent::Error);
+            wait_for_status(&events, &lifecycle, LifecycleStatus::Failed).await;
+
+            assert!(lifecycle.connection().await.is_none());
+            assert!(lifecycle.has_active_process().await);
+            assert!(process.kills() == 1);
+            assert!(matches!(
+                lifecycle.restart_once().await,
+                Err(LifecycleError::RestartRefused)
+            ));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn process_pipe_observes_one_line_eof_then_owned_child_is_killed_and_reaped() {
         tauri::async_runtime::block_on(async {
             let mut child = std::process::Command::new("/bin/sh")
@@ -1455,8 +2166,8 @@ mod tests {
 
             let child = Arc::new(StdMutex::new(child));
             let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-            spawn_process_waiter(Arc::clone(&child), sender);
-            let mut owned = TauriSidecarChild { child };
+            let reap_sender = spawn_process_waiter(Arc::clone(&child), sender);
+            let mut owned = TauriSidecarChild { child, reap_sender };
 
             owned.kill().expect("first kill must succeed");
             assert!(matches!(
@@ -1707,6 +2418,49 @@ mod tests {
             assert!(missing_terminal_lifecycle.status().await == LifecycleStatus::Failed);
             assert!(missing_terminal_lifecycle.has_active_process().await);
             assert!(missing_terminal.kills() == 1);
+        });
+    }
+
+    #[test]
+    fn partial_spawn_failure_is_bounded_retains_child_and_never_auto_restarts() {
+        tauri::async_runtime::block_on(async {
+            let spawner = Arc::new(FakeSpawner::default());
+            let process = spawner.queue_partial_spawn_failure();
+            let lifecycle = lifecycle(
+                Arc::clone(&spawner),
+                ["W".repeat(43)],
+                Arc::new(FakeTimer::cleanup_immediate()),
+                Arc::new(FakeEventSink::default()),
+            );
+
+            let result = tokio::time::timeout(
+                Duration::from_millis(100),
+                lifecycle.start(canonical_workspace()),
+            )
+            .await
+            .expect("partial-spawn cleanup must be bounded");
+
+            assert!(matches!(result, Err(LifecycleError::StartupFailed)));
+            assert!(lifecycle.status().await == LifecycleStatus::Failed);
+            assert!(lifecycle.connection().await.is_none());
+            assert!(lifecycle.has_active_process().await);
+            assert!(process.kills() == 1);
+            assert!(matches!(
+                lifecycle.restart_once().await,
+                Err(LifecycleError::RestartRefused)
+            ));
+            assert!(spawner.bootstraps().len() == 1);
+
+            process.send(ProcessEvent::Terminated);
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while lifecycle.has_active_process().await {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("terminal event must release retained partial-spawn child");
+            assert!(lifecycle.status().await == LifecycleStatus::Failed);
+            assert!(spawner.bootstraps().len() == 1);
         });
     }
 

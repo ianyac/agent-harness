@@ -1,7 +1,12 @@
 import { invoke as invokeTauri } from "@tauri-apps/api/core";
 import { listen as listenTauri } from "@tauri-apps/api/event";
 
-import type { PlatformAdapter, ServiceConnection } from "./types";
+import type {
+  PlatformAdapter,
+  ServiceConnection,
+  ServiceLifecycleState,
+  ServiceLifecycleStatus,
+} from "./types";
 import { normalizeServiceConnection } from "./types";
 
 export type NativeInvoke = <T>(
@@ -14,11 +19,7 @@ export type NativeListen = (
   handler: (event: { payload: unknown }) => void,
 ) => Promise<() => void>;
 
-type ServiceStatus = "starting" | "ready" | "restarting" | "stopping" | "stopped" | "failed";
-
-export type ServiceStatePayload =
-  | { readonly generation: number; readonly status: "ready"; readonly connection: ServiceConnection }
-  | { readonly generation: number; readonly status: Exclude<ServiceStatus, "ready"> };
+export type ServiceStatePayload = ServiceLifecycleState;
 
 type ReadyWaiter = {
   readonly resolve: (connection: ServiceConnection) => void;
@@ -29,7 +30,7 @@ const SERVICE_STATE_EVENT = "service-state";
 const SERVICE_UNAVAILABLE = "The local service is unavailable.";
 const LISTENER_UNAVAILABLE = "The native service listener is unavailable.";
 const READINESS_TIMEOUT_MS = 20_000;
-const statuses = new Set<ServiceStatus>([
+const statuses = new Set<ServiceLifecycleStatus>([
   "starting",
   "ready",
   "restarting",
@@ -50,10 +51,10 @@ function normalizeServiceState(value: unknown): ServiceStatePayload | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
   const record = value as Record<string, unknown>;
   if (!Number.isSafeInteger(record.generation) || (record.generation as number) <= 0) return null;
-  if (typeof record.status !== "string" || !statuses.has(record.status as ServiceStatus)) return null;
+  if (typeof record.status !== "string" || !statuses.has(record.status as ServiceLifecycleStatus)) return null;
 
   const generation = record.generation as number;
-  const status = record.status as ServiceStatus;
+  const status = record.status as ServiceLifecycleStatus;
   if (status !== "ready") {
     if (!exactKeys(record, ["generation", "status"])) return null;
     return { generation, status };
@@ -99,6 +100,7 @@ export function createTauriPlatform(
   let latestState: ServiceStatePayload | undefined;
   let stateRevision = 0;
   const waiters = new Set<ReadyWaiter>();
+  const subscribers = new Set<(state: ServiceLifecycleState) => void>();
 
   const hasTerminalState = () => latestState?.status === "failed" || latestState?.status === "stopped";
 
@@ -120,10 +122,17 @@ export function createTauriPlatform(
     if (next.status === "ready") {
       cachedConnection = next.connection;
       settleReady(next.connection);
-      return;
+    } else {
+      cachedConnection = undefined;
+      if (next.status === "failed" || next.status === "stopped") settleUnavailable();
     }
-    cachedConnection = undefined;
-    if (next.status === "failed" || next.status === "stopped") settleUnavailable();
+    for (const subscriber of subscribers) {
+      try {
+        subscriber(next);
+      } catch {
+        // A view subscriber cannot interrupt service lifecycle authority.
+      }
+    }
   };
   const ensureListener = (): Promise<void> => {
     if (listenerRegistered) return Promise.resolve();
@@ -217,6 +226,20 @@ export function createTauriPlatform(
       });
       connectionRequest = tracked;
       return tracked;
+    },
+    subscribeServiceState(listener: (state: ServiceLifecycleState) => void): () => void {
+      subscribers.add(listener);
+      if (latestState !== undefined) {
+        try {
+          listener(latestState);
+        } catch {
+          // Replay is isolated from service lifecycle authority.
+        }
+      }
+      void ensureListener().catch(() => {});
+      return () => {
+        subscribers.delete(listener);
+      };
     },
     async chooseWorkspace(): Promise<string | null> {
       return validateWorkspace(await invoke<unknown>("choose_workspace"));

@@ -3,9 +3,29 @@ export type ServiceConnection = {
   readonly token: string;
 };
 
+export type ServiceLifecycleStatus =
+  | "starting"
+  | "ready"
+  | "restarting"
+  | "stopping"
+  | "stopped"
+  | "failed";
+
+export type ServiceLifecycleState =
+  | {
+    readonly generation: number;
+    readonly status: "ready";
+    readonly connection: ServiceConnection;
+  }
+  | {
+    readonly generation: number;
+    readonly status: Exclude<ServiceLifecycleStatus, "ready">;
+  };
+
 export interface PlatformAdapter {
   readonly kind: "browser" | "tauri";
   getServiceConnection(): Promise<ServiceConnection>;
+  subscribeServiceState?: (listener: (state: ServiceLifecycleState) => void) => () => void;
   chooseWorkspace(): Promise<string | null>;
   notify(input: { title: string; body: string }): Promise<void>;
   openLogs?: () => Promise<void>;

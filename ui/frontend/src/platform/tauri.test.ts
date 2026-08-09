@@ -150,6 +150,37 @@ describe("Tauri native boundary", () => {
     expect(invokeSpy).toHaveBeenCalledTimes(1);
   });
 
+  it("publishes only validated lifecycle state through a narrow typed subscription", async () => {
+    const events = eventHarness();
+    const platform = createTauriPlatform(
+      async <T,>() => oldConnection as T,
+      events.listen,
+    );
+    await platform.getServiceConnection();
+    const observed: unknown[] = [];
+    const connectionObservedDuringReady = deferred<typeof newConnection>();
+
+    const unsubscribe = platform.subscribeServiceState?.((state) => {
+      observed.push(state);
+      if (state.status === "ready") {
+        void platform.getServiceConnection().then(connectionObservedDuringReady.resolve);
+      }
+    });
+    expect(unsubscribe).toEqual(expect.any(Function));
+    events.emit({ generation: 7, status: "restarting" });
+    events.emit({ generation: 7, status: "ready", connection: { ...newConnection, extra: "private" } });
+    events.emit({ generation: 7, status: "ready", connection: newConnection });
+
+    expect(observed).toEqual([
+      { generation: 7, status: "restarting" },
+      { generation: 7, status: "ready", connection: newConnection },
+    ]);
+    await expect(connectionObservedDuringReady.promise).resolves.toEqual(newConnection);
+    unsubscribe?.();
+    events.emit({ generation: 8, status: "stopping" });
+    expect(observed).toHaveLength(2);
+  });
+
   it("does not restore a stale invoke response after a newer non-Ready transition", async () => {
     const events = eventHarness();
     const response = deferred<unknown>();
@@ -297,6 +328,7 @@ describe("Tauri native boundary", () => {
       "openLogs",
       "quit",
       "restartService",
+      "subscribeServiceState",
     ]);
   });
 

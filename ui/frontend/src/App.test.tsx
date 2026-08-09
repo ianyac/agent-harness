@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { App, createNewChat, resolveNewChatWorkspace } from "./App";
 import { ApiClient } from "./api/http";
-import type { PlatformAdapter } from "./platform/types";
+import type { PlatformAdapter, ServiceLifecycleState } from "./platform/types";
 import type { SessionRecord } from "./features/sessions/useSessions";
 import { event } from "./protocol/fixtures";
 import { emptyTranscript, transcriptReducer } from "./protocol/reducer";
@@ -167,6 +167,35 @@ describe("App", () => {
     });
   });
 
+  it("contains native picker rejection and distinguishes it from cancellation", async () => {
+    const createSession = vi.fn(async () => ({ ok: true as const, session: session() }));
+    const rejected = platformAdapter({
+      kind: "tauri",
+      chooseWorkspace: async () => {
+        throw new Error("/private/workspace/native-dialog-detail");
+      },
+    });
+    const cancelled = platformAdapter({ kind: "tauri", chooseWorkspace: async () => null });
+
+    await expect(createNewChat(
+      rejected,
+      "/app/bootstrap",
+      null,
+      [],
+      { mode: "default", contextMode: "compaction" },
+      createSession,
+    )).resolves.toBe("failed");
+    await expect(createNewChat(
+      cancelled,
+      "/app/bootstrap",
+      null,
+      [],
+      { mode: "default", contextMode: "compaction" },
+      createSession,
+    )).resolves.toBe("cancelled");
+    expect(createSession).not.toHaveBeenCalled();
+  });
+
   it("uses the active native session workspace for later New chat instead of app bootstrap", async () => {
     const user = userEvent.setup();
     const createBodies: unknown[] = [];
@@ -201,6 +230,47 @@ describe("App", () => {
     await waitFor(() => expect(createBodies).toHaveLength(1));
     expect(createBodies[0]).toMatchObject({ workspace: "/work/native-active" });
     expect(JSON.stringify(createBodies[0])).not.toContain("/app/bootstrap");
+  });
+
+  it("keeps New chat single-flight across sidebar and palette activation", async () => {
+    const user = userEvent.setup();
+    const active = session();
+    const created = deferred<Response>();
+    let creates = 0;
+    const fetchRequest: typeof fetch = async (input, init) => {
+      const path = new URL(input instanceof Request ? input.url : input.toString()).pathname;
+      if (path === "/api/config") return Response.json({
+        base_workspace: "/work/base",
+        default_mode: "default",
+        default_context_mode: "compaction",
+        modes: ["default", "acceptAll", "readOnly"],
+        context_modes: ["compaction", "folding"],
+      });
+      if (path === "/api/sessions" && init?.method === "GET") return Response.json([active]);
+      if (path === "/api/sessions" && init?.method === "POST") {
+        creates += 1;
+        return created.promise;
+      }
+      return new Response(null, { status: 404 });
+    };
+    render(
+      <App
+        client={clientWith(fetchRequest)}
+        platformAdapter={platformAdapter({ kind: "tauri" })}
+        sidebarStorage={storage}
+        draftStorage={storage}
+        transcriptBySession={{ [active.session_id]: emptyTranscript() }}
+      />,
+    );
+
+    await user.click(await screen.findByRole("button", { name: "New chat" }));
+    await user.keyboard("{Meta>}k{/Meta}");
+    await user.click(screen.getByRole("button", { name: /New chat.*⌘N/ }));
+    expect(creates).toBe(1);
+
+    created.resolve(Response.json(session({ session_id: "created-once" }), { status: 201 }));
+    expect(await screen.findByRole("button", { name: /^Project A,/ })).toBeVisible();
+    expect(creates).toBe(1);
   });
 
   it("projects a direct prompt immediately, keeps it across session switches, and reconciles completion once", async () => {
@@ -1625,6 +1695,137 @@ describe("App", () => {
     expect(await screen.findByRole("heading", { name: "project-a" })).toBeVisible();
     expect(paths[0]).toBe("/api/health");
     expect(screen.getByRole("status", { name: "Local service connected" })).toBeVisible();
+  });
+
+  it("rebinds HTTP, session, and socket authority only after the latest native Ready health wins", async () => {
+    const oldService = {
+      baseUrl: "http://127.0.0.1:4101",
+      token: "o".repeat(43),
+    };
+    const supersededService = {
+      baseUrl: "http://127.0.0.1:4102",
+      token: "s".repeat(43),
+    };
+    const freshService = {
+      baseUrl: "http://127.0.0.1:4103",
+      token: "f".repeat(43),
+    };
+    const supersededHealth = deferred<Response>();
+    const requests: Array<{ readonly origin: string; readonly path: string; readonly authorization: string | null }> = [];
+    const fetchRequest: typeof fetch = async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : input.toString());
+      const authorization = new Headers(init?.headers).get("Authorization");
+      requests.push({ origin: url.origin, path: url.pathname, authorization });
+      if (url.pathname === "/api/health" && url.origin === supersededService.baseUrl) {
+        return supersededHealth.promise;
+      }
+      if (url.pathname === "/api/health") {
+        return Response.json({ status: "ok", service_id: testServiceId });
+      }
+      if (url.pathname === "/api/config") {
+        return Response.json({
+          base_workspace: "/work/base",
+          default_mode: "default",
+          default_context_mode: "compaction",
+          modes: ["default", "acceptAll", "readOnly"],
+          context_modes: ["compaction", "folding"],
+        });
+      }
+      if (url.pathname === "/api/sessions") {
+        const suffix = url.origin === freshService.baseUrl ? "fresh" : "old";
+        return Response.json([session({
+          session_id: `${suffix}-session`,
+          workspace: `/work/${suffix}`,
+          title: `${suffix} session`,
+        })]);
+      }
+      return new Response(null, { status: 404 });
+    };
+    vi.stubGlobal("fetch", fetchRequest);
+
+    const sockets: Array<{
+      readonly url: string;
+      readonly protocols: readonly string[];
+      readonly close: ReturnType<typeof vi.fn>;
+    }> = [];
+    class FakeWebSocket {
+      readonly url: string;
+      readonly protocols: readonly string[];
+      readonly readyState = 0;
+      onopen: ((event: Event) => void) | null = null;
+      onmessage: ((event: MessageEvent) => void) | null = null;
+      onclose: ((event: CloseEvent) => void) | null = null;
+      onerror: ((event: Event) => void) | null = null;
+      readonly close = vi.fn();
+      readonly send = vi.fn();
+
+      constructor(url: string | URL, protocols: string | string[]) {
+        this.url = url.toString();
+        this.protocols = typeof protocols === "string" ? [protocols] : protocols;
+        sockets.push(this);
+      }
+    }
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+
+    let publish: ((state: ServiceLifecycleState) => void) | undefined;
+    const unsubscribe = vi.fn();
+    const order: string[] = [];
+    const native = platformAdapter({
+      kind: "tauri",
+      subscribeServiceState: (listener) => {
+        order.push("subscribe");
+        publish = listener;
+        return unsubscribe;
+      },
+      getServiceConnection: async () => {
+        order.push("acquire");
+        return oldService;
+      },
+    });
+    const view = render(
+      <App platformAdapter={native} sidebarStorage={storage} draftStorage={storage} />,
+    );
+
+    expect(await screen.findByRole("heading", { name: "old" })).toBeVisible();
+    expect(order).toEqual(["subscribe", "acquire"]);
+    expect(sockets.at(-1)).toMatchObject({
+      url: "ws://127.0.0.1:4101/ws/sessions/old-session",
+      protocols: ["harness-ui", oldService.token],
+    });
+
+    act(() => publish?.({ generation: 2, status: "restarting" }));
+    expect(screen.getByRole("status", { name: "Local service connecting" })).toBeVisible();
+    expect(sockets[0]?.close).toHaveBeenCalledWith(1000, "Client disposed");
+    act(() => publish?.({ generation: 2, status: "ready", connection: supersededService }));
+    await waitFor(() => expect(requests).toContainEqual({
+      origin: supersededService.baseUrl,
+      path: "/api/health",
+      authorization: `Bearer ${supersededService.token}`,
+    }));
+
+    act(() => publish?.({ generation: 3, status: "restarting" }));
+    act(() => publish?.({ generation: 3, status: "ready", connection: freshService }));
+    expect(await screen.findByRole("heading", { name: "fresh" })).toBeVisible();
+    expect(requests).toContainEqual({
+      origin: freshService.baseUrl,
+      path: "/api/sessions",
+      authorization: `Bearer ${freshService.token}`,
+    });
+    expect(sockets.at(-1)).toMatchObject({
+      url: "ws://127.0.0.1:4103/ws/sessions/fresh-session",
+      protocols: ["harness-ui", freshService.token],
+    });
+
+    supersededHealth.resolve(Response.json({ status: "ok", service_id: testServiceId }));
+    await act(async () => { await Promise.resolve(); });
+    expect(screen.getByRole("heading", { name: "fresh" })).toBeVisible();
+    expect(requests.some((request) => (
+      request.origin === supersededService.baseUrl && request.path === "/api/sessions"
+    ))).toBe(false);
+    expect(sockets.some((socket) => socket.url.includes(":4102/"))).toBe(false);
+
+    view.unmount();
+    expect(unsubscribe).toHaveBeenCalledOnce();
   });
 
   it("does not become create-ready when bootstrap health succeeds but session identity health fails", async () => {

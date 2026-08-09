@@ -22,6 +22,7 @@ import type {
   CreateSessionOptions,
   CreateSessionResult,
   ServiceHealth,
+  SessionOperationError,
   SessionRecord,
   SessionRuntimeState,
 } from "./features/sessions/useSessions";
@@ -30,7 +31,11 @@ import { NotificationObserver } from "./features/settings/NotificationObserver";
 import { Settings } from "./features/settings/Settings";
 import type { PreferenceStorage } from "./features/settings/preferences";
 import { usePreferences } from "./features/settings/preferences";
-import type { PlatformAdapter, ServiceConnection } from "./platform/types";
+import type {
+  PlatformAdapter,
+  ServiceConnection,
+  ServiceLifecycleState,
+} from "./platform/types";
 import { emptyTranscript } from "./protocol/reducer";
 import type { ClientEvent, SendMessage, TranscriptState, TranscriptTerminal } from "./protocol/types";
 
@@ -93,15 +98,21 @@ export async function createNewChat(
   sessions: readonly SessionRecord[],
   defaults: Pick<CreateSessionOptions, "mode" | "contextMode">,
   createSession: (options: CreateSessionOptions) => Promise<CreateSessionResult>,
-): Promise<void> {
-  const workspace = await resolveNewChatWorkspace(
-    platform,
-    configuredBaseWorkspace,
-    activeSession,
-    sessions,
-  );
-  if (workspace === null) return;
+): Promise<"created" | "cancelled" | "failed"> {
+  let workspace: string | null;
+  try {
+    workspace = await resolveNewChatWorkspace(
+      platform,
+      configuredBaseWorkspace,
+      activeSession,
+      sessions,
+    );
+  } catch {
+    return "failed";
+  }
+  if (workspace === null) return "cancelled";
   await createSession({ ...defaults, workspace, title: "New chat" });
+  return "created";
 }
 
 function terminalKey(sessionId: string, terminal: TranscriptTerminal): string {
@@ -176,6 +187,7 @@ export function App({
   );
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [newChatWorkspaceFailed, setNewChatWorkspaceFailed] = useState(false);
   const [bootstrapAttempt, setBootstrapAttempt] = useState(0);
   const [bootstrapLifecycle, setBootstrapLifecycle] = useState<BootstrapLifecycle | null>(() =>
     providedClient === undefined
@@ -190,6 +202,7 @@ export function App({
   const optimisticSubmissionRef = useRef(new Map<string, SubmissionCandidate>());
   const submissionOwnerRef = useRef<{ readonly client: ApiClient | null; readonly dispatcher: AppProps["onSessionEvent"] } | null>(null);
   const retrySubmittedRef = useRef(new Set<string>());
+  const newChatPendingRef = useRef(false);
   const bootstrapPendingRef = useRef(providedClient === undefined);
   const preferenceModel = usePreferences(preferenceStorage ?? sidebarStorage);
 
@@ -202,40 +215,104 @@ export function App({
     }
     let current = true;
     let currentPlatform = platformAdapter ?? null;
+    let authority = 0;
+    let latestGeneration = 0;
+    let latestStateKey = "";
+    let sawLifecycleState = false;
+    let unsubscribe = () => {};
     bootstrapPendingRef.current = true;
     setBootstrapLifecycle({ status: "checking", attempt: bootstrapAttempt, retrying: true });
     setConnection({ client: null, service: null, status: "connecting", platform: platformAdapter ?? null });
     const loadPlatform = platformAdapter === undefined
       ? import("./platform").then(({ platform }) => platform)
       : Promise.resolve(platformAdapter);
-    void loadPlatform
-      .then(async (platform) => {
-        currentPlatform = platform;
-        const service = await platform.getServiceConnection();
+    const failCurrent = (platform: PlatformAdapter, candidateAuthority: number) => {
+      if (!current || candidateAuthority !== authority) return;
+      bootstrapPendingRef.current = false;
+      setBootstrapLifecycle({
+        status: "reconnecting",
+        attempt: bootstrapAttempt,
+        retrying: false,
+      });
+      setConnection({ client: null, service: null, status: "connecting", platform });
+    };
+    const activate = async (
+      platform: PlatformAdapter,
+      service: ServiceConnection,
+      candidateAuthority: number,
+    ) => {
+      try {
         const client = new ApiClient(service);
         await client.get<ServiceHealth>("/api/health");
-        return { platform, client, service };
-      })
-      .then(({ platform, client, service }) => {
-        if (current) {
-          bootstrapPendingRef.current = false;
-          setBootstrapLifecycle(null);
-          setConnection({ client, service, status: "connected", platform });
+        if (!current || candidateAuthority !== authority) return;
+        bootstrapPendingRef.current = false;
+        setBootstrapLifecycle(null);
+        setConnection({ client, service, status: "connected", platform });
+      } catch {
+        failCurrent(platform, candidateAuthority);
+      }
+    };
+    const receiveLifecycleState = (platform: PlatformAdapter, state: ServiceLifecycleState) => {
+      if (!current || state.generation < latestGeneration) return;
+      const stateKey = state.status === "ready"
+        ? `${state.generation}:${state.status}:${state.connection.baseUrl}:${state.connection.token}`
+        : `${state.generation}:${state.status}`;
+      if (stateKey === latestStateKey) return;
+      latestGeneration = state.generation;
+      latestStateKey = stateKey;
+      sawLifecycleState = true;
+      const candidateAuthority = ++authority;
+      setConnection({ client: null, service: null, status: "connecting", platform });
+      if (state.status !== "ready") {
+        bootstrapPendingRef.current = false;
+        setBootstrapLifecycle({
+          status: state.status === "starting" ? "checking" : "reconnecting",
+          attempt: bootstrapAttempt,
+          retrying: false,
+        });
+        return;
+      }
+      bootstrapPendingRef.current = true;
+      setBootstrapLifecycle({ status: "checking", attempt: bootstrapAttempt, retrying: true });
+      void activate(platform, state.connection, candidateAuthority);
+    };
+    void loadPlatform
+      .then(async (platform) => {
+        if (!current) return;
+        currentPlatform = platform;
+        if (platform.subscribeServiceState !== undefined) {
+          unsubscribe = platform.subscribeServiceState((state) => {
+            receiveLifecycleState(platform, state);
+          });
+        }
+        try {
+          const service = await platform.getServiceConnection();
+          if (!current || sawLifecycleState) return;
+          const candidateAuthority = ++authority;
+          await activate(platform, service, candidateAuthority);
+        } catch {
+          if (!sawLifecycleState) failCurrent(platform, ++authority);
         }
       })
       .catch(() => {
-        if (current) {
-          bootstrapPendingRef.current = false;
-          setBootstrapLifecycle({
-            status: "reconnecting",
-            attempt: bootstrapAttempt,
-            retrying: false,
-          });
-          setConnection({ client: null, service: null, status: "connecting", platform: currentPlatform });
+        const candidateAuthority = ++authority;
+        if (currentPlatform !== null) {
+          failCurrent(currentPlatform, candidateAuthority);
+          return;
         }
+        if (!current || candidateAuthority !== authority) return;
+        bootstrapPendingRef.current = false;
+        setBootstrapLifecycle({
+          status: "reconnecting",
+          attempt: bootstrapAttempt,
+          retrying: false,
+        });
+        setConnection({ client: null, service: null, status: "connecting", platform: null });
       });
     return () => {
       current = false;
+      authority += 1;
+      unsubscribe();
     };
   }, [bootstrapAttempt, platformAdapter, providedClient]);
 
@@ -590,19 +667,29 @@ export function App({
     setSettingsOpen(true);
   };
   const createFutureSession = async () => {
+    if (newChatPendingRef.current) return;
     const config = sessionsModel.config;
     if (config === null) return;
-    await createNewChat(
-      selectedPlatform,
-      config.base_workspace,
-      activeSession,
-      sessionsModel.sessions,
-      {
-        mode: preferenceModel.preferences.defaultMode,
-        contextMode: preferenceModel.preferences.contextMode,
-      },
-      sessionsModel.createSession,
-    );
+    newChatPendingRef.current = true;
+    setNewChatWorkspaceFailed(false);
+    try {
+      const outcome = await createNewChat(
+        selectedPlatform,
+        config.base_workspace,
+        activeSession,
+        sessionsModel.sessions,
+        {
+          mode: preferenceModel.preferences.defaultMode,
+          contextMode: preferenceModel.preferences.contextMode,
+        },
+        sessionsModel.createSession,
+      );
+      if (outcome === "failed") setNewChatWorkspaceFailed(true);
+    } catch {
+      setNewChatWorkspaceFailed(true);
+    } finally {
+      newChatPendingRef.current = false;
+    }
   };
   const selectedPlatform = connection.platform ?? platformAdapter;
   const sessionReadiness = sessionsModel.refreshError !== null
@@ -613,6 +700,18 @@ export function App({
   const showingFirstRun = connection.client !== null
     && sessionsModel.sessions.length === 0
     && (sessionsModel.loading || sessionsModel.config !== null);
+  const nativeNewChatFailure: SessionOperationError | null = newChatWorkspaceFailed
+    ? {
+      kind: "create",
+      options: {
+        workspace: "/",
+        mode: preferenceModel.preferences.defaultMode,
+        contextMode: preferenceModel.preferences.contextMode,
+        title: "New chat",
+      },
+      error: new Error("The native workspace picker is unavailable."),
+    }
+    : null;
 
   if (showingFirstRun && selectedPlatform !== undefined && selectedPlatform !== null) {
     return (
@@ -702,7 +801,12 @@ export function App({
           />
         )}
         <main aria-label="Conversation" className="conversation-main">
-          {sessionsModel.cleanupError !== null ? (
+          {nativeNewChatFailure !== null ? (
+            <SessionOperationRecovery
+              failure={nativeNewChatFailure}
+              onRetry={createFutureSession}
+            />
+          ) : sessionsModel.cleanupError !== null ? (
             <SessionOperationRecovery
               failure={sessionsModel.cleanupError}
               onRetry={sessionsModel.retryCleanup}

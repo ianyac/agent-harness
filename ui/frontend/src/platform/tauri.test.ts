@@ -1,7 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { createTauriPlatform } from "./tauri";
-import type { NativeInvoke, NativeListen, ServiceStatePayload } from "./tauri";
+import type {
+  NativeInvoke,
+  NativeListen,
+  NativeMenuCommand,
+  ServiceStatePayload,
+} from "./tauri";
 
 const oldConnection = {
   baseUrl: "http://127.0.0.1:4010",
@@ -33,6 +38,24 @@ function eventHarness() {
     listen,
     emit(payload: ServiceStatePayload | unknown) {
       if (handler === undefined) throw new Error("listener is not registered");
+      handler({ payload });
+    },
+  };
+}
+
+function menuEventHarness() {
+  let handler: ((event: { payload: unknown }) => void) | undefined;
+  const unlisten = vi.fn();
+  const listen: NativeListen = vi.fn(async (eventName, next) => {
+    expect(eventName).toBe("native-menu");
+    handler = next;
+    return unlisten;
+  });
+  return {
+    listen,
+    unlisten,
+    emit(payload: unknown) {
+      if (handler === undefined) throw new Error("menu listener is not registered");
       handler({ payload });
     },
   };
@@ -179,6 +202,41 @@ describe("Tauri native boundary", () => {
     unsubscribe?.();
     events.emit({ generation: 8, status: "stopping" });
     expect(observed).toHaveLength(2);
+  });
+
+  it("shares one fixed native-menu listener, validates exact ids, isolates subscribers, and unlistens", async () => {
+    const events = menuEventHarness();
+    const platform = createTauriPlatform(
+      async <T,>() => oldConnection as T,
+      events.listen,
+    );
+    const observed: NativeMenuCommand[] = [];
+    const unsubscribeThrowing = platform.subscribeNativeMenu?.(() => {
+      throw new Error("view failure");
+    });
+    const unsubscribeObserved = platform.subscribeNativeMenu?.((command) => {
+      observed.push(command);
+    });
+
+    await vi.waitFor(() => expect(events.listen).toHaveBeenCalledTimes(1));
+    events.emit("harness.new-chat");
+    events.emit("harness.command-palette");
+    events.emit("harness.toggle-activity");
+    events.emit("harness.settings");
+    events.emit("harness.arbitrary-command");
+    events.emit({ command: "harness.new-chat" });
+
+    expect(observed).toEqual([
+      "harness.new-chat",
+      "harness.command-palette",
+      "harness.toggle-activity",
+      "harness.settings",
+    ]);
+    unsubscribeThrowing?.();
+    unsubscribeObserved?.();
+    await vi.waitFor(() => expect(events.unlisten).toHaveBeenCalledTimes(1));
+    events.emit("harness.new-chat");
+    expect(observed).toHaveLength(4);
   });
 
   it("does not restore a stale invoke response after a newer non-Ready transition", async () => {
@@ -328,6 +386,7 @@ describe("Tauri native boundary", () => {
       "openLogs",
       "quit",
       "restartService",
+      "subscribeNativeMenu",
       "subscribeServiceState",
     ]);
   });

@@ -200,6 +200,7 @@ async function installOfflineAuthority(page: Page): Promise<FixtureAuthority> {
 
 export const test = base.extend<{ authority: FixtureAuthority }>({
   authority: async ({ page }, use) => {
+    await page.clock.setFixedTime(new Date("2026-08-09T12:00:00+08:00"));
     await use(await installOfflineAuthority(page));
   },
 });

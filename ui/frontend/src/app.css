@@ -8,6 +8,30 @@
   background: var(--color-page);
 }
 
+.app-shell--tauri,
+.native-shell-root {
+  --native-titlebar-height: 38px;
+  position: relative;
+  min-height: 100dvh;
+  padding-block-start: var(--native-titlebar-height);
+  background: var(--color-page);
+}
+
+.app-shell--tauri > .session-sidebar,
+.app-shell--tauri > .conversation-shell,
+.native-shell-root > :not(.native-titlebar) {
+  min-height: calc(100dvh - var(--native-titlebar-height));
+}
+
+.native-titlebar {
+  position: absolute;
+  z-index: 20;
+  inset: 0 0 auto;
+  height: var(--native-titlebar-height);
+  background: color-mix(in srgb, var(--color-page) 92%, transparent);
+  border-block-end: 1px solid color-mix(in srgb, var(--color-border) 72%, transparent);
+}
+
 .session-sidebar {
   min-width: 0;
   background: var(--color-sidebar);

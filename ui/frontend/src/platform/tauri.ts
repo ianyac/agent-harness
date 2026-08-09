@@ -2,12 +2,15 @@ import { invoke as invokeTauri } from "@tauri-apps/api/core";
 import { listen as listenTauri } from "@tauri-apps/api/event";
 
 import type {
+  NativeMenuCommand,
   PlatformAdapter,
   ServiceConnection,
   ServiceLifecycleState,
   ServiceLifecycleStatus,
 } from "./types";
 import { normalizeServiceConnection } from "./types";
+
+export type { NativeMenuCommand } from "./types";
 
 export type NativeInvoke = <T>(
   command: string,
@@ -27,6 +30,7 @@ type ReadyWaiter = {
 };
 
 const SERVICE_STATE_EVENT = "service-state";
+const NATIVE_MENU_EVENT = "native-menu";
 const SERVICE_UNAVAILABLE = "The local service is unavailable.";
 const LISTENER_UNAVAILABLE = "The native service listener is unavailable.";
 const READINESS_TIMEOUT_MS = 20_000;
@@ -37,6 +41,12 @@ const statuses = new Set<ServiceLifecycleStatus>([
   "stopping",
   "stopped",
   "failed",
+]);
+const nativeMenuCommands = new Set<NativeMenuCommand>([
+  "harness.new-chat",
+  "harness.command-palette",
+  "harness.toggle-activity",
+  "harness.settings",
 ]);
 
 const defaultInvoke: NativeInvoke = (command, args) => invokeTauri(command, args);
@@ -75,6 +85,12 @@ function normalizeServiceState(value: unknown): ServiceStatePayload | null {
   }
 }
 
+function normalizeNativeMenuCommand(value: unknown): NativeMenuCommand | null {
+  return typeof value === "string" && nativeMenuCommands.has(value as NativeMenuCommand)
+    ? value as NativeMenuCommand
+    : null;
+}
+
 function validateWorkspace(value: unknown): string | null {
   if (value === null) return null;
   if (
@@ -97,10 +113,13 @@ export function createTauriPlatform(
   let connectionRequest: Promise<ServiceConnection> | undefined;
   let listenerRequest: Promise<void> | undefined;
   let listenerRegistered = false;
+  let nativeMenuListenerRequest: Promise<void> | undefined;
+  let nativeMenuUnlisten: (() => void) | undefined;
   let latestState: ServiceStatePayload | undefined;
   let stateRevision = 0;
   const waiters = new Set<ReadyWaiter>();
   const subscribers = new Set<(state: ServiceLifecycleState) => void>();
+  const nativeMenuSubscribers = new Set<(command: NativeMenuCommand) => void>();
 
   const hasTerminalState = () => latestState?.status === "failed" || latestState?.status === "stopped";
 
@@ -145,6 +164,43 @@ export function createTauriPlatform(
         throw new Error(LISTENER_UNAVAILABLE);
       });
     return listenerRequest;
+  };
+  const receiveNativeMenu = (event: { payload: unknown }) => {
+    const command = normalizeNativeMenuCommand(event.payload);
+    if (command === null) return;
+    for (const subscriber of nativeMenuSubscribers) {
+      try {
+        subscriber(command);
+      } catch {
+        // A view subscriber cannot interrupt the fixed native menu boundary.
+      }
+    }
+  };
+  const ensureNativeMenuListener = () => {
+    if (nativeMenuUnlisten !== undefined || nativeMenuListenerRequest !== undefined) return;
+    const request = listen(NATIVE_MENU_EVENT, receiveNativeMenu)
+      .then((unlisten) => {
+        if (nativeMenuListenerRequest !== request) {
+          unlisten();
+          return;
+        }
+        nativeMenuListenerRequest = undefined;
+        if (nativeMenuSubscribers.size === 0) {
+          unlisten();
+          return;
+        }
+        nativeMenuUnlisten = unlisten;
+      })
+      .catch(() => {
+        if (nativeMenuListenerRequest === request) nativeMenuListenerRequest = undefined;
+      });
+    nativeMenuListenerRequest = request;
+  };
+  const releaseNativeMenuListener = () => {
+    if (nativeMenuSubscribers.size !== 0 || nativeMenuUnlisten === undefined) return;
+    const unlisten = nativeMenuUnlisten;
+    nativeMenuUnlisten = undefined;
+    unlisten();
   };
   const waitForReady = () => {
     let waiter: ReadyWaiter;
@@ -239,6 +295,17 @@ export function createTauriPlatform(
       void ensureListener().catch(() => {});
       return () => {
         subscribers.delete(listener);
+      };
+    },
+    subscribeNativeMenu(listener: (command: NativeMenuCommand) => void): () => void {
+      nativeMenuSubscribers.add(listener);
+      ensureNativeMenuListener();
+      let subscribed = true;
+      return () => {
+        if (!subscribed) return;
+        subscribed = false;
+        nativeMenuSubscribers.delete(listener);
+        releaseNativeMenuListener();
       };
     },
     async chooseWorkspace(): Promise<string | null> {

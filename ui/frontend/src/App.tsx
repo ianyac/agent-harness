@@ -32,6 +32,7 @@ import { Settings } from "./features/settings/Settings";
 import type { PreferenceStorage } from "./features/settings/preferences";
 import { usePreferences } from "./features/settings/preferences";
 import type {
+  NativeMenuCommand,
   PlatformAdapter,
   ServiceConnection,
   ServiceLifecycleState,
@@ -203,6 +204,7 @@ export function App({
   const submissionOwnerRef = useRef<{ readonly client: ApiClient | null; readonly dispatcher: AppProps["onSessionEvent"] } | null>(null);
   const retrySubmittedRef = useRef(new Set<string>());
   const newChatPendingRef = useRef(false);
+  const nativeMenuHandlersRef = useRef<Readonly<Record<NativeMenuCommand, () => void>> | null>(null);
   const bootstrapPendingRef = useRef(providedClient === undefined);
   const preferenceModel = usePreferences(preferenceStorage ?? sidebarStorage);
 
@@ -692,6 +694,18 @@ export function App({
     }
   };
   const selectedPlatform = connection.platform ?? platformAdapter;
+  nativeMenuHandlersRef.current = {
+    "harness.new-chat": () => void createFutureSession(),
+    "harness.command-palette": () => setPaletteOpen(true),
+    "harness.toggle-activity": toggleInspector,
+    "harness.settings": openSettings,
+  };
+  useEffect(() => {
+    if (selectedPlatform?.subscribeNativeMenu === undefined) return;
+    return selectedPlatform.subscribeNativeMenu((command) => {
+      nativeMenuHandlersRef.current?.[command]?.();
+    });
+  }, [selectedPlatform]);
   const sessionReadiness = sessionsModel.refreshError !== null
     ? "reconnecting" as const
     : sessionsModel.loading ? "checking" as const : "connected" as const;
@@ -714,7 +728,7 @@ export function App({
     : null;
 
   if (showingFirstRun && selectedPlatform !== undefined && selectedPlatform !== null) {
-    return (
+    const firstRun = (
       <>
         <Onboarding
           serviceStatus={sessionsModel.loading ? "checking" : "ready"}
@@ -736,10 +750,20 @@ export function App({
         />
       </>
     );
+    return selectedPlatform.kind === "tauri" ? (
+      <div className="native-shell-root">
+        <div className="native-titlebar" data-tauri-drag-region aria-hidden="true" />
+        {firstRun}
+      </div>
+    ) : firstRun;
   }
 
+  const nativeShell = selectedPlatform?.kind === "tauri";
   return (
-    <div className="app-shell">
+    <div className={nativeShell ? "app-shell app-shell--tauri" : "app-shell"}>
+      {nativeShell ? (
+        <div className="native-titlebar" data-tauri-drag-region aria-hidden="true" />
+      ) : null}
       <SessionSidebar
         sessions={sessionsModel.sessions}
         activeSessionId={sessionsModel.activeSessionId}

@@ -22,10 +22,17 @@ export type ServiceLifecycleState =
     readonly status: Exclude<ServiceLifecycleStatus, "ready">;
   };
 
+export type NativeMenuCommand =
+  | "harness.new-chat"
+  | "harness.command-palette"
+  | "harness.toggle-activity"
+  | "harness.settings";
+
 export interface PlatformAdapter {
   readonly kind: "browser" | "tauri";
   getServiceConnection(): Promise<ServiceConnection>;
   subscribeServiceState?: (listener: (state: ServiceLifecycleState) => void) => () => void;
+  subscribeNativeMenu?: (listener: (command: NativeMenuCommand) => void) => () => void;
   chooseWorkspace(): Promise<string | null>;
   notify(input: { title: string; body: string }): Promise<void>;
   openLogs?: () => Promise<void>;

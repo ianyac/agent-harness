@@ -3,8 +3,13 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { App, createNewChat, resolveNewChatWorkspace } from "./App";
+import appCss from "./app.css?raw";
 import { ApiClient } from "./api/http";
-import type { PlatformAdapter, ServiceLifecycleState } from "./platform/types";
+import type {
+  NativeMenuCommand,
+  PlatformAdapter,
+  ServiceLifecycleState,
+} from "./platform/types";
 import type { SessionRecord } from "./features/sessions/useSessions";
 import { event } from "./protocol/fixtures";
 import { emptyTranscript, transcriptReducer } from "./protocol/reducer";
@@ -54,6 +59,23 @@ function deferred<T = void>() {
     reject = decline;
   });
   return { promise, resolve, reject };
+}
+
+function nativeMenuHarness(changes: Partial<PlatformAdapter> = {}) {
+  let listener: ((command: NativeMenuCommand) => void) | undefined;
+  const unsubscribe = vi.fn();
+  const subscribeNativeMenu = vi.fn((next: (command: NativeMenuCommand) => void) => {
+    listener = next;
+    return unsubscribe;
+  });
+  return {
+    platform: platformAdapter({ kind: "tauri", subscribeNativeMenu, ...changes }),
+    subscribeNativeMenu,
+    unsubscribe,
+    emit(command: unknown) {
+      listener?.(command as NativeMenuCommand);
+    },
+  };
 }
 
 function capturedSubmissionId(
@@ -113,6 +135,175 @@ afterEach(() => {
 });
 
 describe("App", () => {
+  it("routes native New Chat through the same single-flight session callback", async () => {
+    const active = session({ title: "Native menu workspace" });
+    let creates = 0;
+    const fetchRequest: typeof fetch = async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : input.toString());
+      if (url.pathname === "/api/config") {
+        return Response.json({
+          base_workspace: "/app/bootstrap",
+          default_mode: "default",
+          default_context_mode: "compaction",
+          modes: ["default", "acceptAll", "readOnly"],
+          context_modes: ["compaction", "folding"],
+        });
+      }
+      if (url.pathname === "/api/sessions" && init?.method === "GET") {
+        return Response.json([active]);
+      }
+      if (url.pathname === "/api/sessions" && init?.method === "POST") {
+        creates += 1;
+        return Response.json(session({ session_id: "native-menu-created" }), { status: 201 });
+      }
+      return new Response(null, { status: 404 });
+    };
+    const native = nativeMenuHarness();
+    render(
+      <App
+        client={clientWith(fetchRequest)}
+        platformAdapter={native.platform}
+        sidebarStorage={storage}
+        draftStorage={storage}
+        transcriptBySession={{ [active.session_id]: emptyTranscript() }}
+      />,
+    );
+    await screen.findByRole("button", { name: /^Native menu workspace,/i });
+    await vi.waitFor(() => expect(native.subscribeNativeMenu).toHaveBeenCalledTimes(1));
+
+    act(() => {
+      native.emit("harness.new-chat");
+      native.emit("harness.new-chat");
+    });
+
+    await vi.waitFor(() => expect(creates).toBe(1));
+  });
+
+  it("routes native Command Palette to the existing palette callback", async () => {
+    const active = session();
+    const native = nativeMenuHarness();
+    render(
+      <App
+        client={clientWithSessions([active])}
+        platformAdapter={native.platform}
+        sidebarStorage={storage}
+        draftStorage={storage}
+        transcriptBySession={{ [active.session_id]: emptyTranscript() }}
+      />,
+    );
+    await vi.waitFor(() => expect(native.subscribeNativeMenu).toHaveBeenCalledTimes(1));
+
+    act(() => native.emit("harness.command-palette"));
+
+    expect(await screen.findByRole("dialog", { name: "Command palette" })).toBeVisible();
+  });
+
+  it("routes native Toggle Activity to the existing activity callback", async () => {
+    const active = session();
+    const onToggleActivity = vi.fn();
+    const native = nativeMenuHarness();
+    render(
+      <App
+        client={clientWithSessions([active])}
+        platformAdapter={native.platform}
+        sidebarStorage={storage}
+        draftStorage={storage}
+        transcriptBySession={{ [active.session_id]: emptyTranscript() }}
+        onToggleActivity={onToggleActivity}
+      />,
+    );
+    await vi.waitFor(() => expect(native.subscribeNativeMenu).toHaveBeenCalledTimes(1));
+
+    act(() => native.emit("harness.toggle-activity"));
+
+    expect(onToggleActivity).toHaveBeenCalledTimes(1);
+  });
+
+  it("routes native Settings to the existing settings callback", async () => {
+    const active = session();
+    const onOpenSettings = vi.fn();
+    const native = nativeMenuHarness();
+    render(
+      <App
+        client={clientWithSessions([active])}
+        platformAdapter={native.platform}
+        sidebarStorage={storage}
+        draftStorage={storage}
+        transcriptBySession={{ [active.session_id]: emptyTranscript() }}
+        onOpenSettings={onOpenSettings}
+      />,
+    );
+    await vi.waitFor(() => expect(native.subscribeNativeMenu).toHaveBeenCalledTimes(1));
+
+    act(() => native.emit("harness.settings"));
+
+    expect(onOpenSettings).toHaveBeenCalledTimes(1);
+    expect(await screen.findByRole("dialog", { name: "Settings" })).toBeVisible();
+  });
+
+  it("subscribes once, ignores unknown native menu payloads, and unsubscribes on cleanup", async () => {
+    const active = session();
+    const onOpenSettings = vi.fn();
+    const onToggleActivity = vi.fn();
+    const native = nativeMenuHarness();
+    const props = {
+      client: clientWithSessions([active]),
+      platformAdapter: native.platform,
+      sidebarStorage: storage,
+      draftStorage: storage,
+      transcriptBySession: { [active.session_id]: emptyTranscript() },
+      onOpenSettings,
+      onToggleActivity,
+    };
+    const { rerender, unmount } = render(<App {...props} />);
+    await vi.waitFor(() => expect(native.subscribeNativeMenu).toHaveBeenCalledTimes(1));
+
+    rerender(<App {...props} />);
+    act(() => native.emit("harness.arbitrary-command"));
+
+    expect(native.subscribeNativeMenu).toHaveBeenCalledTimes(1);
+    expect(onOpenSettings).not.toHaveBeenCalled();
+    expect(onToggleActivity).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog", { name: "Command palette" })).not.toBeInTheDocument();
+    unmount();
+    expect(native.unsubscribe).toHaveBeenCalledTimes(1);
+  });
+
+  it("renders one real drag region only for the native shell", async () => {
+    const active = session();
+    const native = nativeMenuHarness();
+    const nativeView = render(
+      <App
+        client={clientWithSessions([active])}
+        platformAdapter={native.platform}
+        sidebarStorage={storage}
+        draftStorage={storage}
+        transcriptBySession={{ [active.session_id]: emptyTranscript() }}
+      />,
+    );
+    await screen.findByRole("button", { name: /^Project A,/i });
+    expect(nativeView.container.querySelectorAll("[data-tauri-drag-region]")).toHaveLength(1);
+    nativeView.unmount();
+
+    const browserView = render(
+      <App
+        client={clientWithSessions([active])}
+        platformAdapter={platformAdapter()}
+        sidebarStorage={storage}
+        draftStorage={storage}
+        transcriptBySession={{ [active.session_id]: emptyTranscript() }}
+      />,
+    );
+    await screen.findByRole("button", { name: /^Project A,/i });
+    expect(browserView.container.querySelector("[data-tauri-drag-region]")).toBeNull();
+  });
+
+  it("keeps native drag chrome below fixed activity and dialog surfaces", () => {
+    const titlebarRule = appCss.match(/\.native-titlebar\s*\{([^}]*)\}/)?.[1];
+
+    expect(titlebarRule).toMatch(/z-index:\s*20\s*;/);
+  });
+
   it("keeps the native bootstrap workspace out of future New chat selection", async () => {
     const chooseWorkspace = vi.fn()
       .mockResolvedValueOnce(null)

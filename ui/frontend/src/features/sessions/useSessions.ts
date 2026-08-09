@@ -313,15 +313,10 @@ export function useSessions(
         && SERVICE_ID_PATTERN.test(health.service_id)
         ? health.service_id.toLowerCase()
         : null;
-      if (
-        responseServiceId === null
-        && (serviceIdRef.current !== null || cleanupLedgerRef.current.size > 0)
-      ) {
+      if (responseServiceId === null) {
         throw new Error("The local service identity could not be confirmed.");
       }
-      const cleanupLedger = responseServiceId === null
-        ? new Set<string>()
-        : activateCleanupLedger(responseServiceId, requestClient, epoch);
+      const cleanupLedger = activateCleanupLedger(responseServiceId, requestClient, epoch);
       const visible = unarchived(records).filter(
         (record) => !cleanupLedger.has(record.session_id),
       );

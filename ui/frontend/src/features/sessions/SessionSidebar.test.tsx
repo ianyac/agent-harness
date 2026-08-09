@@ -262,6 +262,12 @@ describe("SessionSidebar", () => {
     let created = 1;
     const fetchRequest: typeof fetch = async (input, init) => {
       const url = new URL(input instanceof Request ? input.url : input.toString());
+      if (url.pathname === "/api/health") {
+        return Response.json({
+          status: "ok",
+          service_id: "11111111-1111-4111-8111-111111111111",
+        });
+      }
       if (url.pathname === "/api/config") {
         return Response.json({
           base_workspace: "/work/acme",

@@ -14,6 +14,7 @@ const connection = {
   baseUrl: "http://127.0.0.1:4010",
   token: "t".repeat(43),
 };
+const testServiceId = "11111111-1111-4111-8111-111111111111";
 
 const storage = {
   getItem: () => null,
@@ -56,7 +57,14 @@ function deferred<T = void>() {
 }
 
 function clientWith(fetchRequest: typeof fetch) {
-  return new ApiClient(connection, fetchRequest);
+  const withIdentity: typeof fetch = async (input, init) => {
+    const path = new URL(input instanceof Request ? input.url : input.toString()).pathname;
+    if (path === "/api/health") {
+      return Response.json({ status: "ok", service_id: testServiceId });
+    }
+    return fetchRequest(input, init);
+  };
+  return new ApiClient(connection, withIdentity);
 }
 
 function clientWithSessions(records: readonly SessionRecord[]) {
@@ -414,6 +422,43 @@ describe("App", () => {
     await act(async () => retry.resolve());
   });
 
+  it("binds an accepted retry to its new turn and offers the same exact retry after a second failure", async () => {
+    const user = userEvent.setup();
+    const active = session();
+    const client = clientWithSessions([active]);
+    const onSessionEvent = vi.fn();
+    const props = { client, platformAdapter: platformAdapter(), sidebarStorage: storage, draftStorage: storage, onSessionEvent };
+    const { rerender } = render(
+      <App {...props} transcriptBySession={{ [active.session_id]: emptyTranscript() }} />,
+    );
+    await user.type(await screen.findByRole("textbox", { name: "Message" }), "same safe retry");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+    let state = transcriptReducer(
+      emptyTranscript(),
+      event("turn_started", { sequence: 1, turn_id: "turn-a" }),
+    );
+    rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
+    await act(async () => { await Promise.resolve(); });
+    state = transcriptReducer(state, event("turn_failed", { sequence: 2, turn_id: "turn-a" }));
+    rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
+
+    await user.dblClick(await screen.findByRole("button", { name: "Retry" }));
+    expect(onSessionEvent).toHaveBeenCalledTimes(2);
+    state = transcriptReducer(state, event("turn_started", { sequence: 3, turn_id: "turn-b" }));
+    rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
+    await act(async () => { await Promise.resolve(); });
+    state = transcriptReducer(state, event("turn_failed", { sequence: 4, turn_id: "turn-b" }));
+    rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
+
+    await user.dblClick(await screen.findByRole("button", { name: "Retry" }));
+    expect(onSessionEvent).toHaveBeenCalledTimes(3);
+    expect(onSessionEvent).toHaveBeenLastCalledWith(active.session_id, {
+      type: "send_message",
+      text: "same safe retry",
+      mode: "base",
+    });
+  });
+
   it("binds a queued follow-up only when its own turn starts and retries that failed follow-up", async () => {
     const user = userEvent.setup();
     const active = session();
@@ -476,7 +521,7 @@ describe("App", () => {
     });
   });
 
-  it("retires a cleared queued candidate before any later turn can bind it", async () => {
+  it("binds queued B when its authoritative start wins an accepted clear race", async () => {
     const user = userEvent.setup();
     const active = session();
     const client = clientWithSessions([active]);
@@ -500,8 +545,167 @@ describe("App", () => {
     state = transcriptReducer(state, event("turn_failed", { sequence: 4, turn_id: "turn-b" }));
     rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
 
-    expect(await screen.findByRole("alert")).toBeVisible();
+    await user.dblClick(await screen.findByRole("button", { name: "Retry" }));
+    expect(onSessionEvent).toHaveBeenLastCalledWith(active.session_id, {
+      type: "send_message",
+      text: "retired B",
+      mode: "base",
+    });
+    expect(onSessionEvent).toHaveBeenCalledTimes(4);
+  });
+
+  it("restores queued B when clear rejects before B starts", async () => {
+    const user = userEvent.setup();
+    const active = session();
+    const client = clientWithSessions([active]);
+    const onSessionEvent = vi.fn((_sessionId: string, outbound: ClientEvent) => (
+      outbound.type === "clear_queued_message"
+        ? Promise.reject(new Error("unsafe clear detail"))
+        : undefined
+    ));
+    const props = { client, platformAdapter: platformAdapter(), sidebarStorage: storage, draftStorage: storage, onSessionEvent };
+    const { rerender } = render(<App {...props} transcriptBySession={{ [active.session_id]: emptyTranscript() }} />);
+    await user.type(await screen.findByRole("textbox", { name: "Message" }), "turn A");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+    let state = transcriptReducer(emptyTranscript(), event("turn_started", { sequence: 1, turn_id: "turn-a" }));
+    rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
+    await act(async () => { await Promise.resolve(); });
+    await user.type(screen.getByRole("textbox", { name: "Message" }), "queued B");
+    await user.click(screen.getByRole("button", { name: "Queue message" }));
+    state = { ...state, queued: { type: "queue_message", text: "queued B", mode: "base" } };
+    rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
+    await user.click(screen.getByRole("button", { name: "Edit queued follow-up" }));
+    state = transcriptReducer(state, event("turn_completed", { sequence: 2, turn_id: "turn-a" }));
+    state = transcriptReducer(state, event("turn_started", { sequence: 3, turn_id: "turn-b" }));
+    rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
+    await act(async () => { await Promise.resolve(); });
+    state = transcriptReducer(state, event("turn_failed", { sequence: 4, turn_id: "turn-b" }));
+    rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
+
+    await user.click(await screen.findByRole("button", { name: "Retry" }));
+    expect(onSessionEvent).toHaveBeenLastCalledWith(active.session_id, {
+      type: "send_message",
+      text: "queued B",
+      mode: "base",
+    });
+    expect(screen.getByRole("alert")).not.toHaveTextContent("unsafe clear detail");
+  });
+
+  it("keeps a clearing B bound when B starts before the clear rejection settles", async () => {
+    const user = userEvent.setup();
+    const active = session();
+    const client = clientWithSessions([active]);
+    const clear = deferred();
+    const onSessionEvent = vi.fn((_sessionId: string, outbound: ClientEvent) => (
+      outbound.type === "clear_queued_message" ? clear.promise : undefined
+    ));
+    const props = { client, platformAdapter: platformAdapter(), sidebarStorage: storage, draftStorage: storage, onSessionEvent };
+    const { rerender } = render(<App {...props} transcriptBySession={{ [active.session_id]: emptyTranscript() }} />);
+    await user.type(await screen.findByRole("textbox", { name: "Message" }), "turn A");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+    let state = transcriptReducer(emptyTranscript(), event("turn_started", { sequence: 1, turn_id: "turn-a" }));
+    rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
+    await act(async () => { await Promise.resolve(); });
+    await user.type(screen.getByRole("textbox", { name: "Message" }), "queued B");
+    await user.click(screen.getByRole("button", { name: "Queue message" }));
+    state = { ...state, queued: { type: "queue_message", text: "queued B", mode: "base" } };
+    rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
+    await user.click(screen.getByRole("button", { name: "Edit queued follow-up" }));
+    state = transcriptReducer(state, event("turn_completed", { sequence: 2, turn_id: "turn-a" }));
+    state = transcriptReducer(state, event("turn_started", { sequence: 3, turn_id: "turn-b" }));
+    rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
+    await act(async () => { await Promise.resolve(); });
+    state = transcriptReducer(state, event("turn_failed", { sequence: 4, turn_id: "turn-b" }));
+    rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
+    await act(async () => clear.reject(new Error("late clear rejection")));
+
+    await user.click(await screen.findByRole("button", { name: "Retry" }));
+    expect(onSessionEvent).toHaveBeenLastCalledWith(active.session_id, {
+      type: "send_message",
+      text: "queued B",
+      mode: "base",
+    });
+  });
+
+  it("retires an accepted clearing B when a later direct C becomes authoritative", async () => {
+    const user = userEvent.setup();
+    const active = session();
+    const client = clientWithSessions([active]);
+    const onSessionEvent = vi.fn();
+    const props = { client, platformAdapter: platformAdapter(), sidebarStorage: storage, draftStorage: storage, onSessionEvent };
+    const { rerender } = render(<App {...props} transcriptBySession={{ [active.session_id]: emptyTranscript() }} />);
+    await user.type(await screen.findByRole("textbox", { name: "Message" }), "turn A");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+    let state = transcriptReducer(emptyTranscript(), event("turn_started", { sequence: 1, turn_id: "turn-a" }));
+    rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
+    await act(async () => { await Promise.resolve(); });
+    await user.type(screen.getByRole("textbox", { name: "Message" }), "cleared B");
+    await user.click(screen.getByRole("button", { name: "Queue message" }));
+    state = { ...state, queued: { type: "queue_message", text: "cleared B", mode: "base" } };
+    rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
+    await user.click(screen.getByRole("button", { name: "Edit queued follow-up" }));
+
+    state = transcriptReducer(state, event("turn_completed", { sequence: 2, turn_id: "turn-a" }));
+    state = { ...state, queued: null };
+    rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
     expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+    const directComposer = await screen.findByRole("textbox", { name: "Message" });
+    await user.clear(directComposer);
+    await user.type(directComposer, "direct C");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+    state = transcriptReducer(state, event("turn_started", { sequence: 3, turn_id: "turn-c" }));
+    rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
+    await act(async () => { await Promise.resolve(); });
+    state = transcriptReducer(state, event("turn_failed", { sequence: 4, turn_id: "turn-c" }));
+    rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
+
+    await user.click(await screen.findByRole("button", { name: "Retry" }));
+    expect(onSessionEvent).toHaveBeenLastCalledWith(active.session_id, {
+      type: "send_message",
+      text: "direct C",
+      mode: "base",
+    });
+    expect(onSessionEvent).toHaveBeenCalledTimes(5);
+  });
+
+  it("keeps a retried A authoritative when a late clear rejection tries to restore queued B", async () => {
+    const user = userEvent.setup();
+    const active = session();
+    const client = clientWithSessions([active]);
+    const clear = deferred();
+    const onSessionEvent = vi.fn((_sessionId: string, outbound: ClientEvent) => (
+      outbound.type === "clear_queued_message" ? clear.promise : undefined
+    ));
+    const props = { client, platformAdapter: platformAdapter(), sidebarStorage: storage, draftStorage: storage, onSessionEvent };
+    const { rerender } = render(<App {...props} transcriptBySession={{ [active.session_id]: emptyTranscript() }} />);
+    await user.type(await screen.findByRole("textbox", { name: "Message" }), "turn A");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+    let state = transcriptReducer(emptyTranscript(), event("turn_started", { sequence: 1, turn_id: "turn-a" }));
+    rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
+    await act(async () => { await Promise.resolve(); });
+    await user.type(screen.getByRole("textbox", { name: "Message" }), "queued B");
+    await user.click(screen.getByRole("button", { name: "Queue message" }));
+    state = { ...state, queued: { type: "queue_message", text: "queued B", mode: "base" } };
+    rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
+    await user.click(screen.getByRole("button", { name: "Edit queued follow-up" }));
+    state = transcriptReducer(state, event("turn_failed", { sequence: 2, turn_id: "turn-a" }));
+    rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
+
+    await user.click(await screen.findByRole("button", { name: "Retry" }));
+    await act(async () => clear.reject(new Error("late rejected clear")));
+    state = transcriptReducer(state, event("turn_started", { sequence: 3, turn_id: "turn-a-retry" }));
+    rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
+    await act(async () => { await Promise.resolve(); });
+    state = transcriptReducer(state, event("turn_failed", { sequence: 4, turn_id: "turn-a-retry" }));
+    rerender(<App {...props} transcriptBySession={{ [active.session_id]: state }} />);
+
+    await user.click(await screen.findByRole("button", { name: "Retry" }));
+    expect(onSessionEvent).toHaveBeenLastCalledWith(active.session_id, {
+      type: "send_message",
+      text: "turn A",
+      mode: "base",
+    });
+    expect(onSessionEvent).toHaveBeenCalledTimes(5);
   });
 
   it("replaces a queued retry candidate when the follow-up is edited", async () => {
@@ -728,6 +932,67 @@ describe("App", () => {
     expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
   });
 
+  it("invalidates an accepted retry candidate when its client and dispatcher are replaced", async () => {
+    const user = userEvent.setup();
+    const active = session();
+    const firstClient = clientWithSessions([active]);
+    const firstDispatcher = vi.fn();
+    const secondDispatcher = vi.fn();
+    const baseProps = {
+      platformAdapter: platformAdapter(),
+      sidebarStorage: storage,
+      draftStorage: storage,
+    };
+    const { rerender } = render(
+      <App
+        {...baseProps}
+        client={firstClient}
+        onSessionEvent={firstDispatcher}
+        transcriptBySession={{ [active.session_id]: emptyTranscript() }}
+      />,
+    );
+    await user.type(await screen.findByRole("textbox", { name: "Message" }), "accepted then replaced");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+    let state = transcriptReducer(
+      emptyTranscript(),
+      event("turn_started", { sequence: 1, turn_id: "turn-a" }),
+    );
+    rerender(
+      <App {...baseProps} client={firstClient} onSessionEvent={firstDispatcher} transcriptBySession={{ [active.session_id]: state }} />,
+    );
+    await act(async () => { await Promise.resolve(); });
+    state = transcriptReducer(state, event("turn_failed", { sequence: 2, turn_id: "turn-a" }));
+    rerender(
+      <App {...baseProps} client={firstClient} onSessionEvent={firstDispatcher} transcriptBySession={{ [active.session_id]: state }} />,
+    );
+    await user.click(await screen.findByRole("button", { name: "Retry" }));
+    expect(firstDispatcher).toHaveBeenCalledTimes(2);
+
+    state = transcriptReducer(state, event("turn_started", { sequence: 3, turn_id: "turn-b" }));
+    rerender(
+      <App
+        {...baseProps}
+        client={clientWithSessions([active])}
+        onSessionEvent={secondDispatcher}
+        transcriptBySession={{ [active.session_id]: state }}
+      />,
+    );
+    await act(async () => { await Promise.resolve(); });
+    state = transcriptReducer(state, event("turn_failed", { sequence: 4, turn_id: "turn-b" }));
+    rerender(
+      <App
+        {...baseProps}
+        client={clientWithSessions([active])}
+        onSessionEvent={secondDispatcher}
+        transcriptBySession={{ [active.session_id]: state }}
+      />,
+    );
+
+    expect(await screen.findByRole("alert")).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+    expect(secondDispatcher).not.toHaveBeenCalled();
+  });
+
   it("does not replay a submission bound to a different failed turn id", async () => {
     const user = userEvent.setup();
     const active = session();
@@ -760,7 +1025,9 @@ describe("App", () => {
     const fetchRequest: typeof fetch = async (input) => {
       const path = new URL(input instanceof Request ? input.url : input.toString()).pathname;
       paths.push(path);
-      if (path === "/api/health") return Response.json({ status: "ok" });
+      if (path === "/api/health") {
+        return Response.json({ status: "ok", service_id: testServiceId });
+      }
       if (path === "/api/config") return Response.json({
         base_workspace: "/work/base",
         default_mode: "default",
@@ -781,6 +1048,74 @@ describe("App", () => {
     );
     expect(await screen.findByRole("heading", { name: "project-a" })).toBeVisible();
     expect(paths[0]).toBe("/api/health");
+    expect(screen.getByRole("status", { name: "Local service connected" })).toBeVisible();
+  });
+
+  it("does not become create-ready when bootstrap health succeeds but session identity health fails", async () => {
+    vi.useFakeTimers();
+    const serviceId = "11111111-1111-4111-8111-111111111111";
+    let healthRequests = 0;
+    let creates = 0;
+    const identityStorage = {
+      getItem: (key: string) => key.includes(serviceId)
+        ? JSON.stringify({ version: 1, sessionIds: ["stale"] })
+        : null,
+      setItem: () => {},
+    };
+    const fetchRequest: typeof fetch = async (input, init) => {
+      const path = new URL(input instanceof Request ? input.url : input.toString()).pathname;
+      if (path === "/api/health") {
+        healthRequests += 1;
+        return healthRequests === 2
+          ? new Response(null, { status: 503 })
+          : Response.json({ status: "ok", service_id: serviceId });
+      }
+      if (path === "/api/config") return Response.json({
+        base_workspace: "/work/project-a",
+        default_mode: "default",
+        default_context_mode: "compaction",
+        modes: ["default", "acceptAll", "readOnly"],
+        context_modes: ["compaction", "folding"],
+      });
+      if (path === "/api/sessions" && init?.method === "GET") {
+        return Response.json([
+          session({ session_id: "stale", title: "Stale" }),
+          session({ session_id: "current", title: "Current" }),
+        ]);
+      }
+      if (path === "/api/sessions" && init?.method === "POST") {
+        creates += 1;
+        return Response.json(session({ session_id: "created" }), { status: 201 });
+      }
+      return new Response(null, { status: 404 });
+    };
+    vi.stubGlobal("fetch", fetchRequest);
+    render(
+      <App
+        platformAdapter={platformAdapter()}
+        sidebarStorage={identityStorage}
+        draftStorage={storage}
+      />,
+    );
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+      for (let index = 0; index < 12; index += 1) await Promise.resolve();
+    });
+    expect(healthRequests).toBe(2);
+    expect(screen.getByRole("status", { name: "Local service reconnecting" })).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "New chat" }));
+    await act(async () => { await Promise.resolve(); });
+    expect(creates).toBe(0);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+    fireEvent.click(screen.getByRole("button", { name: "Retry connection" }));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+      for (let index = 0; index < 12; index += 1) await Promise.resolve();
+    });
+    expect(screen.getByRole("button", { name: /^Current,/ })).toBeVisible();
+    expect(screen.queryByRole("button", { name: /^Stale,/ })).not.toBeInTheDocument();
     expect(screen.getByRole("status", { name: "Local service connected" })).toBeVisible();
   });
 
@@ -1044,7 +1379,9 @@ describe("App", () => {
     const fetchRequest: typeof fetch = async (input) => {
       const path = new URL(input instanceof Request ? input.url : input.toString()).pathname;
       paths.push(path);
-      if (path === "/api/health") return Response.json({ status: "ok" });
+      if (path === "/api/health") {
+        return Response.json({ status: "ok", service_id: testServiceId });
+      }
       if (path === "/api/config") return Response.json({
         base_workspace: "/work/project-a",
         default_mode: "default",

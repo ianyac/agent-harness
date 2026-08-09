@@ -47,6 +47,11 @@ type DeliveryOperation = EditAuthority & {
   readonly submission: Submission;
 };
 
+type StopOperation = {
+  readonly sessionId: string;
+  readonly operationId: number;
+};
+
 function hasSameEditAuthority(left: EditAuthority, right: EditAuthority) {
   return left.sessionId === right.sessionId &&
     left.sessionEpoch === right.sessionEpoch &&
@@ -99,7 +104,9 @@ export function Composer({
   const [deliveryErrors, setDeliveryErrors] = useState<
     ReadonlyMap<string, DeliveryOperation>
   >(() => new Map());
-  const [turnError, setTurnError] = useState(false);
+  const [turnErrorSessions, setTurnErrorSessions] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
   const [clearPendingSessions, setClearPendingSessions] = useState<ReadonlySet<string>>(
     () => new Set(),
   );
@@ -114,9 +121,14 @@ export function Composer({
   const currentDeliveryOperations = useRef(new Map<string, DeliveryOperation>());
   const nextClearOperationId = useRef(0);
   const currentClearOperations = useRef(new Map<string, ClearOperation>());
+  const nextStopOperationId = useRef(0);
+  const currentStopOperations = useRef(new Map<string, StopOperation>());
+  const activeSessionRef = useRef(sessionId);
+  activeSessionRef.current = sessionId;
   const textboxRef = useRef<HTMLTextAreaElement>(null);
   const stopRef = useRef<HTMLButtonElement>(null);
-  const previousRunning = useRef(running);
+  const runningBySession = useRef(new Map<string, boolean>([[sessionId, running]]));
+  const previousActiveSession = useRef(sessionId);
   const listboxId = useId();
   const slashQuery = draft.startsWith("/") ? draft.split(/\s/, 1)[0].toLocaleLowerCase() : "";
   const matchingCommands = useMemo(
@@ -129,6 +141,7 @@ export function Composer({
   const deliveryError = deliveryErrors.get(sessionId) ?? null;
   const queueReconciliation = queueReconciliations.get(sessionId) ?? null;
   const clearPending = clearPendingSessions.has(sessionId);
+  const turnError = turnErrorSessions.has(sessionId);
 
   const editAuthorityFor = (authoritySessionId: string) => {
     const existing = editAuthorities.current.get(authoritySessionId);
@@ -147,15 +160,19 @@ export function Composer({
   useEffect(() => {
     setSuggestionsDismissed(false);
     setActiveSuggestion(0);
-    setTurnError(false);
     composing.current = false;
     postCompositionEnter.current = false;
   }, [sessionId]);
 
   useEffect(() => {
-    if (previousRunning.current && !running) textboxRef.current?.focus();
-    previousRunning.current = running;
-  }, [running]);
+    const sessionRemainedActive = previousActiveSession.current === sessionId;
+    const previousRunning = runningBySession.current.get(sessionId);
+    runningBySession.current.set(sessionId, running);
+    previousActiveSession.current = sessionId;
+    if (sessionRemainedActive && previousRunning === true && !running) {
+      textboxRef.current?.focus();
+    }
+  }, [running, sessionId]);
 
   useEffect(() => {
     setActiveSuggestion(0);
@@ -258,6 +275,15 @@ export function Composer({
     });
   };
 
+  const setTurnError = (errorSessionId: string, value: boolean) => {
+    setTurnErrorSessions((current) => {
+      const next = new Set(current);
+      if (value) next.add(errorSessionId);
+      else next.delete(errorSessionId);
+      return next;
+    });
+  };
+
   const clearQueue = async (retryOperation?: ClearOperation) => {
     if (
       retryOperation !== undefined &&
@@ -291,7 +317,7 @@ export function Composer({
         markEdited(operation.sessionId);
         setSessionDraft(operation.sessionId, operation.queued.text);
         setSessionMode(operation.sessionId, operation.queued.mode);
-        if (sessionId === operation.sessionId) textboxRef.current?.focus();
+        if (activeSessionRef.current === operation.sessionId) textboxRef.current?.focus();
       } else {
         setQueueReconciliation(operation.sessionId, { kind: "saved", operation });
       }
@@ -327,11 +353,23 @@ export function Composer({
   };
 
   const requestStop = async () => {
-    setTurnError(false);
+    nextStopOperationId.current += 1;
+    const operation: StopOperation = {
+      sessionId,
+      operationId: nextStopOperationId.current,
+    };
+    currentStopOperations.current.set(operation.sessionId, operation);
+    setTurnError(operation.sessionId, false);
     try {
       await onStop();
     } catch {
-      setTurnError(true);
+      if (currentStopOperations.current.get(operation.sessionId) !== operation) return;
+      currentStopOperations.current.delete(operation.sessionId);
+      setTurnError(operation.sessionId, true);
+      return;
+    }
+    if (currentStopOperations.current.get(operation.sessionId) === operation) {
+      currentStopOperations.current.delete(operation.sessionId);
     }
   };
 

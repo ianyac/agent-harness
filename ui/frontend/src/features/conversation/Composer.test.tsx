@@ -158,6 +158,7 @@ describe("Composer", () => {
         "true",
       );
     });
+    expect(screen.getByRole("textbox", { name: "Message" })).toHaveFocus();
   });
 
   it("preserves edits made while queue clear is pending and offers the cleared text non-destructively", async () => {
@@ -251,6 +252,63 @@ describe("Composer", () => {
       "true",
     );
     expect(screen.queryByRole("status", { name: "Queue reconciliation" })).not.toBeInTheDocument();
+  });
+
+  it("debounces an inactive session's restored queue into its text-only backup", async () => {
+    vi.useFakeTimers();
+    const clear = deferred();
+    const sessionId = "clear/session-a";
+    const storageKey = "agent-harness:draft:clear%2Fsession-a";
+    const backup = storage({
+      [storageKey]: JSON.stringify({ text: "" }),
+    });
+    const memory = new Map<string, string>();
+    const onEvent = (event: ClientEvent) =>
+      event.type === "clear_queued_message" ? clear.promise : undefined;
+    const { rerender, unmount } = renderComposer({
+      sessionId,
+      running: true,
+      queued: { type: "queue_message", text: "restored while inactive", mode: "plan" },
+      onEvent,
+      draftMemory: memory,
+      draftStorage: backup.target,
+      backupDelayMs: 250,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit queued follow-up" }));
+    rerender(
+      <Composer
+        sessionId="session-b"
+        running={false}
+        stopping={false}
+        queued={null}
+        onEvent={onEvent}
+        onStop={() => {}}
+        draftMemory={memory}
+        draftStorage={backup.target}
+        backupDelayMs={250}
+      />,
+    );
+    await act(async () => {
+      clear.resolve();
+      await clear.promise;
+    });
+
+    expect(backup.values.get(storageKey)).toBe(JSON.stringify({ text: "" }));
+    act(() => vi.advanceTimersByTime(249));
+    expect(backup.values.get(storageKey)).toBe(JSON.stringify({ text: "" }));
+    act(() => vi.advanceTimersByTime(1));
+    unmount();
+
+    renderComposer({
+      sessionId,
+      draftStorage: backup.target,
+      backupDelayMs: 250,
+      draftMemory: new Map(),
+    });
+    expect(screen.getByRole("textbox", { name: "Message" })).toHaveValue(
+      "restored while inactive",
+    );
   });
 
   it("keeps a rejected queue clear retryable without changing the draft", async () => {
@@ -696,6 +754,57 @@ describe("Composer", () => {
     expect(textbox).toHaveValue("");
   });
 
+  it("debounces an inactive session's successful delivery into its text-only backup", async () => {
+    vi.useFakeTimers();
+    const delivery = deferred();
+    const sessionId = "delivery/session-a";
+    const storageKey = "agent-harness:draft:delivery%2Fsession-a";
+    const backup = storage({
+      [storageKey]: JSON.stringify({ text: "already sent" }),
+    });
+    const memory = new Map<string, string>();
+    const { rerender, unmount } = renderComposer({
+      sessionId,
+      onEvent: () => delivery.promise,
+      draftMemory: memory,
+      draftStorage: backup.target,
+      backupDelayMs: 250,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    rerender(
+      <Composer
+        sessionId="session-b"
+        running={false}
+        stopping={false}
+        queued={null}
+        onEvent={() => delivery.promise}
+        onStop={() => {}}
+        draftMemory={memory}
+        draftStorage={backup.target}
+        backupDelayMs={250}
+      />,
+    );
+    await act(async () => {
+      delivery.resolve();
+      await delivery.promise;
+    });
+
+    expect(backup.values.get(storageKey)).toBe(JSON.stringify({ text: "already sent" }));
+    act(() => vi.advanceTimersByTime(249));
+    expect(backup.values.get(storageKey)).toBe(JSON.stringify({ text: "already sent" }));
+    act(() => vi.advanceTimersByTime(1));
+    unmount();
+
+    renderComposer({
+      sessionId,
+      draftStorage: backup.target,
+      backupDelayMs: 250,
+      draftMemory: new Map(),
+    });
+    expect(screen.getByRole("textbox", { name: "Message" })).toHaveValue("");
+  });
+
   it("ignores prior-session rejection while the current session is pending", async () => {
     const first = deferred();
     const second = deferred();
@@ -833,6 +942,28 @@ describe("Composer", () => {
     expect(screen.getByRole("status", { name: "Turn status" })).toHaveTextContent(
       "Stopping after current action",
     );
+  });
+
+  it("ignores an older Stop rejection after a later attempt succeeds", async () => {
+    const first = deferred();
+    let attempt = 0;
+    renderComposer({
+      running: true,
+      onStop: () => {
+        attempt += 1;
+        return attempt === 1 ? first.promise : undefined;
+      },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Stop turn" }));
+    fireEvent.click(screen.getByRole("button", { name: "Stop turn" }));
+    await act(async () => {
+      first.reject(new Error("older failure"));
+      await first.promise.catch(() => {});
+    });
+
+    expect(attempt).toBe(2);
+    expect(screen.getByRole("status", { name: "Turn status" })).toBeEmptyDOMElement();
   });
 
   it("isolates drafts by stable session id and restores each one when switching", async () => {

@@ -545,4 +545,139 @@ describe("App", () => {
     });
     expect(deliveryAttempts).toBe(2);
   });
+
+  it("keeps a deferred Stop failure with session A while session B is active", async () => {
+    const user = userEvent.setup();
+    const stop = deferred();
+    let stopAttempts = 0;
+    const sessionA = session({
+      session_id: "stop-failure-a",
+      title: "Stop failure A",
+      workspace: "/work/stop-failure-a",
+    });
+    const sessionB = session({
+      session_id: "stop-failure-b",
+      title: "Stop failure B",
+      workspace: "/work/stop-failure-b",
+    });
+    const onStopSession = vi.fn((sessionId: string) => {
+      if (sessionId !== sessionA.session_id) return;
+      stopAttempts += 1;
+      return stopAttempts === 1 ? stop.promise : undefined;
+    });
+    render(
+      <App
+        client={clientWithSessions([sessionA, sessionB])}
+        sidebarStorage={storage}
+        draftStorage={storage}
+        transcriptBySession={{
+          [sessionA.session_id]: { ...emptyTranscript(), running: true },
+          [sessionB.session_id]: { ...emptyTranscript(), running: true },
+        }}
+        onStopSession={onStopSession}
+      />,
+    );
+
+    await screen.findByRole("textbox", { name: "Message" });
+    await user.click(screen.getByRole("button", { name: "Stop turn" }));
+    await selectSession(user, sessionB.title);
+    await act(async () => {
+      stop.reject(new Error("offline"));
+      await stop.promise.catch(() => {});
+    });
+
+    expect(screen.getByRole("status", { name: "Turn status" })).toBeEmptyDOMElement();
+    await selectSession(user, sessionA.title);
+    expect(screen.getByRole("status", { name: "Turn status" })).toHaveTextContent(
+      "Stop request failed",
+    );
+    await user.click(screen.getByRole("button", { name: "Stop turn" }));
+    expect(onStopSession).toHaveBeenLastCalledWith(sessionA.session_id);
+    expect(stopAttempts).toBe(2);
+    expect(screen.getByRole("status", { name: "Turn status" })).toBeEmptyDOMElement();
+  });
+
+  it("keeps sidebar focus when switching from running session A to idle session B", async () => {
+    const user = userEvent.setup();
+    const sessionA = session({
+      session_id: "running-focus-a",
+      title: "Running focus A",
+      workspace: "/work/running-focus-a",
+    });
+    const sessionB = session({
+      session_id: "running-focus-b",
+      title: "Running focus B",
+      workspace: "/work/running-focus-b",
+    });
+    render(
+      <App
+        client={clientWithSessions([sessionA, sessionB])}
+        sidebarStorage={storage}
+        draftStorage={storage}
+        transcriptBySession={{
+          [sessionA.session_id]: { ...emptyTranscript(), running: true },
+          [sessionB.session_id]: emptyTranscript(),
+        }}
+      />,
+    );
+
+    await screen.findByRole("textbox", { name: "Message" });
+    await selectSession(user, sessionB.title);
+
+    expect(screen.getByRole("button", { name: /^Running focus B,/i })).toHaveFocus();
+    expect(screen.getByRole("textbox", { name: "Message" })).not.toHaveFocus();
+  });
+
+  it("keeps sidebar focus when session A's clear succeeds after switching to session B", async () => {
+    const user = userEvent.setup();
+    const clear = deferred();
+    const sessionA = session({
+      session_id: "clear-focus-a",
+      title: "Clear focus A",
+      workspace: "/work/clear-focus-a",
+    });
+    const sessionB = session({
+      session_id: "clear-focus-b",
+      title: "Clear focus B",
+      workspace: "/work/clear-focus-b",
+    });
+    const initialTranscripts = {
+      [sessionA.session_id]: {
+        ...emptyTranscript(),
+        running: true,
+        queued: { type: "queue_message" as const, text: "focus-safe queue", mode: "base" as const },
+      },
+      [sessionB.session_id]: { ...emptyTranscript(), running: true },
+    };
+    const appProps = {
+      client: clientWithSessions([sessionA, sessionB]),
+      sidebarStorage: storage,
+      draftStorage: storage,
+      onSessionEvent: (sessionId: string, event: ClientEvent) =>
+        sessionId === sessionA.session_id && event.type === "clear_queued_message"
+          ? clear.promise
+          : undefined,
+    };
+    const { rerender } = render(<App {...appProps} transcriptBySession={initialTranscripts} />);
+
+    await screen.findByRole("textbox", { name: "Message" });
+    await user.click(screen.getByRole("button", { name: "Edit queued follow-up" }));
+    await selectSession(user, sessionB.title);
+    rerender(
+      <App
+        {...appProps}
+        transcriptBySession={{
+          ...initialTranscripts,
+          [sessionA.session_id]: { ...initialTranscripts[sessionA.session_id], queued: null },
+        }}
+      />,
+    );
+    await act(async () => {
+      clear.resolve();
+      await clear.promise;
+    });
+
+    expect(screen.getByRole("button", { name: /^Clear focus B,/i })).toHaveFocus();
+    expect(screen.getByRole("textbox", { name: "Message" })).not.toHaveFocus();
+  });
 });

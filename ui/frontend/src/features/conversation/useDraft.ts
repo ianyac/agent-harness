@@ -56,11 +56,28 @@ export function useDraft(sessionId: string, options: UseDraftOptions = {}) {
     sessionId,
     text: restoredText(sessionId, memory, storage),
   }));
+  const backupTimers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
   const currentText = state.sessionId === sessionId
     ? state.text
     : restoredText(sessionId, memory, storage);
   const sessionRef = useRef(sessionId);
   sessionRef.current = sessionId;
+
+  const scheduleBackup = useCallback((targetSessionId: string, text: string) => {
+    if (storage === undefined) return;
+    const existing = backupTimers.current.get(targetSessionId);
+    if (existing !== undefined) clearTimeout(existing);
+    const timer = setTimeout(() => {
+      if (backupTimers.current.get(targetSessionId) !== timer) return;
+      backupTimers.current.delete(targetSessionId);
+      try {
+        storage.setItem(storageKey(targetSessionId), JSON.stringify({ text }));
+      } catch {
+        // Drafts remain available in memory when preference storage is unavailable.
+      }
+    }, backupDelayMs);
+    backupTimers.current.set(targetSessionId, timer);
+  }, [backupDelayMs, storage]);
 
   useEffect(() => {
     if (state.sessionId !== sessionId) {
@@ -68,29 +85,19 @@ export function useDraft(sessionId: string, options: UseDraftOptions = {}) {
     }
   }, [currentText, sessionId, state.sessionId]);
 
-  useEffect(() => {
-    if (storage === undefined) return;
-    const timer = setTimeout(() => {
-      try {
-        storage.setItem(storageKey(sessionId), JSON.stringify({ text: currentText }));
-      } catch {
-        // Drafts remain available in memory when preference storage is unavailable.
-      }
-    }, backupDelayMs);
-    return () => clearTimeout(timer);
-  }, [backupDelayMs, currentText, sessionId, storage]);
+  useEffect(() => () => {
+    for (const timer of backupTimers.current.values()) clearTimeout(timer);
+    backupTimers.current.clear();
+  }, [backupDelayMs, storage]);
 
   const setText = useCallback((next: string | ((current: string) => string)) => {
     const targetSessionId = sessionRef.current;
-    setState((current) => {
-      const visible = current.sessionId === targetSessionId
-        ? current.text
-        : restoredText(targetSessionId, memory, storage);
-      const text = typeof next === "function" ? next(visible) : next;
-      memory.set(targetSessionId, text);
-      return { sessionId: targetSessionId, text };
-    });
-  }, [memory, storage]);
+    const visible = restoredText(targetSessionId, memory, storage);
+    const text = typeof next === "function" ? next(visible) : next;
+    memory.set(targetSessionId, text);
+    scheduleBackup(targetSessionId, text);
+    setState({ sessionId: targetSessionId, text });
+  }, [memory, scheduleBackup, storage]);
 
   const setSessionText = useCallback((targetSessionId: string, next: string | ((current: string) => string)) => {
     if (targetSessionId === sessionRef.current) {
@@ -100,7 +107,8 @@ export function useDraft(sessionId: string, options: UseDraftOptions = {}) {
     const visible = restoredText(targetSessionId, memory, storage);
     const text = typeof next === "function" ? next(visible) : next;
     memory.set(targetSessionId, text);
-  }, [memory, setText, storage]);
+    scheduleBackup(targetSessionId, text);
+  }, [memory, scheduleBackup, setText, storage]);
 
   return [currentText, setText, setSessionText] as const;
 }

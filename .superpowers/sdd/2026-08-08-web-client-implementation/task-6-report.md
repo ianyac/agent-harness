@@ -465,3 +465,141 @@ git diff --check
 
 Result: PASS with no whitespace errors. The scope audit contains only the Task
 6 report and App/Composer/useDraft production and test files listed above.
+
+## Fix round 3/5 — Remaining stable-owner lifecycle state
+
+### Re-review scope and root causes
+
+This round resolves only the Important stable-Composer lifecycle findings in
+`task-6-rereview-round2.md` plus the requested clear-focus architecture audit.
+The deferred Minors and Task 7 remain unchanged.
+
+- `useDraft` previously backed up only the active session through an effect;
+  targeted inactive writes stopped at the in-memory map.
+- Stop failure used one boolean, so an A rejection could appear in B, and an
+  older rejection could overwrite a later successful attempt.
+- Running history used one boolean without session identity, making running A
+  to idle B look like an in-place turn completion.
+- Delayed clear success compared the async render closure's old `sessionId`,
+  which still equaled A after B became active and therefore focused B's current
+  textarea ref.
+
+### RED and slice-level GREEN evidence
+
+Inactive-session persistence:
+
+```text
+cd ui/frontend
+npm test -- --run src/features/conversation/Composer.test.tsx -t "inactive session's" --reporter=dot
+```
+
+RED: 2 failed, 30 skipped. After inactive A delivery success, a fresh-memory
+remount restored the stale sent text; after inactive A clear success, it
+restored empty text instead of the returned queued follow-up.
+
+```text
+npm test -- --run src/features/conversation/Composer.test.tsx -t "inactive session's|debounces a text-only backup" --reporter=dot
+```
+
+GREEN: 3 passed, 29 skipped, including the pre-existing active backup case.
+
+Stop authority:
+
+```text
+npm test -- --run src/App.test.tsx src/features/conversation/Composer.test.tsx -t "Stop failure|older Stop" --reporter=dot
+```
+
+RED: 2 failed, 41 skipped. B announced A's deferred rejection, and an older
+rejection overwrote the result of a later successful Stop attempt.
+
+```text
+npm test -- --run src/App.test.tsx src/features/conversation/Composer.test.tsx -t "Stop failure|older Stop|square Stop" --reporter=dot
+```
+
+GREEN: 3 passed, 40 skipped, including the existing Stop/stopping behavior.
+
+Running-transition focus:
+
+```text
+npm test -- --run src/App.test.tsx -t "switching from running session A" --reporter=dot
+```
+
+RED: 1 failed, 10 skipped. Selecting idle B moved focus from B's sidebar
+button to B's textarea because the global history reported a false completion.
+
+```text
+npm test -- --run src/App.test.tsx src/features/conversation/Composer.test.tsx -t "switching from running session A|running turn completes" --reporter=dot
+```
+
+GREEN: 2 passed, 42 skipped. The real App switch retains sidebar focus while
+an in-place running-to-idle transition still focuses the active textarea.
+
+Clear-success focus:
+
+```text
+npm test -- --run src/App.test.tsx src/features/conversation/Composer.test.tsx -t "clear succeeds after switching|returns its text" --reporter=dot
+```
+
+RED: 1 failed, 1 passed, 43 skipped. Delayed A clear success focused B's
+textarea; the active-A clear characterization already passed.
+
+After the current-active identity fix, the same command passed 2 tests with 43
+skipped. Active A retains its intended focus behavior, while inactive A cannot
+move focus in B.
+
+### Implementation
+
+- `useDraft` owns a map of backup timers keyed by stable session id. Active and
+  targeted setters update that session's memory and schedule the same debounced
+  writer. A new write replaces only that session's timer; switching sessions
+  leaves other pending timers intact. Timers write the encoded storage key and
+  exact JSON `{text}` payload under storage-error tolerance, remove themselves
+  only while current, and all timers are cleared on hook cleanup or backup
+  configuration replacement.
+- Stop attempts have monotonic operation ids and current-operation identity per
+  session. Only the latest completion may change that session's error Set, and
+  the live region derives its message from the active session's entry.
+- Running history is keyed per session and paired with previous-active session
+  identity. Focus requires a true-to-false transition observed without an
+  intervening active-session switch.
+- Delayed clear success reads a mutable current-active-session ref after the
+  await and focuses only when that identity still matches the originating
+  operation.
+
+### Final GREEN verification
+
+```text
+cd ui/frontend
+npm test -- --run src/features/conversation/Composer.test.tsx src/App.test.tsx src/features/conversation/ConversationSearch.test.tsx --reporter=dot
+```
+
+Result: 3 files passed, 52 tests passed, 0 failed (Composer 33, App 12,
+ConversationSearch 7).
+
+```text
+npm test -- --run --reporter=dot
+```
+
+Result: 13 files passed, 163 tests passed, 0 failed.
+
+```text
+npm run typecheck
+```
+
+Result: PASS (`tsc -b --pretty false`).
+
+```text
+npm run build
+```
+
+Result: PASS; Vite transformed 1,930 modules and built in 1.01 seconds. The
+main chunk is 335.28 kB (107.16 kB gzip), the markdown chunk is 165.72 kB
+(50.46 kB gzip), and the build emitted no warnings.
+
+```text
+git diff --check
+```
+
+Result: PASS with no whitespace errors. The pre-report scope audit contained
+only App/Composer tests and Composer/useDraft product files; this report is the
+only documentation file added to the round's diff.

@@ -245,10 +245,12 @@ describe("Composer", () => {
         draftStorage={draftBackup}
       />,
     );
-    expect(textbox).toHaveValue("");
-    expect(screen.getByRole("status", { name: "Queue reconciliation" })).toHaveTextContent(
-      "session one queue",
+    expect(textbox).toHaveValue("session one queue");
+    expect(screen.getByRole("button", { name: "Plan mode" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
     );
+    expect(screen.queryByRole("status", { name: "Queue reconciliation" })).not.toBeInTheDocument();
   });
 
   it("keeps a rejected queue clear retryable without changing the draft", async () => {
@@ -287,6 +289,149 @@ describe("Composer", () => {
       "aria-pressed",
       "true",
     );
+  });
+
+  it.each([
+    {
+      changedField: "text",
+      replacement: {
+        type: "queue_message" as const,
+        text: "replacement queue B",
+        mode: "plan" as const,
+      },
+      visibleReplacement: "replacement queue B",
+    },
+    {
+      changedField: "mode",
+      replacement: {
+        type: "queue_message" as const,
+        text: "original queue A",
+        mode: "base" as const,
+      },
+      visibleReplacement: "Queued · Base",
+    },
+    {
+      changedField: "presence",
+      replacement: null,
+      visibleReplacement: null,
+    },
+  ])("does not retry a failed clear when controlled queue $changedField changes", async ({
+    replacement,
+    visibleReplacement,
+  }) => {
+    const user = userEvent.setup();
+    const first = deferred();
+    const queueA: QueuedMessage = {
+      type: "queue_message",
+      text: "original queue A",
+      mode: "plan",
+    };
+    const onEvent = vi.fn((event: ClientEvent) =>
+      event.type === "clear_queued_message" ? first.promise : undefined);
+    const draftMemory = new Map<string, string>();
+    const draftStorage = storage().target;
+    const { rerender } = renderComposer({
+      running: true,
+      queued: queueA,
+      onEvent,
+      draftMemory,
+      draftStorage,
+    });
+
+    await user.click(screen.getByRole("button", { name: "Edit queued follow-up" }));
+    await act(async () => {
+      first.reject(new Error("offline"));
+      await first.promise.catch(() => {});
+    });
+    rerender(
+      <Composer
+        sessionId="session-a"
+        running
+        stopping={false}
+        queued={replacement}
+        onEvent={onEvent}
+        onStop={() => {}}
+        draftMemory={draftMemory}
+        draftStorage={draftStorage}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "Retry clearing follow-up" }));
+
+    expect(onEvent).toHaveBeenCalledTimes(1);
+    if (visibleReplacement === null) {
+      expect(screen.queryByRole("status", { name: "Queued follow-up" })).not.toBeInTheDocument();
+    } else {
+      expect(screen.getByRole("status", { name: "Queued follow-up" })).toHaveTextContent(
+        visibleReplacement,
+      );
+    }
+    const reconciliation = screen.getByRole("status", { name: "Queue reconciliation" });
+    expect(reconciliation).toHaveTextContent("original queue A");
+    expect(screen.getByRole("button", { name: "Append cleared follow-up" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Dismiss cleared follow-up" })).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Dismiss cleared follow-up" }));
+    expect(screen.queryByRole("status", { name: "Queue reconciliation" })).not.toBeInTheDocument();
+    if (visibleReplacement === null) {
+      expect(screen.queryByRole("status", { name: "Queued follow-up" })).not.toBeInTheDocument();
+    } else {
+      expect(screen.getByRole("status", { name: "Queued follow-up" })).toHaveTextContent(
+        visibleReplacement,
+      );
+    }
+  });
+
+  it("retries a failed clear exactly once when the controlled queue still matches", async () => {
+    const user = userEvent.setup();
+    const first = deferred();
+    const second = deferred();
+    const queued: QueuedMessage = {
+      type: "queue_message",
+      text: "matching queue A",
+      mode: "plan",
+    };
+    let attempt = 0;
+    const onEvent = vi.fn((event: ClientEvent) => {
+      if (event.type !== "clear_queued_message") return;
+      attempt += 1;
+      return attempt === 1 ? first.promise : second.promise;
+    });
+    const draftMemory = new Map<string, string>();
+    const draftStorage = storage().target;
+    const { rerender } = renderComposer({
+      running: true,
+      queued,
+      onEvent,
+      draftMemory,
+      draftStorage,
+    });
+
+    await user.click(screen.getByRole("button", { name: "Edit queued follow-up" }));
+    await act(async () => {
+      first.reject(new Error("offline"));
+      await first.promise.catch(() => {});
+    });
+    rerender(
+      <Composer
+        sessionId="session-a"
+        running
+        stopping={false}
+        queued={{ ...queued }}
+        onEvent={onEvent}
+        onStop={() => {}}
+        draftMemory={draftMemory}
+        draftStorage={draftStorage}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: "Retry clearing follow-up" }));
+
+    expect(onEvent).toHaveBeenCalledTimes(2);
+    expect(onEvent).toHaveBeenLastCalledWith({ type: "clear_queued_message" });
+    await act(async () => {
+      second.resolve();
+      await second.promise;
+    });
+    expect(screen.getByRole("textbox", { name: "Message" })).toHaveValue("matching queue A");
   });
 
   it("does not submit blank input", async () => {

@@ -350,3 +350,118 @@ git diff --check
 ```
 
 Result: PASS with no whitespace errors.
+
+## Fix round 2/5 — App-boundary authority and queue replacement
+
+### Re-review scope
+
+This round addresses the real `App` session-switch boundary: deferred queue
+clears and deliveries must retain their originating session authority while
+the sidebar selects another session. It also closes the failed-clear retry
+case where the controlled queued slot has since changed or disappeared. The
+closed IME, contrast, config-split, and deferred minor findings were not
+changed.
+
+### RED evidence
+
+The new tests exercise two sessions through the real `App`, `useSessions`,
+sidebar, and `Composer`, with deferred operations settled while session B is
+active:
+
+```text
+cd ui/frontend
+npm test -- --run src/App.test.tsx -t "session A|queue clear" --reporter=dot
+```
+
+Before the App-boundary fix: 5 failed, 1 passed, 3 skipped. Queue-clear
+success/reconciliation/rejection and delivery success/rejection state were
+lost on the keyed Composer remount. A same-text A re-edit also lost its stale
+delivery protection across A/B/A/B selection.
+
+After correcting the test interaction and completing the implementation, the
+same suite was mutation-checked by temporarily restoring the old keyed
+Composer remount. It again produced 5 failures, 1 pass, and 3 skips, including
+the delivery-rejection status case. This demonstrates that the App-boundary
+assertions depend on the production authority lifetime rather than passing
+through a false-positive interaction.
+
+Failed-clear replacement RED:
+
+```text
+cd ui/frontend
+npm test -- --run src/features/conversation/Composer.test.tsx -t "failed clear when controlled queue|retries a failed clear exactly once" --reporter=dot
+```
+
+Before the replacement guard: 1 failed, 1 passed, 26 skipped. Retry dispatched
+a second unqualified clear even though the controlled queue no longer matched
+the failed operation.
+
+A text-only guard was then mutation-checked against the expanded text/mode/null
+table. The mode-only case failed (1 failed, 2 passed, 27 skipped), proving the
+comparison must include both exact text and exact mode and must reject a null
+queue.
+
+### Implementation
+
+- `App` now keeps one Composer instance across sidebar selection and owns a
+  stable per-session draft-memory map. Component-local async operation state is
+  no longer destroyed by a session-key remount.
+- Composer edit authority, mode, pending operations, delivery errors, and queue
+  reconciliations are retained per session. Deferred completion always looks
+  up and updates the operation's originating session; session B is isolated
+  even when it contains identical text.
+- `useDraft` captures the target session before a state update and exposes a
+  targeted session setter, preventing a completion from being retargeted by a
+  concurrent prop switch.
+- A failed-clear retry dispatches exactly once only while the current
+  controlled queue is non-null and exactly matches the captured text and mode.
+  If it changed or disappeared, retry is non-destructive: it does not dispatch,
+  preserves the replacement, and converts the original text into an explicit
+  Append/Dismiss reconciliation.
+
+### Final GREEN verification
+
+```text
+cd ui/frontend
+npm test -- --run src/App.test.tsx -t "session A|queue clear" --reporter=dot
+```
+
+Result: 1 file passed, 6 tests passed, 3 skipped, 0 failed.
+
+```text
+cd ui/frontend
+npm test -- --run src/features/conversation/Composer.test.tsx src/App.test.tsx src/features/conversation/ConversationSearch.test.tsx --reporter=dot
+```
+
+Result: 3 files passed, 46 tests passed, 0 failed (Composer 30, App 9,
+ConversationSearch 7).
+
+```text
+cd ui/frontend
+npm test -- --run --reporter=dot
+```
+
+Result: 13 files passed, 157 tests passed, 0 failed.
+
+```text
+cd ui/frontend
+npm run typecheck
+```
+
+Result: PASS (`tsc -b --pretty false`).
+
+```text
+cd ui/frontend
+npm run build
+```
+
+Result: PASS; Vite transformed 1,930 modules and built in 1.01 seconds. The
+main chunk is 334.56 kB (106.96 kB gzip), the markdown chunk is 165.72 kB
+(50.46 kB gzip), and the build emitted no warnings.
+
+```text
+git diff --check
+```
+
+Result: PASS with no whitespace errors. The scope audit contains only the Task
+6 report and App/Composer/useDraft production and test files listed above.

@@ -6,6 +6,7 @@ import { App } from "./App";
 import { ApiClient } from "./api/http";
 import type { SessionRecord } from "./features/sessions/useSessions";
 import { emptyTranscript } from "./protocol/reducer";
+import type { ClientEvent } from "./protocol/types";
 
 const connection = {
   baseUrl: "http://127.0.0.1:4010",
@@ -32,16 +33,46 @@ function session(changes: Partial<SessionRecord> = {}): SessionRecord {
   };
 }
 
-function deferred<T>() {
-  let resolve!: (value: T) => void;
-  const promise = new Promise<T>((accept) => {
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((accept, decline) => {
     resolve = accept;
+    reject = decline;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 }
 
 function clientWith(fetchRequest: typeof fetch) {
   return new ApiClient(connection, fetchRequest);
+}
+
+function clientWithSessions(records: readonly SessionRecord[]) {
+  const fetchRequest: typeof fetch = async (input, init) => {
+    const url = new URL(input instanceof Request ? input.url : input.toString());
+    if (url.pathname === "/api/config") {
+      return Response.json({
+        base_workspace: "/work/default",
+        default_mode: "default",
+        default_context_mode: "compaction",
+        modes: ["default", "acceptAll", "readOnly"],
+        context_modes: ["compaction", "folding"],
+      });
+    }
+    if (url.pathname === "/api/sessions" && init?.method === "GET") {
+      return Response.json(records);
+    }
+    return new Response(null, { status: 404 });
+  };
+  return clientWith(fetchRequest);
+}
+
+async function selectSession(user: ReturnType<typeof userEvent.setup>, title: string) {
+  await user.click(await screen.findByRole("button", { name: new RegExp(`^${title},`, "i") }));
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: new RegExp(`^${title},`, "i") }))
+      .toHaveAttribute("aria-current", "page"),
+  );
 }
 
 afterEach(cleanup);
@@ -180,5 +211,338 @@ describe("App", () => {
     await waitFor(() =>
       expect(screen.queryByRole("searchbox", { name: "Search conversation" })).not.toBeInTheDocument(),
     );
+  });
+
+  it("restores an authoritative queue clear only to session A after it resolves while B is active", async () => {
+    const user = userEvent.setup();
+    const clear = deferred();
+    const sessionA = session({
+      session_id: "clear-success-a",
+      title: "Clear success A",
+      workspace: "/work/clear-success-a",
+    });
+    const sessionB = session({
+      session_id: "clear-success-b",
+      title: "Clear success B",
+      workspace: "/work/clear-success-b",
+    });
+    const client = clientWithSessions([sessionA, sessionB]);
+    const onSessionEvent = vi.fn((sessionId: string, event: ClientEvent) =>
+      sessionId === sessionA.session_id && event.type === "clear_queued_message"
+        ? clear.promise
+        : undefined);
+    const initialTranscripts = {
+      [sessionA.session_id]: {
+        ...emptyTranscript(),
+        running: true,
+        queued: { type: "queue_message" as const, text: "restore A queue", mode: "plan" as const },
+      },
+      [sessionB.session_id]: emptyTranscript(),
+    };
+    const appProps = {
+      client,
+      sidebarStorage: storage,
+      draftStorage: storage,
+      onSessionEvent,
+    };
+    const { rerender } = render(<App {...appProps} transcriptBySession={initialTranscripts} />);
+
+    await screen.findByRole("textbox", { name: "Message" });
+    await user.click(screen.getByRole("button", { name: "Edit queued follow-up" }));
+    await selectSession(user, sessionB.title);
+    const textbox = screen.getByRole("textbox", { name: "Message" });
+    await user.type(textbox, "B remains editable");
+    rerender(
+      <App
+        {...appProps}
+        transcriptBySession={{
+          ...initialTranscripts,
+          [sessionA.session_id]: { ...initialTranscripts[sessionA.session_id], queued: null },
+        }}
+      />,
+    );
+    await act(async () => {
+      clear.resolve();
+      await clear.promise;
+    });
+
+    expect(textbox).toHaveValue("B remains editable");
+    expect(screen.queryByRole("status", { name: "Queue reconciliation" })).not.toBeInTheDocument();
+    await selectSession(user, sessionA.title);
+    expect(screen.getByRole("textbox", { name: "Message" })).toHaveValue("restore A queue");
+    expect(screen.getByRole("button", { name: "Plan mode" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+  });
+
+  it("keeps a stale queue-clear reconciliation with session A across an App switch", async () => {
+    const user = userEvent.setup();
+    const clear = deferred();
+    const sessionA = session({
+      session_id: "clear-stale-a",
+      title: "Clear stale A",
+      workspace: "/work/clear-stale-a",
+    });
+    const sessionB = session({
+      session_id: "clear-stale-b",
+      title: "Clear stale B",
+      workspace: "/work/clear-stale-b",
+    });
+    const client = clientWithSessions([sessionA, sessionB]);
+    const onSessionEvent = vi.fn((sessionId: string, event: ClientEvent) =>
+      sessionId === sessionA.session_id && event.type === "clear_queued_message"
+        ? clear.promise
+        : undefined);
+    const initialTranscripts = {
+      [sessionA.session_id]: {
+        ...emptyTranscript(),
+        running: true,
+        queued: { type: "queue_message" as const, text: "stale A queue", mode: "plan" as const },
+      },
+      [sessionB.session_id]: emptyTranscript(),
+    };
+    const appProps = {
+      client,
+      sidebarStorage: storage,
+      draftStorage: storage,
+      onSessionEvent,
+    };
+    const { rerender } = render(<App {...appProps} transcriptBySession={initialTranscripts} />);
+
+    const textbox = await screen.findByRole("textbox", { name: "Message" });
+    await user.click(screen.getByRole("button", { name: "Edit queued follow-up" }));
+    await user.type(textbox, "new A draft");
+    await selectSession(user, sessionB.title);
+    await user.type(screen.getByRole("textbox", { name: "Message" }), "B draft");
+    rerender(
+      <App
+        {...appProps}
+        transcriptBySession={{
+          ...initialTranscripts,
+          [sessionA.session_id]: { ...initialTranscripts[sessionA.session_id], queued: null },
+        }}
+      />,
+    );
+    await act(async () => {
+      clear.resolve();
+      await clear.promise;
+    });
+
+    expect(screen.getByRole("textbox", { name: "Message" })).toHaveValue("B draft");
+    expect(screen.queryByRole("status", { name: "Queue reconciliation" })).not.toBeInTheDocument();
+    await selectSession(user, sessionA.title);
+    expect(screen.getByRole("textbox", { name: "Message" })).toHaveValue("new A draft");
+    expect(screen.getByRole("status", { name: "Queue reconciliation" })).toHaveTextContent(
+      "stale A queue",
+    );
+  });
+
+  it("returns a rejected queue clear and its retry only to session A", async () => {
+    const user = userEvent.setup();
+    const clear = deferred();
+    let clearAttempts = 0;
+    const sessionA = session({
+      session_id: "clear-failure-a",
+      title: "Clear failure A",
+      workspace: "/work/clear-failure-a",
+    });
+    const sessionB = session({
+      session_id: "clear-failure-b",
+      title: "Clear failure B",
+      workspace: "/work/clear-failure-b",
+    });
+    const onSessionEvent = vi.fn((sessionId: string, event: ClientEvent) => {
+      if (sessionId !== sessionA.session_id || event.type !== "clear_queued_message") return;
+      clearAttempts += 1;
+      return clearAttempts === 1 ? clear.promise : undefined;
+    });
+    render(
+      <App
+        client={clientWithSessions([sessionA, sessionB])}
+        sidebarStorage={storage}
+        draftStorage={storage}
+        transcriptBySession={{
+          [sessionA.session_id]: {
+            ...emptyTranscript(),
+            running: true,
+            queued: { type: "queue_message", text: "retry A queue", mode: "base" },
+          },
+          [sessionB.session_id]: emptyTranscript(),
+        }}
+        onSessionEvent={onSessionEvent}
+      />,
+    );
+
+    await screen.findByRole("textbox", { name: "Message" });
+    await user.click(screen.getByRole("button", { name: "Edit queued follow-up" }));
+    await selectSession(user, sessionB.title);
+    await user.type(screen.getByRole("textbox", { name: "Message" }), "B survives failure");
+    await act(async () => {
+      clear.reject(new Error("offline"));
+      await clear.promise.catch(() => {});
+    });
+
+    expect(screen.getByRole("textbox", { name: "Message" })).toHaveValue("B survives failure");
+    expect(screen.queryByRole("status", { name: "Queue reconciliation" })).not.toBeInTheDocument();
+    await selectSession(user, sessionA.title);
+    expect(screen.getByRole("status", { name: "Queue reconciliation" })).toHaveTextContent(
+      "Queued follow-up was not cleared",
+    );
+    await user.click(screen.getByRole("button", { name: "Retry clearing follow-up" }));
+    expect(onSessionEvent).toHaveBeenLastCalledWith(sessionA.session_id, {
+      type: "clear_queued_message",
+    });
+    expect(clearAttempts).toBe(2);
+  });
+
+  it("clears only session A's authoritative draft when delivery succeeds while B is active", async () => {
+    const user = userEvent.setup();
+    const delivery = deferred();
+    const sessionA = session({
+      session_id: "delivery-success-a",
+      title: "Delivery success A",
+      workspace: "/work/delivery-success-a",
+    });
+    const sessionB = session({
+      session_id: "delivery-success-b",
+      title: "Delivery success B",
+      workspace: "/work/delivery-success-b",
+    });
+    const onSessionEvent = vi.fn((sessionId: string) =>
+      sessionId === sessionA.session_id ? delivery.promise : undefined);
+    render(
+      <App
+        client={clientWithSessions([sessionA, sessionB])}
+        sidebarStorage={storage}
+        draftStorage={storage}
+        transcriptBySession={{
+          [sessionA.session_id]: emptyTranscript(),
+          [sessionB.session_id]: emptyTranscript(),
+        }}
+        onSessionEvent={onSessionEvent}
+      />,
+    );
+
+    const textbox = await screen.findByRole("textbox", { name: "Message" });
+    await user.type(textbox, "same draft");
+    await user.keyboard("{Meta>}{Enter}{/Meta}");
+    await selectSession(user, sessionB.title);
+    await user.type(screen.getByRole("textbox", { name: "Message" }), "same draft");
+    await act(async () => {
+      delivery.resolve();
+      await delivery.promise;
+    });
+
+    expect(screen.getByRole("textbox", { name: "Message" })).toHaveValue("same draft");
+    expect(screen.queryByRole("status", { name: "Message status" })).not.toBeInTheDocument();
+    await selectSession(user, sessionA.title);
+    expect(screen.getByRole("textbox", { name: "Message" })).toHaveValue("");
+  });
+
+  it("preserves session A's same-text re-edit when its older delivery resolves across App switches", async () => {
+    const user = userEvent.setup();
+    const delivery = deferred();
+    const sessionA = session({
+      session_id: "delivery-stale-a",
+      title: "Delivery stale A",
+      workspace: "/work/delivery-stale-a",
+    });
+    const sessionB = session({
+      session_id: "delivery-stale-b",
+      title: "Delivery stale B",
+      workspace: "/work/delivery-stale-b",
+    });
+    render(
+      <App
+        client={clientWithSessions([sessionA, sessionB])}
+        sidebarStorage={storage}
+        draftStorage={storage}
+        transcriptBySession={{
+          [sessionA.session_id]: emptyTranscript(),
+          [sessionB.session_id]: emptyTranscript(),
+        }}
+        onSessionEvent={(sessionId) =>
+          sessionId === sessionA.session_id ? delivery.promise : undefined}
+      />,
+    );
+
+    const textbox = await screen.findByRole("textbox", { name: "Message" });
+    await user.type(textbox, "same A text");
+    await user.keyboard("{Meta>}{Enter}{/Meta}");
+    await selectSession(user, sessionB.title);
+    await user.type(screen.getByRole("textbox", { name: "Message" }), "B draft");
+    await selectSession(user, sessionA.title);
+    await user.clear(screen.getByRole("textbox", { name: "Message" }));
+    await user.type(screen.getByRole("textbox", { name: "Message" }), "different A text");
+    await user.clear(screen.getByRole("textbox", { name: "Message" }));
+    await user.type(screen.getByRole("textbox", { name: "Message" }), "same A text");
+    await selectSession(user, sessionB.title);
+    await act(async () => {
+      delivery.resolve();
+      await delivery.promise;
+    });
+
+    expect(screen.getByRole("textbox", { name: "Message" })).toHaveValue("B draft");
+    await selectSession(user, sessionA.title);
+    expect(screen.getByRole("textbox", { name: "Message" })).toHaveValue("same A text");
+  });
+
+  it("returns an exact failed Plan delivery retry only to session A", async () => {
+    const user = userEvent.setup();
+    const delivery = deferred();
+    let deliveryAttempts = 0;
+    const sessionA = session({
+      session_id: "delivery-failure-a",
+      title: "Delivery failure A",
+      workspace: "/work/delivery-failure-a",
+    });
+    const sessionB = session({
+      session_id: "delivery-failure-b",
+      title: "Delivery failure B",
+      workspace: "/work/delivery-failure-b",
+    });
+    const onSessionEvent = vi.fn((sessionId: string) => {
+      if (sessionId !== sessionA.session_id) return;
+      deliveryAttempts += 1;
+      return deliveryAttempts === 1 ? delivery.promise : undefined;
+    });
+    render(
+      <App
+        client={clientWithSessions([sessionA, sessionB])}
+        sidebarStorage={storage}
+        draftStorage={storage}
+        transcriptBySession={{
+          [sessionA.session_id]: emptyTranscript(),
+          [sessionB.session_id]: emptyTranscript(),
+        }}
+        onSessionEvent={onSessionEvent}
+      />,
+    );
+
+    const textbox = await screen.findByRole("textbox", { name: "Message" });
+    await user.type(textbox, "exact A plan");
+    await user.click(screen.getByRole("button", { name: "Plan mode" }));
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+    await selectSession(user, sessionB.title);
+    await user.type(screen.getByRole("textbox", { name: "Message" }), "B avoids A feedback");
+    await act(async () => {
+      delivery.reject(new Error("offline"));
+      await delivery.promise.catch(() => {});
+    });
+
+    expect(screen.getByRole("textbox", { name: "Message" })).toHaveValue("B avoids A feedback");
+    expect(screen.queryByRole("status", { name: "Message status" })).not.toBeInTheDocument();
+    await selectSession(user, sessionA.title);
+    expect(screen.getByRole("status", { name: "Message status" })).toHaveTextContent(
+      "Message not sent",
+    );
+    await user.click(screen.getByRole("button", { name: "Retry message" }));
+    expect(onSessionEvent).toHaveBeenLastCalledWith(sessionA.session_id, {
+      type: "send_message",
+      text: "exact A plan",
+      mode: "plan",
+    });
+    expect(deliveryAttempts).toBe(2);
   });
 });

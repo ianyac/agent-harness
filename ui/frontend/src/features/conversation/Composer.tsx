@@ -53,6 +53,10 @@ function hasSameEditAuthority(left: EditAuthority, right: EditAuthority) {
     left.editRevision === right.editRevision;
 }
 
+function hasSameQueuedSlot(current: QueuedMessage | null, captured: QueuedMessage) {
+  return current !== null && current.text === captured.text && current.mode === captured.mode;
+}
+
 const commands: ReadonlyArray<{
   readonly command: string;
   readonly label: string;
@@ -84,12 +88,12 @@ export function Composer({
   backupDelayMs,
   draftMemory,
 }: ComposerProps) {
-  const [draft, setDraft] = useDraft(sessionId, {
+  const [draft, setDraft, setSessionDraft] = useDraft(sessionId, {
     storage: draftStorage,
     backupDelayMs,
     memory: draftMemory,
   });
-  const [mode, setMode] = useState<TurnMode>("base");
+  const [modes, setModes] = useState<ReadonlyMap<string, TurnMode>>(() => new Map());
   const [suggestionsDismissed, setSuggestionsDismissed] = useState(false);
   const [activeSuggestion, setActiveSuggestion] = useState(0);
   const [deliveryErrors, setDeliveryErrors] = useState<
@@ -104,7 +108,8 @@ export function Composer({
   >(() => new Map());
   const composing = useRef(false);
   const postCompositionEnter = useRef(false);
-  const editAuthority = useRef<EditAuthority>({ sessionId, sessionEpoch: 0, editRevision: 0 });
+  const editAuthorities = useRef(new Map<string, EditAuthority>());
+  const nextSessionEpoch = useRef(0);
   const nextDeliveryOperationId = useRef(0);
   const currentDeliveryOperations = useRef(new Map<string, DeliveryOperation>());
   const nextClearOperationId = useRef(0);
@@ -120,23 +125,28 @@ export function Composer({
   );
   const suggestionsOpen = !suggestionsDismissed && matchingCommands.length > 0;
   const blank = draft.trim() === "";
+  const mode = modes.get(sessionId) ?? "base";
   const deliveryError = deliveryErrors.get(sessionId) ?? null;
   const queueReconciliation = queueReconciliations.get(sessionId) ?? null;
   const clearPending = clearPendingSessions.has(sessionId);
 
-  if (editAuthority.current.sessionId !== sessionId) {
-    editAuthority.current = {
-      sessionId,
-      sessionEpoch: editAuthority.current.sessionEpoch + 1,
+  const editAuthorityFor = (authoritySessionId: string) => {
+    const existing = editAuthorities.current.get(authoritySessionId);
+    if (existing !== undefined) return existing;
+    nextSessionEpoch.current += 1;
+    const created: EditAuthority = {
+      sessionId: authoritySessionId,
+      sessionEpoch: nextSessionEpoch.current,
       editRevision: 0,
     };
-  }
+    editAuthorities.current.set(authoritySessionId, created);
+    return created;
+  };
+  editAuthorityFor(sessionId);
 
   useEffect(() => {
-    setMode("base");
     setSuggestionsDismissed(false);
     setActiveSuggestion(0);
-    setDeliveryErrors(new Map());
     setTurnError(false);
     composing.current = false;
     postCompositionEnter.current = false;
@@ -165,7 +175,7 @@ export function Composer({
   };
 
   const deliver = async (submission: Submission, retryOperation?: DeliveryOperation) => {
-    const origin = retryOperation ?? editAuthority.current;
+    const origin = retryOperation ?? editAuthorityFor(sessionId);
     const active = currentDeliveryOperations.current.get(origin.sessionId);
     if (active !== undefined && hasSameEditAuthority(active, origin)) return;
     nextDeliveryOperationId.current += 1;
@@ -182,11 +192,14 @@ export function Composer({
       await onEvent(submission);
       if (currentDeliveryOperations.current.get(operation.sessionId) !== operation) return;
       currentDeliveryOperations.current.delete(operation.sessionId);
-      if (hasSameEditAuthority(editAuthority.current, operation)) setDraft("");
+      if (hasSameEditAuthority(editAuthorityFor(operation.sessionId), operation)) {
+        markEdited(operation.sessionId);
+        setSessionDraft(operation.sessionId, "");
+      }
     } catch {
       if (currentDeliveryOperations.current.get(operation.sessionId) !== operation) return;
       currentDeliveryOperations.current.delete(operation.sessionId);
-      if (hasSameEditAuthority(editAuthority.current, operation)) {
+      if (hasSameEditAuthority(editAuthorityFor(operation.sessionId), operation)) {
         setDeliveryError(operation.sessionId, operation);
       }
     }
@@ -201,17 +214,27 @@ export function Composer({
     });
   };
 
-  const markEdited = () => {
-    setDeliveryError(editAuthority.current.sessionId, null);
-    editAuthority.current = {
-      ...editAuthority.current,
-      editRevision: editAuthority.current.editRevision + 1,
-    };
+  const markEdited = (editedSessionId = sessionId) => {
+    setDeliveryError(editedSessionId, null);
+    const current = editAuthorityFor(editedSessionId);
+    editAuthorities.current.set(editedSessionId, {
+      ...current,
+      editRevision: current.editRevision + 1,
+    });
+  };
+
+  const setSessionMode = (modeSessionId: string, next: TurnMode) => {
+    setModes((current) => {
+      if ((current.get(modeSessionId) ?? "base") === next) return current;
+      const updated = new Map(current);
+      updated.set(modeSessionId, next);
+      return updated;
+    });
   };
 
   const changeMode = (next: TurnMode) => {
     if (next !== mode) markEdited();
-    setMode(next);
+    setSessionMode(sessionId, next);
   };
 
   const setQueueReconciliation = (
@@ -236,13 +259,20 @@ export function Composer({
   };
 
   const clearQueue = async (retryOperation?: ClearOperation) => {
+    if (
+      retryOperation !== undefined &&
+      (sessionId !== retryOperation.sessionId || !hasSameQueuedSlot(queued, retryOperation.queued))
+    ) {
+      setQueueReconciliation(retryOperation.sessionId, { kind: "saved", operation: retryOperation });
+      return;
+    }
     const queuedMessage = retryOperation?.queued ?? queued;
     const operationSessionId = retryOperation?.sessionId ?? sessionId;
     if (
       queuedMessage === null ||
       currentClearOperations.current.has(operationSessionId)
     ) return;
-    const origin: EditAuthority = retryOperation ?? editAuthority.current;
+    const origin: EditAuthority = retryOperation ?? editAuthorityFor(sessionId);
     nextClearOperationId.current += 1;
     const operation: ClearOperation = {
       ...origin,
@@ -257,11 +287,11 @@ export function Composer({
       if (currentClearOperations.current.get(operation.sessionId) !== operation) return;
       currentClearOperations.current.delete(operation.sessionId);
       setClearPending(operation.sessionId, false);
-      if (hasSameEditAuthority(editAuthority.current, operation)) {
-        markEdited();
-        setDraft(operation.queued.text);
-        setMode(operation.queued.mode);
-        textboxRef.current?.focus();
+      if (hasSameEditAuthority(editAuthorityFor(operation.sessionId), operation)) {
+        markEdited(operation.sessionId);
+        setSessionDraft(operation.sessionId, operation.queued.text);
+        setSessionMode(operation.sessionId, operation.queued.mode);
+        if (sessionId === operation.sessionId) textboxRef.current?.focus();
       } else {
         setQueueReconciliation(operation.sessionId, { kind: "saved", operation });
       }
@@ -274,19 +304,23 @@ export function Composer({
   };
 
   const appendClearedFollowUp = (operation: ClearOperation) => {
-    markEdited();
-    setDraft((current) => current === ""
+    markEdited(operation.sessionId);
+    setSessionDraft(operation.sessionId, (current) => current === ""
       ? operation.queued.text
       : `${current}\n${operation.queued.text}`);
     setQueueReconciliation(operation.sessionId, null);
     textboxRef.current?.focus();
   };
 
+  const dismissClearedFollowUp = (operation: ClearOperation) => {
+    setQueueReconciliation(operation.sessionId, null);
+  };
+
   const chooseCommand = (index: number) => {
     const selected = matchingCommands[index];
     if (selected === undefined) return;
     markEdited();
-    setMode(selected.mode);
+    setSessionMode(sessionId, selected.mode);
     setDraft(draft.replace(/^\/\S+\s*/, ""));
     setSuggestionsDismissed(true);
     textboxRef.current?.focus();
@@ -519,13 +553,20 @@ export function Composer({
               </>
             ) : (
               <>
-                <span>Cleared follow-up saved: {queueReconciliation.operation.queued.text}</span>
+                <span>Previous follow-up saved: {queueReconciliation.operation.queued.text}</span>
                 <button
                   type="button"
                   aria-label="Append cleared follow-up"
                   onClick={() => appendClearedFollowUp(queueReconciliation.operation)}
                 >
                   Append
+                </button>
+                <button
+                  type="button"
+                  aria-label="Dismiss cleared follow-up"
+                  onClick={() => dismissClearedFollowUp(queueReconciliation.operation)}
+                >
+                  Dismiss
                 </button>
               </>
             )}

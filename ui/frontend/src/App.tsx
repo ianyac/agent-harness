@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { ApiClient } from "./api/http";
 import { CommandPalette } from "./components/CommandPalette";
@@ -49,6 +49,7 @@ export function App({
       : { client: providedClient, status: "connected" },
   );
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const composerDraftMemory = useRef(new Map<string, string>());
 
   useEffect(() => {
     if (providedClient !== undefined) {
@@ -125,7 +126,6 @@ export function App({
         </main>
         {activeSession !== null && activeTranscript !== null ? (
           <Composer
-            key={`composer-${activeSession.session_id}`}
             sessionId={activeSession.session_id}
             running={activeTranscript.running}
             stopping={activeTranscript.stopping}
@@ -133,6 +133,7 @@ export function App({
             onEvent={(event) => onSessionEvent(activeSession.session_id, event)}
             onStop={() => onStopSession(activeSession.session_id)}
             draftStorage={draftStorage}
+            draftMemory={composerDraftMemory.current}
           />
         ) : null}
       </div>

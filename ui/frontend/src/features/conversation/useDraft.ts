@@ -81,15 +81,26 @@ export function useDraft(sessionId: string, options: UseDraftOptions = {}) {
   }, [backupDelayMs, currentText, sessionId, storage]);
 
   const setText = useCallback((next: string | ((current: string) => string)) => {
+    const targetSessionId = sessionRef.current;
     setState((current) => {
-      const visible = current.sessionId === sessionRef.current
+      const visible = current.sessionId === targetSessionId
         ? current.text
-        : restoredText(sessionRef.current, memory, storage);
+        : restoredText(targetSessionId, memory, storage);
       const text = typeof next === "function" ? next(visible) : next;
-      memory.set(sessionRef.current, text);
-      return { sessionId: sessionRef.current, text };
+      memory.set(targetSessionId, text);
+      return { sessionId: targetSessionId, text };
     });
   }, [memory, storage]);
 
-  return [currentText, setText] as const;
+  const setSessionText = useCallback((targetSessionId: string, next: string | ((current: string) => string)) => {
+    if (targetSessionId === sessionRef.current) {
+      setText(next);
+      return;
+    }
+    const visible = restoredText(targetSessionId, memory, storage);
+    const text = typeof next === "function" ? next(visible) : next;
+    memory.set(targetSessionId, text);
+  }, [memory, setText, storage]);
+
+  return [currentText, setText, setSessionText] as const;
 }

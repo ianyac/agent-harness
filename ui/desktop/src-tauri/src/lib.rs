@@ -699,6 +699,29 @@ mod tests {
     }
 
     #[test]
+    fn main_window_capability_allows_only_core_defaults_and_native_dragging() {
+        let capability: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/default.json")).unwrap();
+        let permissions = capability["permissions"].as_array().unwrap();
+
+        assert_eq!(capability["windows"], serde_json::json!(["main"]));
+        assert_eq!(
+            permissions.as_slice(),
+            [
+                serde_json::json!("core:default"),
+                serde_json::json!("core:window:allow-start-dragging")
+            ]
+        );
+        for forbidden_prefix in ["shell:", "fs:", "http:", "opener:"] {
+            assert!(!permissions.iter().any(|permission| {
+                permission
+                    .as_str()
+                    .is_some_and(|value| value.starts_with(forbidden_prefix))
+            }));
+        }
+    }
+
+    #[test]
     fn application_bootstrap_directory_is_created_below_app_data_and_canonicalized() {
         let root = std::env::temp_dir().join(format!(
             "agent-harness-bootstrap-{}-{}",

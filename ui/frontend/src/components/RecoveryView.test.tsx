@@ -97,6 +97,30 @@ describe("RecoveryView", () => {
     expect(screen.getByRole("button", { name: "Locate workspace" })).toBeEnabled();
   });
 
+  it.each(["turn_failure", "session_resume_failure", "session_resume_error"])(
+    "offers one duplicate-suppressed retry for %s",
+    async (category) => {
+      const user = userEvent.setup();
+      const retry = deferred();
+      const onRetry = vi.fn(() => retry.promise);
+      render(
+        <RecoveryView
+          error={{ category, message: "safe retry" }}
+          sessionId="session-stable"
+          platform={adapter()}
+          onLocate={async () => {}}
+          onArchive={async () => {}}
+          onRetry={onRetry}
+        />,
+      );
+
+      await user.dblClick(screen.getByRole("button", { name: "Retry" }));
+      expect(onRetry).toHaveBeenCalledTimes(1);
+      expect(screen.getByRole("button", { name: "Retry" })).toBeDisabled();
+      await act(async () => retry.resolve());
+    },
+  );
+
   it("shows only fixed native crash capabilities and contains failures with latest-operation authority", async () => {
     const user = userEvent.setup();
     const restart = deferred();

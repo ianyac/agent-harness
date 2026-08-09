@@ -51,7 +51,14 @@ function SessionsHarness({ api }: { api: ApiClient }) {
     <>
       <output aria-label="Session titles">{model.sessions.map((item) => item.title).join("|")}</output>
       <output aria-label="Active session">{model.activeSessionId ?? "none"}</output>
-      <output aria-label="Session error">{model.error?.message ?? "none"}</output>
+      <output aria-label="Refresh error">{model.refreshError?.message ?? "none"}</output>
+      <output aria-label="Operation error">
+        {model.operationError === null
+          ? "none"
+          : `${model.operationError.kind}:${"category" in model.operationError.error
+            ? String(model.operationError.error.category)
+            : "unknown"}:${model.operationError.error.message}`}
+      </output>
       <button type="button" onClick={() => void model.refresh()}>Refresh</button>
       <button type="button" onClick={() => void model.createSession()}>Create</button>
       <button type="button" onClick={() => void model.createSession({
@@ -74,6 +81,7 @@ function SessionsHarness({ api }: { api: ApiClient }) {
         Second rename
       </button>
       <button type="button" onClick={() => void model.archiveSession("session-1")}>Archive</button>
+      <button type="button" onClick={() => void model.retryOperation()}>Retry operation</button>
     </>
   );
 }
@@ -81,6 +89,38 @@ function SessionsHarness({ api }: { api: ApiClient }) {
 afterEach(cleanup);
 
 describe("useSessions async authority", () => {
+  it("preserves a typed rename failure apart from refresh readiness and retries its exact request", async () => {
+    const user = userEvent.setup();
+    const titles: string[] = [];
+    const api = client(async (input, init) => {
+      const path = new URL(input instanceof Request ? input.url : input.toString()).pathname;
+      if (path === "/api/config") return Response.json(config);
+      if (path === "/api/sessions" && init?.method === "GET") {
+        return Response.json([session("session-1", "Original")]);
+      }
+      if (init?.method === "PATCH") {
+        const body = JSON.parse(String(init.body)) as { title: string };
+        titles.push(body.title);
+        return titles.length === 1
+          ? Response.json({ error: { type: "invalid_title", message: "Bad title" } }, { status: 422 })
+          : Response.json(session("session-1", body.title));
+      }
+      return new Response(null, { status: 404 });
+    });
+    render(<SessionsHarness api={api} />);
+    await screen.findByText("Original", { selector: "output" });
+
+    await user.click(screen.getByRole("button", { name: "First rename" }));
+    expect(await screen.findByRole("status", { name: "Operation error" }))
+      .toHaveTextContent("rename:invalid_title");
+    expect(screen.getByRole("status", { name: "Refresh error" })).toHaveTextContent("none");
+
+    await user.dblClick(screen.getByRole("button", { name: "Retry operation" }));
+    expect(titles).toEqual(["First rename", "First rename"]);
+    expect(await screen.findByText("First rename", { selector: "output" })).toBeVisible();
+    expect(screen.getByRole("status", { name: "Operation error" })).toHaveTextContent("none");
+  });
+
   it("uses explicit validated workspace and defaults for a future session", async () => {
     const user = userEvent.setup();
     let createBody: unknown;
@@ -120,7 +160,7 @@ describe("useSessions async authority", () => {
     render(<SessionsHarness api={api} />);
     await user.click(await screen.findByRole("button", { name: "Create invalid" }));
     expect(creates).toBe(0);
-    expect(screen.getByRole("status", { name: "Session error" })).toHaveTextContent(
+    expect(screen.getByRole("status", { name: "Operation error" })).toHaveTextContent(
       "Invalid session creation options.",
     );
   });
@@ -292,7 +332,7 @@ describe("useSessions async authority", () => {
     second.resolve(new Response(null, { status: 500 }));
 
     await waitFor(() =>
-      expect(screen.getByRole("status", { name: "Session error" })).not.toHaveTextContent("none"),
+      expect(screen.getByRole("status", { name: "Operation error" })).not.toHaveTextContent("none"),
     );
     expect(screen.getByRole("status", { name: "Session titles" })).toHaveTextContent(
       "First confirmed",
@@ -363,7 +403,7 @@ describe("useSessions async authority", () => {
     archive.resolve(new Response(null, { status: 500 }));
 
     await waitFor(() =>
-      expect(screen.getByRole("status", { name: "Session error" })).not.toHaveTextContent("none"),
+      expect(screen.getByRole("status", { name: "Operation error" })).not.toHaveTextContent("none"),
     );
     expect(screen.getByRole("status", { name: "Session titles" })).toHaveTextContent(
       "Confirmed rename",

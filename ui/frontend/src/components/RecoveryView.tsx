@@ -106,7 +106,11 @@ export function RecoveryView({
             </button>
           </>
         ) : null}
-        {onRetry === undefined || (error.category !== "turn_failure" && error.category !== "session_resume_failure") ? null : (
+        {onRetry === undefined || ![
+          "turn_failure",
+          "session_resume_failure",
+          "session_resume_error",
+        ].includes(error.category) ? null : (
           <button type="button" disabled={pending} onClick={() => void run(onRetry)}>
             <RefreshCw aria-hidden="true" size={18} /> Retry
           </button>

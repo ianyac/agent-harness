@@ -28,6 +28,7 @@ export function emptyTranscript(): TranscriptState {
     safety: null,
     latestContext: null,
     error: null,
+    terminal: null,
   };
 }
 
@@ -215,6 +216,7 @@ export function transcriptReducer(state: TranscriptState, event: ServerEvent): T
       safety: event.safety,
       latestContext: null,
       error: null,
+      terminal: null,
     };
   }
 
@@ -237,6 +239,7 @@ export function transcriptReducer(state: TranscriptState, event: ServerEvent): T
         stopping: false,
         queued: null,
         error: null,
+        terminal: null,
       };
     case "assistant_delta": {
       const timeline = appendAssistantDelta(state.timeline, event.text);
@@ -328,6 +331,12 @@ export function transcriptReducer(state: TranscriptState, event: ServerEvent): T
         messages: event.messages,
         timeline: boundary(reconciled, "turn_completion"),
         error: null,
+        terminal: {
+          kind: "completed",
+          generation: event.generation,
+          sequence: event.sequence,
+          turnId: event.turn_id,
+        },
       };
     }
     case "turn_cancelled":
@@ -335,12 +344,24 @@ export function transcriptReducer(state: TranscriptState, event: ServerEvent): T
         ...terminalState(accepted),
         timeline: boundary(discardUncommittedAssistants(state.timeline), "turn_completion"),
         error: null,
+        terminal: {
+          kind: "cancelled",
+          generation: event.generation,
+          sequence: event.sequence,
+          turnId: event.turn_id,
+        },
       };
     case "turn_failed":
       return {
         ...terminalState(accepted),
         timeline: boundary(discardUncommittedAssistants(state.timeline), "error"),
         error: { category: event.error_category, message: event.message },
+        terminal: {
+          kind: "failed",
+          generation: event.generation,
+          sequence: event.sequence,
+          turnId: event.turn_id,
+        },
       };
     case "safety_updated":
       return { ...accepted, safety: event.safety };

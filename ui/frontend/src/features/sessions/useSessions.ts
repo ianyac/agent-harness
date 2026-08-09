@@ -44,20 +44,39 @@ export type CreateSessionOptions = {
   readonly title?: string;
 };
 
+export type CreateSessionAuthority = {
+  readonly token: symbol;
+};
+
+export function createSessionAuthority(): CreateSessionAuthority {
+  return { token: Symbol("create-session") };
+}
+
 export type CreateSessionResult =
   | { readonly ok: true; readonly session: SessionRecord }
   | { readonly ok: false; readonly error: Error };
+
+export type SessionOperationError =
+  | { readonly kind: "create"; readonly options: CreateSessionOptions; readonly error: Error }
+  | { readonly kind: "rename"; readonly sessionId: string; readonly title: string; readonly error: Error }
+  | { readonly kind: "archive"; readonly sessionId: string; readonly error: Error };
 
 export type SessionsModel = {
   readonly sessions: SessionRecord[];
   readonly activeSessionId: string | null;
   readonly loading: boolean;
-  readonly error: Error | null;
+  readonly refreshError: Error | null;
+  readonly operationError: SessionOperationError | null;
   readonly config: ServiceConfig | null;
-  readonly createSession: (options?: CreateSessionOptions) => Promise<CreateSessionResult>;
+  readonly createSession: (
+    options?: CreateSessionOptions,
+    authority?: CreateSessionAuthority,
+  ) => Promise<CreateSessionResult>;
+  readonly invalidateCreate: (authority: CreateSessionAuthority) => void;
   readonly selectSession: (sessionId: string) => void;
   readonly renameSession: (sessionId: string, title: string) => Promise<void>;
   readonly archiveSession: (sessionId: string) => Promise<void>;
+  readonly retryOperation: () => Promise<void>;
   readonly refresh: () => Promise<void>;
 };
 
@@ -74,7 +93,8 @@ export function useSessions(client: ApiClient | null): SessionsModel {
   const [config, setConfig] = useState<ServiceConfig | null>(null);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [loading, setLoading] = useState(client !== null);
-  const [error, setError] = useState<Error | null>(null);
+  const [refreshError, setRefreshError] = useState<Error | null>(null);
+  const [operationError, setOperationError] = useState<SessionOperationError | null>(null);
   const sessionsRef = useRef<SessionRecord[]>([]);
   const configRef = useRef<ServiceConfig | null>(null);
   const activeSessionIdRef = useRef<string | null>(null);
@@ -88,6 +108,9 @@ export function useSessions(client: ApiClient | null): SessionsModel {
     new Map<string, { readonly operation: number; readonly record: SessionRecord }>(),
   );
   const selectionIntentRef = useRef(0);
+  const operationErrorRef = useRef<SessionOperationError | null>(null);
+  const operationErrorAuthorityRef = useRef(0);
+  const currentCreateAuthorityRef = useRef<CreateSessionAuthority | null>(null);
 
   const commitSessions = useCallback((next: SessionRecord[]) => {
     sessionsRef.current = next;
@@ -106,6 +129,11 @@ export function useSessions(client: ApiClient | null): SessionsModel {
 
   const isCurrentClient = useCallback((requestClient: ApiClient, epoch: number) => {
     return clientRef.current === requestClient && clientEpochRef.current === epoch;
+  }, []);
+
+  const commitOperationError = useCallback((next: SessionOperationError | null) => {
+    operationErrorRef.current = next;
+    setOperationError(next);
   }, []);
 
   const refresh = useCallback(async () => {
@@ -132,10 +160,10 @@ export function useSessions(client: ApiClient | null): SessionsModel {
             : (visible[0]?.session_id ?? null),
         );
       }
-      setError(null);
+      setRefreshError(null);
     } catch (value) {
       if (isCurrentClient(requestClient, epoch) && refreshRequestRef.current === request) {
-        setError(errorFrom(value));
+        setRefreshError(errorFrom(value));
       }
     } finally {
       if (isCurrentClient(requestClient, epoch) && refreshRequestRef.current === request) {
@@ -154,23 +182,27 @@ export function useSessions(client: ApiClient | null): SessionsModel {
     confirmedArchiveRef.current.clear();
     confirmedRenameRef.current.clear();
     selectionIntentRef.current += 1;
+    operationErrorAuthorityRef.current += 1;
+    currentCreateAuthorityRef.current = null;
   }, [client]);
 
   useEffect(() => {
     commitSessions([]);
     commitConfig(null);
     commitActiveSession(null);
-    setError(null);
+    setRefreshError(null);
+    commitOperationError(null);
     if (client === null) {
       setLoading(false);
       return;
     }
     setLoading(true);
     void refresh();
-  }, [client, commitActiveSession, commitConfig, commitSessions, refresh]);
+  }, [client, commitActiveSession, commitConfig, commitOperationError, commitSessions, refresh]);
 
   const createSession = useCallback(async (
     options?: CreateSessionOptions,
+    authority?: CreateSessionAuthority,
   ): Promise<CreateSessionResult> => {
     const serviceConfig = configRef.current;
     if (client === null || serviceConfig === null) {
@@ -182,6 +214,9 @@ export function useSessions(client: ApiClient | null): SessionsModel {
       contextMode: serviceConfig.default_context_mode,
       title: "New chat",
     };
+    const operationAuthority = ++operationErrorAuthorityRef.current;
+    if (authority !== undefined) currentCreateAuthorityRef.current = authority;
+    commitOperationError(null);
     if (
       !request.workspace.startsWith("/")
       || request.workspace.includes("\0")
@@ -191,7 +226,7 @@ export function useSessions(client: ApiClient | null): SessionsModel {
       || (request.title !== undefined && request.title.trim() === "")
     ) {
       const validationError = new Error("Invalid session creation options.");
-      setError(validationError);
+      commitOperationError({ kind: "create", options: request, error: validationError });
       return { ok: false, error: validationError };
     }
     const requestClient = client;
@@ -205,6 +240,16 @@ export function useSessions(client: ApiClient | null): SessionsModel {
         context_mode: request.contextMode,
         title: request.title ?? "New chat",
       });
+      const staleAuthority = authority !== undefined
+        && currentCreateAuthorityRef.current !== authority;
+      if (staleAuthority) {
+        try {
+          await requestClient.delete(`/api/sessions/${encodeURIComponent(created.session_id)}`);
+        } catch {
+          // The stale session was never committed locally; cleanup failure cannot replace newer state.
+        }
+        return { ok: false, error: new Error("The session request was superseded.") };
+      }
       if (!isCurrentClient(requestClient, epoch)) {
         return { ok: false, error: new Error("The session client was replaced.") };
       }
@@ -216,14 +261,30 @@ export function useSessions(client: ApiClient | null): SessionsModel {
       if (selectionIntentRef.current === selectionIntent) {
         commitActiveSession(created.session_id);
       }
-      setError(null);
+      if (authority !== undefined && currentCreateAuthorityRef.current === authority) {
+        currentCreateAuthorityRef.current = null;
+      }
+      if (operationErrorAuthorityRef.current === operationAuthority) commitOperationError(null);
       return { ok: true, session: created };
     } catch (value) {
       const operationError = errorFrom(value);
-      if (isCurrentClient(requestClient, epoch)) setError(operationError);
+      if (
+        isCurrentClient(requestClient, epoch)
+        && (authority === undefined || currentCreateAuthorityRef.current === authority)
+        && operationErrorAuthorityRef.current === operationAuthority
+      ) {
+        commitOperationError({ kind: "create", options: request, error: operationError });
+      }
       return { ok: false, error: operationError };
     }
-  }, [client, commitActiveSession, commitSessions, isCurrentClient]);
+  }, [client, commitActiveSession, commitOperationError, commitSessions, isCurrentClient]);
+
+  const invalidateCreate = useCallback((authority: CreateSessionAuthority) => {
+    if (currentCreateAuthorityRef.current !== authority) return;
+    currentCreateAuthorityRef.current = null;
+    operationErrorAuthorityRef.current += 1;
+    if (operationErrorRef.current?.kind === "create") commitOperationError(null);
+  }, [commitOperationError]);
 
   const selectSession = useCallback(
     (sessionId: string) => {
@@ -240,6 +301,8 @@ export function useSessions(client: ApiClient | null): SessionsModel {
       if (client === null) return;
       const requestClient = client;
       const epoch = clientEpochRef.current;
+      const errorAuthority = ++operationErrorAuthorityRef.current;
+      commitOperationError(null);
       const operation = (sessionOperationRef.current.get(sessionId) ?? 0) + 1;
       sessionOperationRef.current.set(sessionId, operation);
       mutationVersionRef.current += 1;
@@ -260,14 +323,18 @@ export function useSessions(client: ApiClient | null): SessionsModel {
             ),
           );
         }
-        setError(null);
+        if (operationErrorAuthorityRef.current === errorAuthority) commitOperationError(null);
       } catch (value) {
-        if (isCurrentClient(requestClient, epoch) && !confirmedArchiveRef.current.has(sessionId)) {
-          setError(errorFrom(value));
+        if (
+          isCurrentClient(requestClient, epoch)
+          && !confirmedArchiveRef.current.has(sessionId)
+          && operationErrorAuthorityRef.current === errorAuthority
+        ) {
+          commitOperationError({ kind: "rename", sessionId, title, error: errorFrom(value) });
         }
       }
     },
-    [client, commitSessions, isCurrentClient],
+    [client, commitOperationError, commitSessions, isCurrentClient],
   );
 
   const archiveSession = useCallback(
@@ -275,6 +342,8 @@ export function useSessions(client: ApiClient | null): SessionsModel {
       if (client === null) return;
       const requestClient = client;
       const epoch = clientEpochRef.current;
+      const errorAuthority = ++operationErrorAuthorityRef.current;
+      commitOperationError(null);
       const operation = (sessionOperationRef.current.get(sessionId) ?? 0) + 1;
       sessionOperationRef.current.set(sessionId, operation);
       mutationVersionRef.current += 1;
@@ -289,26 +358,47 @@ export function useSessions(client: ApiClient | null): SessionsModel {
         if (activeSessionIdRef.current === sessionId) {
           commitActiveSession(remaining[0]?.session_id ?? null);
         }
-        setError(null);
+        if (operationErrorAuthorityRef.current === errorAuthority) commitOperationError(null);
       } catch (value) {
-        if (isCurrentClient(requestClient, epoch) && !confirmedArchiveRef.current.has(sessionId)) {
-          setError(errorFrom(value));
+        if (
+          isCurrentClient(requestClient, epoch)
+          && !confirmedArchiveRef.current.has(sessionId)
+          && operationErrorAuthorityRef.current === errorAuthority
+        ) {
+          commitOperationError({ kind: "archive", sessionId, error: errorFrom(value) });
         }
       }
     },
-    [client, commitActiveSession, commitSessions, isCurrentClient],
+    [client, commitActiveSession, commitOperationError, commitSessions, isCurrentClient],
   );
+
+  const retryOperation = useCallback(async () => {
+    const failed = operationErrorRef.current;
+    if (failed === null) return;
+    if (failed.kind === "create") {
+      await createSession(failed.options);
+      return;
+    }
+    if (failed.kind === "rename") {
+      await renameSession(failed.sessionId, failed.title);
+      return;
+    }
+    await archiveSession(failed.sessionId);
+  }, [archiveSession, createSession, renameSession]);
 
   return {
     sessions,
     activeSessionId,
     loading,
-    error,
+    refreshError,
+    operationError,
     config,
     createSession,
+    invalidateCreate,
     selectSession,
     renameSession,
     archiveSession,
+    retryOperation,
     refresh,
   };
 }

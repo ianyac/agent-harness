@@ -6,9 +6,11 @@ import type { PlatformAdapter } from "../../platform/types";
 import type { BaseMode } from "../../protocol/types";
 import type {
   ContextMode,
+  CreateSessionAuthority,
   CreateSessionOptions,
   CreateSessionResult,
 } from "../sessions/useSessions";
+import { createSessionAuthority } from "../sessions/useSessions";
 import { CredentialPrerequisite } from "./CredentialPrerequisite";
 import styles from "./onboarding.module.css";
 
@@ -18,9 +20,15 @@ type OnboardingProps = {
   readonly defaultWorkspace: string;
   readonly defaultMode: BaseMode;
   readonly defaultContextMode: ContextMode;
-  readonly onCreate: (options: CreateSessionOptions) => Promise<CreateSessionResult>;
+  readonly onCreate: (
+    options: CreateSessionOptions,
+    authority: CreateSessionAuthority,
+  ) => Promise<CreateSessionResult>;
+  readonly onInvalidateCreate?: (authority: CreateSessionAuthority) => void;
   readonly authorityKey?: unknown;
 };
+
+const ignoreInvalidation = () => {};
 
 function browserPathError(path: string): string | null {
   if (path === "") return "Choose a workspace to continue.";
@@ -37,6 +45,7 @@ export function Onboarding({
   defaultMode,
   defaultContextMode,
   onCreate,
+  onInvalidateCreate = ignoreInvalidation,
   authorityKey,
 }: OnboardingProps) {
   const [workspace, setWorkspace] = useState(defaultWorkspace);
@@ -46,12 +55,13 @@ export function Onboarding({
   const [credentialRequest, setCredentialRequest] = useState<CreateSessionOptions | null>(null);
   const [pending, setPending] = useState(false);
   const [complete, setComplete] = useState(false);
-  const operationRef = useRef(0);
-  const pendingRef = useRef(false);
+  const authorityRef = useRef<CreateSessionAuthority>(createSessionAuthority());
+  const pendingRef = useRef<CreateSessionAuthority | null>(null);
 
   useLayoutEffect(() => {
-    operationRef.current += 1;
-    pendingRef.current = false;
+    onInvalidateCreate(authorityRef.current);
+    authorityRef.current = createSessionAuthority();
+    pendingRef.current = null;
     setPending(false);
     setComplete(false);
     setCredentialRequest(null);
@@ -59,23 +69,29 @@ export function Onboarding({
     setWorkspace(defaultWorkspace);
     setMode(defaultMode);
     setContextMode(defaultContextMode);
-  }, [authorityKey, defaultContextMode, defaultMode, defaultWorkspace, platform]);
+  }, [authorityKey, defaultContextMode, defaultMode, defaultWorkspace, onInvalidateCreate, platform]);
 
   const invalidate = () => {
-    operationRef.current += 1;
+    const invalidated = authorityRef.current;
+    onInvalidateCreate(invalidated);
+    authorityRef.current = createSessionAuthority();
+    if (pendingRef.current === invalidated) {
+      pendingRef.current = null;
+      setPending(false);
+    }
     setCredentialRequest(null);
     setError(null);
   };
 
   const submit = async (request: CreateSessionOptions) => {
-    if (pendingRef.current) return;
-    pendingRef.current = true;
+    if (pendingRef.current !== null) return;
+    const authority = authorityRef.current;
+    pendingRef.current = authority;
     setPending(true);
     setError(null);
-    const operation = ++operationRef.current;
-    const result = await onCreate(request);
-    if (operationRef.current !== operation) return;
-    pendingRef.current = false;
+    const result = await onCreate(request, authority);
+    if (authorityRef.current !== authority) return;
+    if (pendingRef.current === authority) pendingRef.current = null;
     setPending(false);
     if (result.ok) {
       setCredentialRequest(null);
@@ -110,7 +126,7 @@ export function Onboarding({
   }
 
   const chooseNativeWorkspace = async () => {
-    if (pendingRef.current) return;
+    if (pendingRef.current !== null) return;
     setError(null);
     try {
       const chosen = await platform.chooseWorkspace();
@@ -135,7 +151,7 @@ export function Onboarding({
       <section className={styles.card}>
         <ShieldCheck aria-hidden="true" size={26} />
         <h1 id="first-run-title">Start locally</h1>
-        <p>Processing and session files stay local to this Mac.</p>
+        <p>Processing and session files stay local to this computer.</p>
         <p className={styles.trust}>
           Choosing a workspace does not automatically run workspace configuration, hooks,
           MCP commands, or skill shell blocks.

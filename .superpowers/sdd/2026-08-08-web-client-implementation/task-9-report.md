@@ -122,3 +122,57 @@ No server API, Tauri host, deployment, Playwright, Task 10, controller ledger, o
 - Credential retry reuses the exact retained create request; workspace/default edits and client replacement invalidate stale completions.
 - `Open logs`, `Restart service`, and `Quit` accept no frontend path or arguments and exist only when the adapter exposes them.
 - Current refresh failure reuses `useSessions.refresh`; successful current refresh clears recovery, while stale client completions remain ignored by existing client/epoch authority.
+
+## Fix round 1/5 — official review findings
+
+All five Important findings from `task-9-review.md` are addressed.
+
+### RED checkpoints
+
+1. Authoritative completion notifications
+
+   `npm test -- --run src/features/settings/NotificationObserver.test.tsx`
+
+   Result before the fix: 2 failed, 3 passed. Both `turn_cancelled` and `turn_failed` produced the same unexpected `Work complete · Title background` notification.
+
+2. Exact failed-turn retry
+
+   `npm test -- --run src/components/RecoveryView.test.tsx src/App.test.tsx`
+
+   Result before the fix: 2 failed, 37 passed. `session_resume_error` exposed no Retry button, and App flattened the real resume category to generic turn-stopped copy before it could offer exact replay.
+
+3. Session-operation errors versus transport readiness
+
+   `npm test -- --run src/App.test.tsx src/features/sessions/useSessions.test.tsx`
+
+   Result before the fix: 2 failed, 37 passed. A typed rename failure had no scoped operation result, while a typed New chat failure exposed no operation alert and drove the false local-service connecting state.
+
+4. First-run edit authority
+
+   `npm test -- --run src/App.test.tsx`
+
+   Result before the fix: 2 failed, 26 passed. Both stale-success and stale-failure integration cases retained a disabled `Starting…` button after workspace, permission-mode, and context-mode edits, so the newer request could not start.
+
+5. Recoverable bootstrap acquisition
+
+   `npm test -- --run src/App.test.tsx src/platform/tauri.test.ts`
+
+   Result before the fix: 2 failed, 28 passed. App exposed only terminal `Local service disconnected`, and Tauri's second connection request rejected with the cached first acquisition failure.
+
+### Implemented contracts
+
+- The transcript reducer records exact completed/cancelled/failed terminal identity. Background completion notifications now require a newly observed authoritative `turn_completed`; cancellation and failure never announce success.
+- App retains the exact session-scoped `send_message` and replays it only while client, dispatcher, session, generation, sequence, and turn identity still match. Pending retries are duplicate-suppressed, successful submission retires the action, and `session_resume_error` follows the real retry path.
+- `useSessions` separates `refreshError` from typed create/rename/archive `operationError`. Only refresh readiness drives reconnect state; scoped mutation recovery preserves `ApiError.category` and retries the exact failed request.
+- One opaque create token spans Onboarding and `useSessions`. Editing workspace/mode/context releases only that token's pending slot. A stale failure cannot replace newer state; a stale successful POST is never committed or activated and receives best-effort cleanup of only its exact returned session id.
+- Bootstrap uses explicit attempt identity for quiet checking, reconnect escalation, and fresh acquisition plus authenticated-health Retry. Replaced attempts cannot commit, and the Tauri adapter clears a rejected connection promise instead of caching a terminal failure.
+- Shared local-only onboarding copy now says “this computer”.
+
+### Final verification after fix round 1
+
+- Focused Task 9 command: 10 files, 81 tests passed.
+- Full frontend: 24 files, 279 tests passed.
+- `npm run typecheck`: passed with no diagnostics.
+- `npm run build`: passed without warnings; main application `389.23 kB`, markdown vendor `165.72 kB`.
+- `git diff --check`: passed.
+- No browser or Playwright run was used.

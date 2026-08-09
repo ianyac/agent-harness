@@ -29,9 +29,12 @@ export function createTauriPlatform(invoke: NativeInvoke = defaultInvoke): Platf
   return Object.freeze({
     kind: "tauri" as const,
     getServiceConnection(): Promise<ServiceConnection> {
-      connectionRequest ??= invoke<unknown>("service_connection").then(
-        normalizeServiceConnection,
-      );
+      connectionRequest ??= invoke<unknown>("service_connection")
+        .then(normalizeServiceConnection)
+        .catch((error: unknown) => {
+          connectionRequest = undefined;
+          throw error;
+        });
       return connectionRequest;
     },
     async chooseWorkspace(): Promise<string | null> {

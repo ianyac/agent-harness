@@ -18,7 +18,7 @@ type Observation = {
   readonly generation: number;
   readonly sequence: number;
   readonly permissionId: string | null;
-  readonly running: boolean;
+  readonly completionId: string | null;
 };
 
 function observation(state: TranscriptState): Observation {
@@ -26,7 +26,9 @@ function observation(state: TranscriptState): Observation {
     generation: state.generation,
     sequence: state.lastSequence,
     permissionId: state.permission?.requestId ?? null,
-    running: state.running,
+    completionId: state.terminal?.kind === "completed"
+      ? `${state.terminal.generation}:${state.terminal.sequence}:${state.terminal.turnId}`
+      : null,
   };
 }
 
@@ -90,7 +92,11 @@ export function NotificationObserver({
           body,
         }).catch(() => {});
       }
-      if (preferences.notifyCompletions && previous.running && !current.running) {
+      if (
+        preferences.notifyCompletions
+        && current.completionId !== null
+        && current.completionId !== previous.completionId
+      ) {
         void platform.notify({
           title: `Work complete · ${session.title}`,
           body,

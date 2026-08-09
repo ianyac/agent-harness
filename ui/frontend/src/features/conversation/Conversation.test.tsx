@@ -47,6 +47,7 @@ function transcript(overrides: Partial<TranscriptState> = {}): TranscriptState {
     error: null,
     ...overrides,
     latestContext: overrides.latestContext ?? null,
+    terminal: overrides.terminal ?? null,
   };
 }
 

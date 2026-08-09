@@ -130,7 +130,7 @@ describe("Onboarding", () => {
       mode: "default",
       contextMode: "compaction",
       title: "New chat",
-    });
+    }, expect.anything());
   });
 
   it("sends one base and one context mode, retains credential request, and suppresses rapid retry duplicates", async () => {
@@ -164,7 +164,7 @@ describe("Onboarding", () => {
       mode: "readOnly",
       contextMode: "folding",
       title: "New chat",
-    });
+    }, expect.anything());
 
     const retryButton = screen.getByRole("button", { name: "Retry" });
     await user.dblClick(retryButton);
@@ -174,7 +174,7 @@ describe("Onboarding", () => {
       mode: "readOnly",
       contextMode: "folding",
       title: "New chat",
-    });
+    }, expect.anything());
     await act(async () => retry.resolve(success()));
     await waitFor(() => expect(screen.queryByRole("heading", { name: "Sign in required" })).not.toBeInTheDocument());
   });

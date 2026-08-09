@@ -2,7 +2,8 @@ import { cleanup, render, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { PlatformAdapter } from "../../platform/types";
-import { emptyTranscript } from "../../protocol/reducer";
+import { event } from "../../protocol/fixtures";
+import { emptyTranscript, transcriptReducer } from "../../protocol/reducer";
 import type { TranscriptState } from "../../protocol/types";
 import type { SessionRecord } from "../sessions/useSessions";
 import { defaultPreferences } from "./preferences";
@@ -33,6 +34,17 @@ function adapter(notify: PlatformAdapter["notify"]): PlatformAdapter {
 
 function transcript(changes: Partial<TranscriptState> = {}): TranscriptState {
   return { ...emptyTranscript(), ...changes };
+}
+
+function runningTranscript(sequence = 1): TranscriptState {
+  return transcriptReducer(emptyTranscript(), event("turn_started", { sequence }));
+}
+
+function terminalTranscript(
+  type: "turn_completed" | "turn_cancelled" | "turn_failed",
+  sequence = 2,
+): TranscriptState {
+  return transcriptReducer(runningTranscript(1), event(type, { sequence }));
 }
 
 afterEach(cleanup);
@@ -77,10 +89,10 @@ describe("NotificationObserver", () => {
     expect(notify).toHaveBeenCalledTimes(1);
   });
 
-  it("notifies only a background running-to-terminal transition and ignores active or disabled transitions", async () => {
+  it("notifies only an authoritative background turn completion and ignores active or disabled completions", async () => {
     const notify = vi.fn().mockResolvedValue(undefined);
     const records = [session("active"), session("background")];
-    const initial = { active: transcript({ running: true }), background: transcript({ running: true }) };
+    const initial = { active: runningTranscript(), background: runningTranscript() };
     const props = {
       clientKey: "client-a",
       platform: adapter(notify),
@@ -90,8 +102,8 @@ describe("NotificationObserver", () => {
     };
     const { rerender } = render(<NotificationObserver {...props} transcriptBySession={initial} />);
     rerender(<NotificationObserver {...props} transcriptBySession={{
-      active: transcript({ lastSequence: 2, running: false }),
-      background: transcript({ lastSequence: 2, running: false }),
+      active: terminalTranscript("turn_completed"),
+      background: terminalTranscript("turn_completed"),
     }} />);
     await waitFor(() => expect(notify).toHaveBeenCalledTimes(1));
     expect(notify).toHaveBeenCalledWith({
@@ -100,15 +112,45 @@ describe("NotificationObserver", () => {
     });
 
     rerender(<NotificationObserver {...props} preferences={defaultPreferences} transcriptBySession={{
-      active: transcript({ lastSequence: 3, running: true }),
-      background: transcript({ lastSequence: 3, running: true }),
+      active: runningTranscript(3),
+      background: runningTranscript(3),
     }} />);
     rerender(<NotificationObserver {...props} preferences={defaultPreferences} transcriptBySession={{
-      active: transcript({ lastSequence: 4, running: false }),
-      background: transcript({ lastSequence: 4, running: false }),
+      active: terminalTranscript("turn_completed", 4),
+      background: terminalTranscript("turn_completed", 4),
     }} />);
     expect(notify).toHaveBeenCalledTimes(1);
   });
+
+  it.each(["turn_cancelled", "turn_failed"] as const)(
+    "does not call cancelled or failed work complete when the terminal event is %s",
+    async (terminalType) => {
+      const notify = vi.fn().mockResolvedValue(undefined);
+      const records = [session("active"), session("background")];
+      const props = {
+        clientKey: "client-a",
+        platform: adapter(notify),
+        sessions: records,
+        activeSessionId: "active",
+        preferences: { ...defaultPreferences, notifyCompletions: true },
+      };
+      const { rerender } = render(
+        <NotificationObserver
+          {...props}
+          transcriptBySession={{ active: transcript(), background: runningTranscript() }}
+        />,
+      );
+
+      rerender(
+        <NotificationObserver
+          {...props}
+          transcriptBySession={{ active: transcript(), background: terminalTranscript(terminalType) }}
+        />,
+      );
+
+      await waitFor(() => expect(notify).not.toHaveBeenCalled());
+    },
+  );
 
   it("invalidates bookkeeping on client replacement, ignores stale generations, and contains notification failure", async () => {
     const notify = vi.fn().mockRejectedValue(new Error("Notification denied"));

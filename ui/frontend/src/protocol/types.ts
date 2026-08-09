@@ -234,6 +234,13 @@ export type RecoverableError = {
   message: string;
 };
 
+export type TranscriptTerminal = {
+  kind: "completed" | "cancelled" | "failed";
+  generation: number;
+  sequence: number;
+  turnId: string;
+};
+
 export type TranscriptBoundary =
   | "permission"
   | "plan_review"
@@ -310,4 +317,5 @@ export type TranscriptState = {
   safety: SafetySnapshot | null;
   latestContext: JsonObject | null;
   error: RecoverableError | null;
+  terminal: TranscriptTerminal | null;
 };

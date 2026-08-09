@@ -31,6 +31,22 @@ describe("transcriptReducer", () => {
     expect(state.streamingText).toBe("");
     expect(state.permission).toBeNull();
     expect(state.running).toBe(false);
+    expect(state.terminal).toEqual({
+      kind: "completed",
+      generation: 1,
+      sequence: 4,
+      turnId: "t1",
+    });
+  });
+
+  it.each([
+    ["turn_cancelled", "cancelled"],
+    ["turn_failed", "failed"],
+  ] as const)("records authoritative %s terminal identity", (eventType, kind) => {
+    let state = transcriptReducer(emptyTranscript(), event("turn_started", { sequence: 1 }));
+    state = transcriptReducer(state, event(eventType, { sequence: 2 }));
+
+    expect(state.terminal).toEqual({ kind, generation: 1, sequence: 2, turnId: "t1" });
   });
 
   it("retains real current-turn boundaries and reconciles narration in chronological order", () => {
@@ -790,6 +806,7 @@ describe("transcriptReducer", () => {
       safety: { mode: "default" },
       latestContext: null,
       error: null,
+      terminal: null,
     });
   });
 });

@@ -159,6 +159,124 @@ describe("App", () => {
     expect(screen.queryByRole("heading", { name: "Start locally" })).not.toBeInTheDocument();
   });
 
+  it("lets newer first-run choices supersede a pending successful create and cleans up only its exact stale session", async () => {
+    const user = userEvent.setup();
+    const stale = deferred<Response>();
+    const deleted: string[] = [];
+    let posts = 0;
+    const fetchRequest: typeof fetch = async (input, init) => {
+      const path = new URL(input instanceof Request ? input.url : input.toString()).pathname;
+      if (path === "/api/config") return Response.json({
+        base_workspace: "/work/old",
+        default_mode: "default",
+        default_context_mode: "compaction",
+        modes: ["default", "acceptAll", "readOnly"],
+        context_modes: ["compaction", "folding"],
+      });
+      if (path === "/api/sessions" && init?.method === "GET") return Response.json([]);
+      if (path === "/api/sessions" && init?.method === "POST") {
+        posts += 1;
+        return posts === 1
+          ? stale.promise
+          : Response.json(session({
+              session_id: "new-choice",
+              workspace: "/work/new",
+              title: "New choice",
+              mode: "readOnly",
+              context_mode: "folding",
+            }), { status: 201 });
+      }
+      if (init?.method === "DELETE") {
+        deleted.push(path);
+        return new Response(null, { status: 204 });
+      }
+      return new Response(null, { status: 404 });
+    };
+    render(
+      <App
+        client={clientWith(fetchRequest)}
+        platformAdapter={platformAdapter()}
+        sidebarStorage={storage}
+        draftStorage={storage}
+      />,
+    );
+
+    const path = await screen.findByRole("textbox", { name: "Workspace path" });
+    await user.click(screen.getByRole("button", { name: "Start local session" }));
+    expect(posts).toBe(1);
+    await user.clear(path);
+    await user.type(path, "/work/new");
+    await user.selectOptions(screen.getByRole("combobox", { name: "Permission mode" }), "readOnly");
+    await user.click(screen.getByRole("radio", { name: "Recoverable folding" }));
+    expect(screen.getByRole("button", { name: "Start local session" })).toBeEnabled();
+    await user.click(screen.getByRole("button", { name: "Start local session" }));
+    expect(posts).toBe(2);
+    expect(await screen.findByRole("heading", { name: "new" })).toBeVisible();
+
+    stale.resolve(Response.json(session({
+      session_id: "stale-old",
+      workspace: "/work/old",
+      title: "Stale old",
+    }), { status: 201 }));
+    await waitFor(() => expect(deleted).toEqual(["/api/sessions/stale-old"]));
+    expect(screen.queryByRole("button", { name: /^Stale old,/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^New choice,/ })).toHaveAttribute("aria-current", "page");
+  });
+
+  it("contains a stale first-run failure without blocking or replacing the newer choices", async () => {
+    const user = userEvent.setup();
+    const stale = deferred<Response>();
+    let posts = 0;
+    const fetchRequest: typeof fetch = async (input, init) => {
+      const path = new URL(input instanceof Request ? input.url : input.toString()).pathname;
+      if (path === "/api/config") return Response.json({
+        base_workspace: "/work/old",
+        default_mode: "default",
+        default_context_mode: "compaction",
+        modes: ["default", "acceptAll", "readOnly"],
+        context_modes: ["compaction", "folding"],
+      });
+      if (path === "/api/sessions" && init?.method === "GET") return Response.json([]);
+      if (path === "/api/sessions" && init?.method === "POST") {
+        posts += 1;
+        return posts === 1
+          ? stale.promise
+          : Response.json(session({
+              session_id: "new-after-failure",
+              workspace: "/work/newer",
+              title: "Newer choice",
+              mode: "acceptAll",
+              context_mode: "folding",
+            }), { status: 201 });
+      }
+      return new Response(null, { status: 404 });
+    };
+    render(
+      <App
+        client={clientWith(fetchRequest)}
+        platformAdapter={platformAdapter()}
+        sidebarStorage={storage}
+        draftStorage={storage}
+      />,
+    );
+
+    const path = await screen.findByRole("textbox", { name: "Workspace path" });
+    await user.click(screen.getByRole("button", { name: "Start local session" }));
+    await user.clear(path);
+    await user.type(path, "/work/newer");
+    await user.selectOptions(screen.getByRole("combobox", { name: "Permission mode" }), "acceptAll");
+    await user.click(screen.getByRole("radio", { name: "Recoverable folding" }));
+    await user.click(screen.getByRole("button", { name: "Start local session" }));
+    expect(await screen.findByRole("heading", { name: "newer" })).toBeVisible();
+
+    stale.resolve(Response.json({
+      error: { type: "credential_prerequisite", message: "stale credential requirement" },
+    }, { status: 409 }));
+    await act(async () => { await Promise.resolve(); });
+    expect(screen.queryByRole("heading", { name: "Sign in required" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^Newer choice,/ })).toHaveAttribute("aria-current", "page");
+  });
+
   it("bypasses first run, opens internal Settings from sidebar and palette, and applies defaults only to later New chat", async () => {
     const user = userEvent.setup();
     const onSessionEvent = vi.fn();
@@ -237,6 +355,107 @@ describe("App", () => {
       "The turn stopped before it completed.",
     );
     expect(screen.getByRole("alert")).not.toHaveTextContent("secret provider trace");
+  });
+
+  it("retries the exact retained failed submission once under session, client, generation, and turn authority", async () => {
+    const user = userEvent.setup();
+    const active = session();
+    const client = clientWithSessions([active]);
+    const retry = deferred();
+    let attempts = 0;
+    const onSessionEvent = vi.fn((_sessionId: string, event: ClientEvent) => {
+      if (event.type !== "send_message") return;
+      attempts += 1;
+      return attempts === 2 ? retry.promise : undefined;
+    });
+    const appProps = {
+      client,
+      platformAdapter: platformAdapter(),
+      sidebarStorage: storage,
+      draftStorage: storage,
+      onSessionEvent,
+    };
+    const { rerender } = render(
+      <App {...appProps} transcriptBySession={{ [active.session_id]: emptyTranscript() }} />,
+    );
+
+    const textbox = await screen.findByRole("textbox", { name: "Message" });
+    await user.type(textbox, "exact retained plan");
+    await user.click(screen.getByRole("button", { name: "Plan mode" }));
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+    expect(onSessionEvent).toHaveBeenCalledWith(active.session_id, {
+      type: "send_message",
+      text: "exact retained plan",
+      mode: "plan",
+    });
+
+    let failed = transcriptReducer(emptyTranscript(), event("turn_started", { sequence: 1 }));
+    failed = transcriptReducer(failed, event("turn_failed", {
+      sequence: 2,
+      turn_id: "failed-turn",
+      error_category: "session_resume_error",
+      message: "unsafe service detail",
+    }));
+    rerender(<App {...appProps} transcriptBySession={{ [active.session_id]: failed }} />);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("This session could not be reopened.");
+    await user.dblClick(screen.getByRole("button", { name: "Retry" }));
+    expect(onSessionEvent).toHaveBeenCalledTimes(2);
+    expect(onSessionEvent).toHaveBeenLastCalledWith(active.session_id, {
+      type: "send_message",
+      text: "exact retained plan",
+      mode: "plan",
+    });
+    await act(async () => retry.resolve());
+  });
+
+  it("does not offer a retained turn retry after the client or generation authority is replaced", async () => {
+    const user = userEvent.setup();
+    const active = session();
+    const firstClient = clientWithSessions([active]);
+    const onSessionEvent = vi.fn();
+    const props = {
+      platformAdapter: platformAdapter(),
+      sidebarStorage: storage,
+      draftStorage: storage,
+      onSessionEvent,
+    };
+    const { rerender } = render(
+      <App
+        {...props}
+        client={firstClient}
+        transcriptBySession={{ [active.session_id]: emptyTranscript() }}
+      />,
+    );
+    await user.type(await screen.findByRole("textbox", { name: "Message" }), "stale submission");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+
+    let generationTwo = transcriptReducer(
+      emptyTranscript(),
+      event("session_snapshot", { generation: 2, sequence: 1 }),
+    );
+    generationTwo = transcriptReducer(
+      generationTwo,
+      event("turn_failed", { generation: 2, sequence: 2 }),
+    );
+    rerender(
+      <App
+        {...props}
+        client={firstClient}
+        transcriptBySession={{ [active.session_id]: generationTwo }}
+      />,
+    );
+    expect(await screen.findByRole("alert")).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+
+    rerender(
+      <App
+        {...props}
+        client={clientWithSessions([active])}
+        transcriptBySession={{ [active.session_id]: generationTwo }}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
   });
 
   it("checks authenticated health before exposing a platform client as connected", async () => {
@@ -367,6 +586,54 @@ describe("App", () => {
     expect(screen.getByRole("status", { name: "Local service connected" })).toBeVisible();
   });
 
+  it("keeps a typed New chat failure scoped and retries the exact mutation without claiming a disconnect", async () => {
+    const user = userEvent.setup();
+    const active = session();
+    const bodies: unknown[] = [];
+    const fetchRequest: typeof fetch = async (input, init) => {
+      const path = new URL(input instanceof Request ? input.url : input.toString()).pathname;
+      if (path === "/api/config") return Response.json({
+        base_workspace: "/work/project-a",
+        default_mode: "default",
+        default_context_mode: "compaction",
+        modes: ["default", "acceptAll", "readOnly"],
+        context_modes: ["compaction", "folding"],
+      });
+      if (path === "/api/sessions" && init?.method === "GET") return Response.json([active]);
+      if (path === "/api/sessions" && init?.method === "POST") {
+        bodies.push(JSON.parse(String(init.body)));
+        return bodies.length === 1
+          ? Response.json({
+              error: { type: "credential_prerequisite", message: "unsafe token detail" },
+            }, { status: 401 })
+          : Response.json(session({ session_id: "retry-created", title: "New chat" }), { status: 201 });
+      }
+      return new Response(null, { status: 404 });
+    };
+    render(
+      <App
+        client={clientWith(fetchRequest)}
+        platformAdapter={platformAdapter()}
+        sidebarStorage={storage}
+        draftStorage={storage}
+        transcriptBySession={{ [active.session_id]: emptyTranscript() }}
+      />,
+    );
+    await screen.findByRole("heading", { name: "project-a" });
+
+    await user.click(screen.getByRole("button", { name: "New chat" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Run codex login, then retry.");
+    expect(screen.getByRole("alert")).not.toHaveTextContent("unsafe token detail");
+    expect(screen.getByRole("status", { name: "Local service connected" })).toBeVisible();
+    expect(screen.queryByRole("status", { name: "Local service reconnecting" })).not.toBeInTheDocument();
+
+    await user.dblClick(screen.getByRole("button", { name: "Retry New chat" }));
+    expect(bodies).toHaveLength(2);
+    expect(bodies[1]).toEqual(bodies[0]);
+    expect(await screen.findByRole("heading", { name: "project-a" })).toBeVisible();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
   it("opens selected activity detail from the transcript and overview from the header", async () => {
     const user = userEvent.setup();
     const active = session();
@@ -473,19 +740,58 @@ describe("App", () => {
     expect(screen.queryByRole("region", { name: "Selected activity detail" })).not.toBeInTheDocument();
   });
 
-  it("renders the focused product shell and reports a failed bootstrap", async () => {
+  it("keeps failed bootstrap recoverable and retries fresh acquisition plus authenticated health", async () => {
+    vi.useFakeTimers();
+    let acquisitions = 0;
+    const paths: string[] = [];
+    const fetchRequest: typeof fetch = async (input) => {
+      const path = new URL(input instanceof Request ? input.url : input.toString()).pathname;
+      paths.push(path);
+      if (path === "/api/health") return Response.json({ status: "ok" });
+      if (path === "/api/config") return Response.json({
+        base_workspace: "/work/project-a",
+        default_mode: "default",
+        default_context_mode: "compaction",
+        modes: ["default", "acceptAll", "readOnly"],
+        context_modes: ["compaction", "folding"],
+      });
+      if (path === "/api/sessions") return Response.json([session()]);
+      return new Response(null, { status: 404 });
+    };
+    vi.stubGlobal("fetch", fetchRequest);
     render(
       <App
+        platformAdapter={platformAdapter({
+          getServiceConnection: async () => {
+            acquisitions += 1;
+            if (acquisitions === 1) throw new Error("Sidecar is still starting");
+            return connection;
+          },
+        })}
         sidebarStorage={storage}
+        draftStorage={storage}
       />,
     );
 
     expect(screen.getByRole("navigation", { name: "Sessions" })).toBeVisible();
     expect(screen.getByRole("main")).toBeVisible();
     expect(screen.getByRole("status", { name: "Local service connecting" })).toBeVisible();
-    expect(
-      await screen.findByRole("status", { name: "Local service disconnected" }),
-    ).toBeVisible();
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(screen.getByRole("status", { name: "Local service reconnecting" })).toBeVisible();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+    expect(screen.getByRole("alert")).toHaveTextContent("Still reconnecting to the local service");
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry connection" }));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+      for (let index = 0; index < 12; index += 1) await Promise.resolve();
+    });
+    expect(acquisitions).toBe(2);
+    expect(paths[0]).toBe("/api/health");
+    expect(screen.getByRole("heading", { name: "project-a" })).toBeVisible();
+    expect(screen.getByRole("status", { name: "Local service connected" })).toBeVisible();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
   it("cancels a session-bound accept-all confirmation when the active session changes", async () => {

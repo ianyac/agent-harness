@@ -14,6 +14,7 @@ import type { InspectorStorage } from "./features/inspector/useInspector";
 import type { CopyText } from "./features/conversation/CodeBlock";
 import { ConversationHeader } from "./features/sessions/ConversationHeader";
 import { SessionSidebar } from "./features/sessions/SessionSidebar";
+import { SessionOperationRecovery } from "./features/sessions/SessionOperationRecovery";
 import type { ConnectionStatus } from "./features/sessions/SessionSidebar";
 import type { SessionRuntimeState } from "./features/sessions/useSessions";
 import { useSessions } from "./features/sessions/useSessions";
@@ -23,9 +24,35 @@ import type { PreferenceStorage } from "./features/settings/preferences";
 import { usePreferences } from "./features/settings/preferences";
 import type { PlatformAdapter } from "./platform/types";
 import { emptyTranscript } from "./protocol/reducer";
-import type { ClientEvent, TranscriptState } from "./protocol/types";
+import type { ClientEvent, SendMessage, TranscriptState, TranscriptTerminal } from "./protocol/types";
 
 const emptyTranscriptState = emptyTranscript();
+
+type RetainedSubmission = {
+  readonly client: ApiClient;
+  readonly dispatcher: AppProps["onSessionEvent"];
+  readonly generation: number;
+  readonly event: SendMessage;
+};
+
+type RetryAuthority = {
+  readonly key: string;
+  readonly sessionId: string;
+  readonly client: ApiClient;
+  readonly dispatcher: AppProps["onSessionEvent"];
+  readonly terminal: TranscriptTerminal;
+  readonly event: SendMessage;
+};
+
+type BootstrapLifecycle = {
+  readonly status: "checking" | "reconnecting";
+  readonly attempt: number;
+  readonly retrying: boolean;
+};
+
+function terminalKey(sessionId: string, terminal: TranscriptTerminal): string {
+  return `${sessionId}:${terminal.generation}:${terminal.sequence}:${terminal.turnId}`;
+}
 
 type AppProps = {
   readonly client?: ApiClient;
@@ -73,36 +100,70 @@ export function App({
   );
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [bootstrapAttempt, setBootstrapAttempt] = useState(0);
+  const [bootstrapLifecycle, setBootstrapLifecycle] = useState<BootstrapLifecycle | null>(() =>
+    providedClient === undefined
+      ? { status: "checking", attempt: 0, retrying: true }
+      : null,
+  );
+  const [, setRetryRevision] = useState(0);
   const composerDraftMemory = useRef(new Map<string, string>());
+  const retainedSubmissionRef = useRef(new Map<string, RetainedSubmission>());
+  const retrySubmittedRef = useRef(new Set<string>());
+  const bootstrapPendingRef = useRef(providedClient === undefined);
   const preferenceModel = usePreferences(preferenceStorage ?? sidebarStorage);
 
   useEffect(() => {
     if (providedClient !== undefined) {
+      bootstrapPendingRef.current = false;
+      setBootstrapLifecycle(null);
       setConnection({ client: providedClient, status: "connected", platform: platformAdapter ?? null });
       return;
     }
     let current = true;
+    let currentPlatform = platformAdapter ?? null;
+    bootstrapPendingRef.current = true;
+    setBootstrapLifecycle({ status: "checking", attempt: bootstrapAttempt, retrying: true });
     setConnection({ client: null, status: "connecting", platform: platformAdapter ?? null });
     const loadPlatform = platformAdapter === undefined
       ? import("./platform").then(({ platform }) => platform)
       : Promise.resolve(platformAdapter);
     void loadPlatform
       .then(async (platform) => {
+        currentPlatform = platform;
         const service = await platform.getServiceConnection();
         const client = new ApiClient(service);
         await client.get<{ readonly status: string }>("/api/health");
         return { platform, client };
       })
       .then(({ platform, client }) => {
-        if (current) setConnection({ client, status: "connected", platform });
+        if (current) {
+          bootstrapPendingRef.current = false;
+          setBootstrapLifecycle(null);
+          setConnection({ client, status: "connected", platform });
+        }
       })
       .catch(() => {
-        if (current) setConnection({ client: null, status: "disconnected", platform: platformAdapter ?? null });
+        if (current) {
+          bootstrapPendingRef.current = false;
+          setBootstrapLifecycle({
+            status: "reconnecting",
+            attempt: bootstrapAttempt,
+            retrying: false,
+          });
+          setConnection({ client: null, status: "connecting", platform: currentPlatform });
+        }
       });
     return () => {
       current = false;
     };
-  }, [platformAdapter, providedClient]);
+  }, [bootstrapAttempt, platformAdapter, providedClient]);
+
+  const retryBootstrap = () => {
+    if (providedClient !== undefined || bootstrapPendingRef.current) return;
+    bootstrapPendingRef.current = true;
+    setBootstrapAttempt((attempt) => attempt + 1);
+  };
 
   const sessionsModel = useSessions(connection.client);
   const activeSession = useMemo(
@@ -115,6 +176,83 @@ export function App({
   const activeTranscript = activeSession === null
     ? null
     : transcriptBySession[activeSession.session_id] ?? emptyTranscriptState;
+  const latestRetryContextRef = useRef({
+    client: connection.client,
+    activeSessionId: activeSession?.session_id ?? null,
+    transcriptBySession,
+    dispatcher: onSessionEvent,
+  });
+  latestRetryContextRef.current = {
+    client: connection.client,
+    activeSessionId: activeSession?.session_id ?? null,
+    transcriptBySession,
+    dispatcher: onSessionEvent,
+  };
+  const routeSessionEvent = (sessionId: string, clientEvent: ClientEvent) => {
+    if (clientEvent.type === "send_message" && connection.client !== null) {
+      const transcript = transcriptBySession[sessionId] ?? emptyTranscriptState;
+      retainedSubmissionRef.current.set(sessionId, {
+        client: connection.client,
+        dispatcher: onSessionEvent,
+        generation: transcript.generation,
+        event: { ...clientEvent },
+      });
+    }
+    return onSessionEvent(sessionId, clientEvent);
+  };
+  const retryAuthority = (() => {
+    if (
+      connection.client === null
+      || activeSession === null
+      || activeTranscript === null
+      || activeTranscript.error === null
+      || activeTranscript.terminal?.kind !== "failed"
+    ) return null;
+    const retained = retainedSubmissionRef.current.get(activeSession.session_id);
+    if (
+      retained === undefined
+      || retained.client !== connection.client
+      || retained.dispatcher !== onSessionEvent
+      || retained.generation !== activeTranscript.terminal.generation
+    ) return null;
+    const key = terminalKey(activeSession.session_id, activeTranscript.terminal);
+    if (retrySubmittedRef.current.has(key)) return null;
+    return {
+      key,
+      sessionId: activeSession.session_id,
+      client: connection.client,
+      dispatcher: onSessionEvent,
+      terminal: activeTranscript.terminal,
+      event: retained.event,
+    } satisfies RetryAuthority;
+  })();
+  const retryFailedSubmission = retryAuthority === null ? undefined : async () => {
+    const authority = retryAuthority;
+    const latest = latestRetryContextRef.current;
+    const transcript = latest.transcriptBySession[authority.sessionId];
+    const currentTerminal = transcript?.terminal;
+    const retained = retainedSubmissionRef.current.get(authority.sessionId);
+    if (
+      latest.client !== authority.client
+      || latest.dispatcher !== authority.dispatcher
+      || latest.activeSessionId !== authority.sessionId
+      || currentTerminal?.kind !== "failed"
+      || terminalKey(authority.sessionId, currentTerminal) !== authority.key
+      || retained?.client !== authority.client
+      || retained.dispatcher !== authority.dispatcher
+      || retained.generation !== authority.terminal.generation
+      || retrySubmittedRef.current.has(authority.key)
+    ) return;
+    retrySubmittedRef.current.add(authority.key);
+    try {
+      await authority.dispatcher?.(authority.sessionId, authority.event);
+      setRetryRevision((revision) => revision + 1);
+    } catch (error) {
+      retrySubmittedRef.current.delete(authority.key);
+      setRetryRevision((revision) => revision + 1);
+      throw error;
+    }
+  };
   const inspector = useInspector({
     sessionId: activeSession?.session_id ?? null,
     storage: inspectorStorage ?? sidebarStorage,
@@ -145,7 +283,7 @@ export function App({
     });
   };
   const selectedPlatform = connection.platform ?? platformAdapter;
-  const sessionReadiness = sessionsModel.error !== null
+  const sessionReadiness = sessionsModel.refreshError !== null
     ? "reconnecting" as const
     : sessionsModel.loading ? "checking" as const : "connected" as const;
   const showingFirstRun = connection.client !== null
@@ -162,6 +300,7 @@ export function App({
           defaultMode={preferenceModel.preferences.defaultMode}
           defaultContextMode={preferenceModel.preferences.contextMode}
           onCreate={sessionsModel.createSession}
+          onInvalidateCreate={sessionsModel.invalidateCreate}
           authorityKey={connection.client}
         />
         <NotificationObserver
@@ -196,11 +335,20 @@ export function App({
         onOpenSettings={openSettings}
       />
       <div className="conversation-shell">
-        {connection.client === null || sessionReadiness === "connected" ? null : (
+        {connection.client === null && bootstrapLifecycle !== null ? (
+          <div className="connection-lifecycle">
+            <ServiceStatus
+              status={bootstrapLifecycle.status}
+              attemptKey={`bootstrap:${bootstrapLifecycle.attempt}`}
+              retrying={bootstrapLifecycle.retrying}
+              onRetry={retryBootstrap}
+            />
+          </div>
+        ) : connection.client === null || sessionReadiness === "connected" ? null : (
           <div className="connection-lifecycle">
             <ServiceStatus
               status={sessionReadiness}
-              attemptKey={sessionsModel.error ?? connection.client}
+              attemptKey={sessionsModel.refreshError ?? connection.client}
               retrying={sessionsModel.loading}
               onRetry={() => void sessionsModel.refresh()}
             />
@@ -217,18 +365,31 @@ export function App({
             workspace={activeSession.workspace}
             branch={branchBySession[activeSession.session_id] ?? null}
             mode={activeSession.mode}
-            onSetSessionMode={(event) => onSessionEvent(activeSession.session_id, event)}
+            onSetSessionMode={(event) => routeSessionEvent(activeSession.session_id, event)}
             onToggleActivity={openInspectorOverview}
           />
         )}
         <main aria-label="Conversation" className="conversation-main">
-          {activeTranscript?.error !== null && activeTranscript?.error !== undefined && activeSession !== null && selectedPlatform !== null && selectedPlatform !== undefined ? (
+          {sessionsModel.operationError !== null ? (
+            <SessionOperationRecovery
+              failure={sessionsModel.operationError}
+              onRetry={sessionsModel.retryOperation}
+            />
+          ) : activeTranscript?.error !== null && activeTranscript?.error !== undefined && activeSession !== null && selectedPlatform !== null && selectedPlatform !== undefined ? (
             <RecoveryView
-              error={{ category: "turn_failure", message: activeTranscript.error.message }}
+              key={retryAuthority?.key ?? `${activeSession.session_id}:recovery`}
+              error={{
+                category: activeTranscript.error.category === "session_resume_error"
+                  || activeTranscript.error.category === "session_resume_failure"
+                  ? activeTranscript.error.category
+                  : "turn_failure",
+                message: activeTranscript.error.message,
+              }}
               sessionId={activeSession.session_id}
               platform={selectedPlatform}
               onLocate={onLocateWorkspace}
               onArchive={sessionsModel.archiveSession}
+              onRetry={retryFailedSubmission}
             />
           ) : activeTranscript === null ? null : (
             <Conversation
@@ -241,7 +402,7 @@ export function App({
               ownsSearchShortcut
               onSessionEvent={(event) => activeSession === null
                 ? undefined
-                : onSessionEvent(activeSession.session_id, event)}
+                : routeSessionEvent(activeSession.session_id, event)}
             />
           )}
         </main>
@@ -251,7 +412,7 @@ export function App({
             running={activeTranscript.running}
             stopping={activeTranscript.stopping}
             queued={activeTranscript.queued}
-            onEvent={(event) => onSessionEvent(activeSession.session_id, event)}
+            onEvent={(event) => routeSessionEvent(activeSession.session_id, event)}
             onStop={() => onStopSession(activeSession.session_id)}
             draftStorage={draftStorage}
             draftMemory={composerDraftMemory.current}

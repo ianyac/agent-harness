@@ -3,6 +3,8 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { ActivityItem, HarnessMessage, TranscriptState } from "../../protocol/types";
+import { event } from "../../protocol/fixtures";
+import { emptyTranscript, transcriptReducer } from "../../protocol/reducer";
 import { Conversation } from "./Conversation";
 
 afterEach(() => {
@@ -344,6 +346,54 @@ describe("Conversation", () => {
     const answer = screen.getByText("Authoritative answer").closest("article");
     expect(completedCard.compareDocumentPosition(answer as Node) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
     expect(screen.queryByText("Draft answer")).not.toBeInTheDocument();
+  });
+
+  it("renders every changed authoritative narration once at its streamed position", () => {
+    let state = transcriptReducer(
+      emptyTranscript(),
+      event("session_snapshot", {
+        sequence: 1,
+        messages: [
+          { role: "user", content: "Earlier" },
+          { role: "assistant", content: "Draft before" },
+          { role: "assistant", content: "Historical different" },
+          { role: "user", content: "Current" },
+        ],
+      }),
+    );
+    state = transcriptReducer(state, event("turn_started", { sequence: 2 }));
+    state = transcriptReducer(state, event("assistant_delta", { sequence: 3, text: "Draft before" }));
+    state = transcriptReducer(
+      state,
+      event("activity_started", { sequence: 4, activity_id: "read-current", name: "read_file" }),
+    );
+    state = transcriptReducer(state, event("assistant_delta", { sequence: 5, text: "Draft after" }));
+    state = transcriptReducer(
+      state,
+      event("turn_completed", {
+        sequence: 6,
+        final_text: "Authoritative after",
+        messages: [
+          { role: "user", content: "Earlier" },
+          { role: "assistant", content: "Draft before" },
+          { role: "assistant", content: "Historical different" },
+          { role: "user", content: "Current" },
+          { role: "assistant", content: "Authoritative before" },
+          { role: "assistant", content: "Authoritative after" },
+        ],
+      }),
+    );
+    render(<Conversation state={state} openInspector={() => {}} />);
+
+    const before = screen.getByText("Authoritative before").closest("article");
+    const work = screen.getByRole("button", { name: /Open activity/ });
+    const after = screen.getByText("Authoritative after").closest("article");
+    expect((before?.compareDocumentPosition(work) ?? 0) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+    expect(work.compareDocumentPosition(after as Node) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+    expect(screen.getAllByText("Authoritative before")).toHaveLength(1);
+    expect(screen.getAllByText("Authoritative after")).toHaveLength(1);
+    expect(screen.getAllByText("Draft before")).toHaveLength(1);
+    expect(screen.queryByText("Draft after")).not.toBeInTheDocument();
   });
 
   it("auto-scrolls only from near the bottom and otherwise offers New messages", async () => {

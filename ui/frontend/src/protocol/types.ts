@@ -234,7 +234,13 @@ export type RecoverableError = {
   message: string;
 };
 
-export type TranscriptBoundary = "permission" | "plan_review" | "error" | "turn_completion";
+export type TranscriptBoundary =
+  | "permission"
+  | "plan_review"
+  | "activity_error"
+  | "subagent_completion"
+  | "error"
+  | "turn_completion";
 
 export type TranscriptActivityTimelineItem = {
   kind: "activity";

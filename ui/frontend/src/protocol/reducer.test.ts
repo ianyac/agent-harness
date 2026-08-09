@@ -94,6 +94,7 @@ describe("transcriptReducer", () => {
       { kind: "boundary", boundary: "plan_review" },
       { kind: "activity", activityId: "agent-1" },
       { kind: "activity", activityId: "bash-1" },
+      { kind: "boundary", boundary: "activity_error" },
       { kind: "assistant", text: "Authoritative result", messageIndex: 1 },
       { kind: "boundary", boundary: "turn_completion" },
     ]);
@@ -164,6 +165,148 @@ describe("transcriptReducer", () => {
     ]);
   });
 
+  it("replaces every changed current-turn narration by authoritative position", () => {
+    let state = transcriptReducer(
+      emptyTranscript(),
+      event("session_snapshot", {
+        sequence: 1,
+        messages: [
+          { role: "user", content: "Earlier" },
+          { role: "assistant", content: "Draft before" },
+          { role: "assistant", content: "Historical different" },
+          { role: "user", content: "Current" },
+        ],
+      }),
+    );
+    state = transcriptReducer(state, event("turn_started", { sequence: 2 }));
+    state = transcriptReducer(state, event("assistant_delta", { sequence: 3, text: "Draft before" }));
+    state = transcriptReducer(
+      state,
+      event("activity_started", { sequence: 4, activity_id: "read-current" }),
+    );
+    state = transcriptReducer(state, event("assistant_delta", { sequence: 5, text: "Draft after" }));
+    state = transcriptReducer(
+      state,
+      event("turn_completed", {
+        sequence: 6,
+        final_text: "Authoritative after",
+        messages: [
+          { role: "user", content: "Earlier" },
+          { role: "assistant", content: "Draft before" },
+          { role: "assistant", content: "Historical different" },
+          { role: "user", content: "Current" },
+          { role: "assistant", content: "Authoritative before" },
+          { role: "assistant", content: "Authoritative after" },
+        ],
+      }),
+    );
+
+    expect(timelineOf(state)).toEqual([
+      { kind: "assistant", text: "Authoritative before", messageIndex: 4 },
+      { kind: "activity", activityId: "read-current" },
+      { kind: "assistant", text: "Authoritative after", messageIndex: 5 },
+      { kind: "boundary", boundary: "turn_completion" },
+    ]);
+    expect(state.messages).toEqual([
+      { role: "user", content: "Earlier" },
+      { role: "assistant", content: "Draft before" },
+      { role: "assistant", content: "Historical different" },
+      { role: "user", content: "Current" },
+      { role: "assistant", content: "Authoritative before" },
+      { role: "assistant", content: "Authoritative after" },
+    ]);
+  });
+
+  it("discards surplus draft segments when completion has fewer authoritative messages", () => {
+    let state = transcriptReducer(emptyTranscript(), event("turn_started", { sequence: 1 }));
+    state = transcriptReducer(state, event("assistant_delta", { sequence: 2, text: "Draft one" }));
+    state = transcriptReducer(
+      state,
+      event("activity_started", { sequence: 3, activity_id: "read-one" }),
+    );
+    state = transcriptReducer(state, event("assistant_delta", { sequence: 4, text: "Draft two" }));
+    state = transcriptReducer(
+      state,
+      event("activity_started", { sequence: 5, activity_id: "read-two" }),
+    );
+    state = transcriptReducer(state, event("assistant_delta", { sequence: 6, text: "Draft surplus" }));
+    state = transcriptReducer(
+      state,
+      event("turn_completed", {
+        sequence: 7,
+        final_text: "Authoritative two",
+        messages: [
+          { role: "user", content: "Current" },
+          { role: "assistant", content: "Authoritative one" },
+          { role: "assistant", content: "Authoritative two" },
+        ],
+      }),
+    );
+
+    expect(timelineOf(state)).toEqual([
+      { kind: "assistant", text: "Authoritative one", messageIndex: 1 },
+      { kind: "activity", activityId: "read-one" },
+      { kind: "assistant", text: "Authoritative two", messageIndex: 2 },
+      { kind: "activity", activityId: "read-two" },
+      { kind: "boundary", boundary: "turn_completion" },
+    ]);
+  });
+
+  it("appends surplus authoritative messages after the known current-turn timeline", () => {
+    let state = transcriptReducer(emptyTranscript(), event("turn_started", { sequence: 1 }));
+    state = transcriptReducer(state, event("assistant_delta", { sequence: 2, text: "Only draft" }));
+    state = transcriptReducer(
+      state,
+      event("activity_started", { sequence: 3, activity_id: "read-current" }),
+    );
+    state = transcriptReducer(
+      state,
+      event("turn_completed", {
+        sequence: 4,
+        final_text: "Authoritative two",
+        messages: [
+          { role: "user", content: "Current" },
+          { role: "assistant", content: "Authoritative one" },
+          { role: "assistant", content: "Authoritative two" },
+        ],
+      }),
+    );
+
+    expect(timelineOf(state)).toEqual([
+      { kind: "assistant", text: "Authoritative one", messageIndex: 1 },
+      { kind: "activity", activityId: "read-current" },
+      { kind: "assistant", text: "Authoritative two", messageIndex: 2 },
+      { kind: "boundary", boundary: "turn_completion" },
+    ]);
+  });
+
+  it("does not let an empty draft segment consume an authoritative position", () => {
+    let state = transcriptReducer(emptyTranscript(), event("turn_started", { sequence: 1 }));
+    state = transcriptReducer(state, event("assistant_delta", { sequence: 2, text: "" }));
+    state = transcriptReducer(
+      state,
+      event("activity_started", { sequence: 3, activity_id: "read-current" }),
+    );
+    state = transcriptReducer(state, event("assistant_delta", { sequence: 4, text: "Real draft" }));
+    state = transcriptReducer(
+      state,
+      event("turn_completed", {
+        sequence: 5,
+        final_text: "Authoritative narration",
+        messages: [
+          { role: "user", content: "Current" },
+          { role: "assistant", content: "Authoritative narration" },
+        ],
+      }),
+    );
+
+    expect(timelineOf(state)).toEqual([
+      { kind: "activity", activityId: "read-current" },
+      { kind: "assistant", text: "Authoritative narration", messageIndex: 1 },
+      { kind: "boundary", boundary: "turn_completion" },
+    ]);
+  });
+
   it("rejects stale generations, duplicates, and out-of-order sequences", () => {
     let state = transcriptReducer(
       emptyTranscript(),
@@ -211,6 +354,75 @@ describe("transcriptReducer", () => {
       result: { content: "ok" },
       durationMs: 12,
     });
+  });
+
+  it("records subagent completion at its later event position", () => {
+    let state = transcriptReducer(
+      emptyTranscript(),
+      event("activity_started", {
+        sequence: 1,
+        activity_id: "subagent",
+        actor: "subagent",
+        name: "spawn_agent",
+      }),
+    );
+    state = transcriptReducer(
+      state,
+      event("activity_started", { sequence: 2, activity_id: "root-read", name: "read_file" }),
+    );
+    state = transcriptReducer(
+      state,
+      event("activity_completed", {
+        sequence: 3,
+        activity_id: "subagent",
+        actor: "subagent",
+        name: "spawn_agent",
+      }),
+    );
+    state = transcriptReducer(
+      state,
+      event("activity_started", { sequence: 4, activity_id: "root-list", name: "list_dir" }),
+    );
+
+    expect(state.activityOrder).toEqual(["subagent", "root-read", "root-list"]);
+    expect(timelineOf(state)).toEqual([
+      { kind: "activity", activityId: "subagent" },
+      { kind: "activity", activityId: "root-read" },
+      { kind: "boundary", boundary: "subagent_completion" },
+      { kind: "activity", activityId: "root-list" },
+    ]);
+  });
+
+  it("records activity error completion at its later event position", () => {
+    let state = transcriptReducer(
+      emptyTranscript(),
+      event("activity_started", { sequence: 1, activity_id: "failed", name: "bash" }),
+    );
+    state = transcriptReducer(
+      state,
+      event("activity_started", { sequence: 2, activity_id: "root-read", name: "read_file" }),
+    );
+    state = transcriptReducer(
+      state,
+      event("activity_completed", {
+        sequence: 3,
+        activity_id: "failed",
+        name: "bash",
+        is_error: true,
+      }),
+    );
+    state = transcriptReducer(
+      state,
+      event("activity_started", { sequence: 4, activity_id: "root-list", name: "list_dir" }),
+    );
+
+    expect(state.activityOrder).toEqual(["failed", "root-read", "root-list"]);
+    expect(timelineOf(state)).toEqual([
+      { kind: "activity", activityId: "failed" },
+      { kind: "activity", activityId: "root-read" },
+      { kind: "boundary", boundary: "activity_error" },
+      { kind: "activity", activityId: "root-list" },
+    ]);
   });
 
   it("keeps only the current permission and plan-review requests authoritative", () => {

@@ -2,10 +2,14 @@ import { describe, expect, it } from "vitest";
 
 import type {
   ActivityItem,
+  TranscriptState,
   TranscriptAssistantTimelineItem,
   TranscriptBoundaryTimelineItem,
 } from "../../protocol/types";
+import { event } from "../../protocol/fixtures";
+import { emptyTranscript, transcriptReducer } from "../../protocol/reducer";
 import { groupActivities } from "./groupActivities";
+import type { TimelineMarker } from "./groupActivities";
 
 function activity(
   name: string,
@@ -26,6 +30,19 @@ function activity(
     durationMs: 10,
     ...overrides,
   };
+}
+
+function groupTimeline(state: TranscriptState) {
+  const resolved: Array<ActivityItem | TimelineMarker> = [];
+  for (const item of state.timeline) {
+    if (item.kind !== "activity") {
+      resolved.push(item);
+      continue;
+    }
+    const resolvedActivity = state.activities[item.activityId];
+    if (resolvedActivity !== undefined) resolved.push(resolvedActivity);
+  }
+  return groupActivities(resolved);
 }
 
 describe("groupActivities", () => {
@@ -131,5 +148,76 @@ describe("groupActivities", () => {
       [childRead, childList],
       [rootRead],
     ]);
+  });
+
+  it("does not group root work across a subagent completion event", () => {
+    let state = transcriptReducer(
+      emptyTranscript(),
+      event("activity_started", {
+        sequence: 1,
+        activity_id: "subagent",
+        actor: "subagent",
+        name: "spawn_agent",
+      }),
+    );
+    state = transcriptReducer(
+      state,
+      event("activity_started", { sequence: 2, activity_id: "root-read", name: "read_file" }),
+    );
+    state = transcriptReducer(
+      state,
+      event("activity_completed", {
+        sequence: 3,
+        activity_id: "subagent",
+        actor: "subagent",
+        name: "spawn_agent",
+      }),
+    );
+    state = transcriptReducer(
+      state,
+      event("activity_started", { sequence: 4, activity_id: "root-list", name: "list_dir" }),
+    );
+
+    expect(groupTimeline(state)).toEqual([
+      [expect.objectContaining({ activityId: "subagent" })],
+      [expect.objectContaining({ activityId: "root-read" })],
+      { kind: "boundary", boundary: "subagent_completion" },
+      [expect.objectContaining({ activityId: "root-list" })],
+    ]);
+    expect(state.timeline.filter((item) => item.kind === "activity" && item.activityId === "subagent"))
+      .toHaveLength(1);
+  });
+
+  it("does not group root work across an activity error completion event", () => {
+    let state = transcriptReducer(
+      emptyTranscript(),
+      event("activity_started", { sequence: 1, activity_id: "failed", name: "bash" }),
+    );
+    state = transcriptReducer(
+      state,
+      event("activity_started", { sequence: 2, activity_id: "root-read", name: "read_file" }),
+    );
+    state = transcriptReducer(
+      state,
+      event("activity_completed", {
+        sequence: 3,
+        activity_id: "failed",
+        name: "bash",
+        is_error: true,
+      }),
+    );
+    state = transcriptReducer(
+      state,
+      event("activity_started", { sequence: 4, activity_id: "root-list", name: "list_dir" }),
+    );
+
+    expect(groupTimeline(state)).toEqual([
+      [expect.objectContaining({ activityId: "failed" })],
+      [expect.objectContaining({ activityId: "root-read" })],
+      { kind: "boundary", boundary: "activity_error" },
+      [expect.objectContaining({ activityId: "root-list" })],
+    ]);
+    expect(state.timeline.filter((item) => item.kind === "activity" && item.activityId === "failed"))
+      .toHaveLength(1);
   });
 });

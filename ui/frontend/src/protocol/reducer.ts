@@ -4,6 +4,7 @@ import type {
   ActivityStarted,
   HarnessMessage,
   ServerEvent,
+  TranscriptBoundary,
   TranscriptState,
   TranscriptTimelineItem,
 } from "./types";
@@ -110,7 +111,6 @@ function messageText(message: HarnessMessage): string | null {
 function reconcileAssistantTimeline(
   timeline: readonly TranscriptTimelineItem[],
   messages: readonly HarnessMessage[],
-  finalText: string,
 ): TranscriptTimelineItem[] {
   let latestUserIndex = -1;
   messages.forEach((message, messageIndex) => {
@@ -121,46 +121,28 @@ function reconcileAssistantTimeline(
     const text = messageText(message);
     return text === null ? [] : [{ messageIndex, text }];
   });
-  const used = new Set<number>();
   let candidateCursor = 0;
-  const reconciled = timeline.map((item): TranscriptTimelineItem => {
-    if (item.kind !== "assistant") return item;
-    const matchOffset = candidates.slice(candidateCursor).findIndex(
-      (candidate) => candidate.text === item.text,
-    );
-    if (matchOffset === -1) return item;
-    const candidatePosition = candidateCursor + matchOffset;
-    const candidate = candidates[candidatePosition];
-    candidateCursor = candidatePosition + 1;
-    used.add(candidate.messageIndex);
-    return { ...item, text: candidate.text, messageIndex: candidate.messageIndex };
+  const reconciled = timeline.flatMap((item): TranscriptTimelineItem[] => {
+    if (item.kind !== "assistant") return [item];
+    if (item.text === "") return [];
+    const candidate = candidates[candidateCursor];
+    if (candidate === undefined) return [];
+    candidateCursor += 1;
+    return [{ ...item, text: candidate.text, messageIndex: candidate.messageIndex }];
   });
-
-  const finalCandidate = [...candidates].reverse().find(
-    (candidate) => candidate.text === finalText,
-  ) ?? candidates[candidates.length - 1];
-  if (finalCandidate === undefined || used.has(finalCandidate.messageIndex)) return reconciled;
-
-  for (let index = reconciled.length - 1; index >= 0; index -= 1) {
-    const item = reconciled[index];
-    if (item.kind === "assistant" && item.messageIndex === null) {
-      reconciled[index] = {
-        ...item,
-        text: finalCandidate.text,
-        messageIndex: finalCandidate.messageIndex,
-      };
-      return reconciled;
-    }
-  }
   return [
     ...reconciled,
-    { kind: "assistant", text: finalCandidate.text, messageIndex: finalCandidate.messageIndex },
+    ...candidates.slice(candidateCursor).map((candidate): TranscriptTimelineItem => ({
+      kind: "assistant",
+      text: candidate.text,
+      messageIndex: candidate.messageIndex,
+    })),
   ];
 }
 
 function boundary(
   timeline: readonly TranscriptTimelineItem[],
-  value: "permission" | "plan_review" | "error" | "turn_completion",
+  value: TranscriptBoundary,
 ): TranscriptTimelineItem[] {
   return [...timeline, { kind: "boundary", boundary: value }];
 }
@@ -237,8 +219,20 @@ export function transcriptReducer(state: TranscriptState, event: ServerEvent): T
     }
     case "activity_started":
       return { ...accepted, ...appendActivity(state, startedActivity(event)) };
-    case "activity_completed":
-      return { ...accepted, ...appendActivity(state, completedActivity(event)) };
+    case "activity_completed": {
+      const activity = completedActivity(event);
+      const appended = appendActivity(state, activity);
+      const completionBoundary = activity.status === "error"
+        ? "activity_error"
+        : activity.actor === "subagent" ? "subagent_completion" : null;
+      return {
+        ...accepted,
+        ...appended,
+        timeline: completionBoundary === null
+          ? appended.timeline
+          : boundary(appended.timeline, completionBoundary),
+      };
+    }
     case "permission_requested":
       return {
         ...accepted,
@@ -272,7 +266,7 @@ export function transcriptReducer(state: TranscriptState, event: ServerEvent): T
     case "turn_stopping":
       return { ...accepted, running: true, stopping: true };
     case "turn_completed": {
-      const reconciled = reconcileAssistantTimeline(state.timeline, event.messages, event.final_text);
+      const reconciled = reconcileAssistantTimeline(state.timeline, event.messages);
       return {
         ...terminalState(accepted),
         messages: event.messages,

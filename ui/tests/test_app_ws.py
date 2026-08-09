@@ -255,6 +255,75 @@ def test_websocket_sends_snapshot_before_turn_events(service):
             assert done["messages"][-1]["content"] == "hello back"
 
 
+def test_legacy_direct_turn_started_has_the_exact_prior_client_shape(service):
+    with service(WholeTextLLM("hello back")) as (client, session_id, _, _):
+        with connect(client, session_id) as ws:
+            ws.receive_json()
+            ws.send_json({"type": "send_message", "text": "hello", "mode": "base"})
+
+            started = ws.receive_json()
+
+            assert set(started) == {
+                "type",
+                "session_id",
+                "generation",
+                "sequence",
+                "turn_id",
+                "mode",
+            }
+            assert started["type"] == "turn_started"
+            assert started["mode"] == "base"
+            receive_until(ws, "turn_completed")
+
+
+def test_legacy_queued_reconnect_snapshot_has_the_exact_prior_client_shape(service):
+    llm = BlockingFirstTurnLLM()
+    with service(llm) as (client, session_id, _, app):
+        with connect(client, session_id) as ws:
+            ws.receive_json()
+            ws.send_json({"type": "send_message", "text": "first", "mode": "base"})
+            assert ws.receive_json()["type"] == "turn_started"
+            assert ws.receive_json()["type"] == "assistant_delta"
+            ws.send_json({"type": "queue_message", "text": "later", "mode": "plan"})
+            channel = app.state.session_manager._channels[session_id]
+            for _ in range(1000):
+                if channel.queued_message is not None:
+                    break
+                time.sleep(0.001)
+            assert channel.queued_message is not None
+
+            with connect(client, session_id) as healed:
+                snapshot = healed.receive_json()
+                assert set(snapshot) == {
+                    "type",
+                    "session_id",
+                    "generation",
+                    "sequence",
+                    "turn_id",
+                    "messages",
+                    "running",
+                    "queued_message",
+                    "safety",
+                }
+                assert snapshot["queued_message"] == {
+                    "type": "queue_message",
+                    "text": "later",
+                    "mode": "plan",
+                }
+                llm.release.set()
+                receive_until(healed, "turn_completed")
+                queued_started = healed.receive_json()
+                assert set(queued_started) == {
+                    "type",
+                    "session_id",
+                    "generation",
+                    "sequence",
+                    "turn_id",
+                    "mode",
+                }
+                receive_until(healed, "turn_completed")
+
+
 def test_duplicate_connection_supersedes_sender_and_restamps_future_events(service):
     llm = BlockingLLM()
     with service(llm) as (client, session_id, _, _):

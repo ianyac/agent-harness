@@ -316,3 +316,42 @@ App binds retry authority only by exact echoed id.
   `165.72 kB`.
 - `git diff --check`: passed.
 - No browser or Playwright run was used, as required.
+
+## Fix round 5/5 — legacy correlation-field omission
+
+The round-4 review found that explicit null correlation fields broke the exact
+object shapes accepted by the immediately preceding strict frontend. The
+serializer now omits only an uncorrelated `submission_id` on
+`turn_started` and on a nested queued-message snapshot. Correlated current
+frames retain their exact id, while unrelated null fields remain serialized.
+
+### RED checkpoint
+
+`uv run pytest -q tests/test_protocol.py::test_turn_started_serialization_omits_only_legacy_submission_correlation tests/test_protocol.py::test_snapshot_serialization_omits_only_legacy_nested_queue_correlation tests/test_app_ws.py::test_legacy_direct_turn_started_has_the_exact_prior_client_shape tests/test_app_ws.py::test_legacy_queued_reconnect_snapshot_has_the_exact_prior_client_shape`
+
+Initial result: 4 failed. Both field-level failures differed only by the extra
+`submission_id: None`; both WebSocket failures differed only by the extra
+`submission_id` key rejected by the `d1c3f41` strict parser contract.
+
+### Implemented contract
+
+- Legacy direct `turn_started` frames have exactly the prior six-field shape.
+- Legacy reconnect snapshots retain every required snapshot/envelope field,
+  including `turn_id: null`, while their nested queued message has exactly
+  `type`, `text`, and `mode`.
+- Correlated direct starts and nested queued messages continue to serialize the
+  exact bounded id. The frontend still accepts missing, explicit null, or valid
+  correlation, but only a valid known id gains retry authority.
+- The omission is local to the two `submission_id` paths; it does not use
+  global `exclude_none` and therefore cannot remove unrelated required nulls.
+
+### Final verification after fix round 5
+
+- Protocol + WebSocket compatibility gate: 62 tests passed.
+- Full frontend: 25 files, 310 tests passed.
+- Full UI server: 398 tests passed (the prior 394 plus four compatibility
+  tests).
+- `npm run typecheck`: passed with no diagnostics.
+- `npm run build`: passed without warnings; main application `394.99 kB`,
+  markdown vendor `165.72 kB`.
+- No browser or Playwright run was used, as required.

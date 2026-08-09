@@ -87,6 +87,101 @@ def test_submission_correlation_is_bounded_nullable_and_preserved():
             )
 
 
+def test_turn_started_serialization_omits_only_legacy_submission_correlation():
+    legacy = TurnStarted(
+        session_id="s1",
+        generation=1,
+        sequence=2,
+        turn_id="t1",
+        mode="base",
+    )
+    current = TurnStarted(
+        session_id="s1",
+        generation=1,
+        sequence=2,
+        turn_id="t1",
+        mode="base",
+        submission_id="submission-A",
+    )
+
+    assert json.loads(dump_server_event(legacy)) == {
+        "session_id": "s1",
+        "generation": 1,
+        "sequence": 2,
+        "turn_id": "t1",
+        "type": "turn_started",
+        "mode": "base",
+    }
+    assert json.loads(dump_server_event(current)) == {
+        "session_id": "s1",
+        "generation": 1,
+        "sequence": 2,
+        "turn_id": "t1",
+        "type": "turn_started",
+        "mode": "base",
+        "submission_id": "submission-A",
+    }
+
+
+def test_snapshot_serialization_omits_only_legacy_nested_queue_correlation():
+    legacy = SessionSnapshot(
+        session_id="s1",
+        generation=1,
+        sequence=1,
+        turn_id=None,
+        messages=[],
+        running=True,
+        queued_message=QueuedMessage(text="later", mode="plan"),
+        safety={},
+    )
+    current = SessionSnapshot(
+        session_id="s1",
+        generation=1,
+        sequence=1,
+        turn_id=None,
+        messages=[],
+        running=True,
+        queued_message=QueuedMessage(
+            text="later",
+            mode="plan",
+            submission_id="submission-B",
+        ),
+        safety={},
+    )
+
+    assert json.loads(dump_server_event(legacy)) == {
+        "session_id": "s1",
+        "generation": 1,
+        "sequence": 1,
+        "turn_id": None,
+        "type": "session_snapshot",
+        "messages": [],
+        "running": True,
+        "queued_message": {
+            "text": "later",
+            "mode": "plan",
+            "type": "queue_message",
+        },
+        "safety": {},
+    }
+    assert json.loads(dump_server_event(current)) == {
+        "session_id": "s1",
+        "generation": 1,
+        "sequence": 1,
+        "turn_id": None,
+        "type": "session_snapshot",
+        "messages": [],
+        "running": True,
+        "queued_message": {
+            "text": "later",
+            "mode": "plan",
+            "submission_id": "submission-B",
+            "type": "queue_message",
+        },
+        "safety": {},
+    }
+
+
 @pytest.mark.parametrize(
     ("raw", "expected_type"),
     [
@@ -137,7 +232,15 @@ def test_dump_server_event_preserves_every_field_and_round_trips_every_server_ev
             queued_message=None,
             safety={"mode": "default", "sandbox": {"backend": "none"}},
         ),
-        TurnStarted(type="turn_started", session_id="s1", generation=1, sequence=2, turn_id="t1", mode="plan"),
+        TurnStarted(
+            type="turn_started",
+            session_id="s1",
+            generation=1,
+            sequence=2,
+            turn_id="t1",
+            mode="plan",
+            submission_id="submission-round-trip",
+        ),
         AssistantDelta(type="assistant_delta", session_id="s1", generation=1, sequence=3, turn_id="t1", text="hello"),
         StreamReset(type="stream_reset", session_id="s1", generation=1, sequence=4, turn_id="t1"),
         ActivityStarted(

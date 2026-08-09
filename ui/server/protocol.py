@@ -297,4 +297,14 @@ ServerEvent = Annotated[
 def dump_server_event(event: ServerEvent) -> str:
     """Return a compact JSON text frame for a validated server event."""
     validate_unicode_scalars(event.model_dump(mode="python"))
+    if isinstance(event, TurnStarted) and event.submission_id is None:
+        return event.model_dump_json(exclude={"submission_id"})
+    if (
+        isinstance(event, SessionSnapshot)
+        and event.queued_message is not None
+        and event.queued_message.submission_id is None
+    ):
+        return event.model_dump_json(
+            exclude={"queued_message": {"submission_id"}}
+        )
     return event.model_dump_json()

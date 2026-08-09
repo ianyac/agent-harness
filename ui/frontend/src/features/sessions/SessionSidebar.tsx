@@ -29,7 +29,9 @@ type SessionSidebarProps = {
   readonly connectionStatus?: ConnectionStatus;
   readonly now?: Date;
   readonly storage?: Pick<Storage, "getItem" | "setItem">;
-  readonly onCreate: () => void | Promise<void>;
+  readonly collapsed?: boolean;
+  readonly onCollapsedChange?: (collapsed: boolean) => void;
+  readonly onCreate: () => void | Promise<unknown>;
   readonly onSelect: (sessionId: string) => void;
   readonly onRename: (sessionId: string, title: string) => void | Promise<void>;
   readonly onArchive: (sessionId: string) => void | Promise<void>;
@@ -71,7 +73,9 @@ export function SessionSidebar({
   runtimeBySession,
   connectionStatus = "connecting",
   now = new Date(),
-  storage = browserStorage(),
+  storage,
+  collapsed: controlledCollapsed,
+  onCollapsedChange,
   onCreate,
   onSelect,
   onRename,
@@ -79,7 +83,9 @@ export function SessionSidebar({
   onSearch,
   onOpenSettings,
 }: SessionSidebarProps) {
-  const [collapsed, setCollapsed] = useState(() => initialCollapsed(storage));
+  const effectiveStorage = storage ?? (controlledCollapsed === undefined ? browserStorage() : undefined);
+  const [localCollapsed, setLocalCollapsed] = useState(() => initialCollapsed(effectiveStorage));
+  const collapsed = controlledCollapsed ?? localCollapsed;
   const visibleSessions = sessions.filter((session) => session.archived_at === null);
   const groups: Record<GroupName, SessionRecord[]> = {
     Today: [],
@@ -89,15 +95,16 @@ export function SessionSidebar({
   for (const session of visibleSessions) groups[groupName(session, now)].push(session);
 
   const toggleCollapsed = () => {
-    setCollapsed((current) => {
-      const next = !current;
+    const next = !collapsed;
+    if (controlledCollapsed === undefined) {
+      setLocalCollapsed(next);
       try {
-        storage?.setItem(collapsePreferenceKey, String(next));
+        effectiveStorage?.setItem(collapsePreferenceKey, String(next));
       } catch {
         // Preference storage is optional; the current view remains usable.
       }
-      return next;
-    });
+    }
+    onCollapsedChange?.(next);
   };
   const connectionLabel = {
     connecting: "Local service connecting",

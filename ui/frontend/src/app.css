@@ -16,11 +16,26 @@
 }
 
 .conversation-shell {
+  position: relative;
   display: grid;
   flex: 1;
   grid-template-rows: auto minmax(0, 1fr) auto;
   min-width: 0;
   min-height: 100dvh;
+}
+
+.connection-lifecycle {
+  position: absolute;
+  z-index: 30;
+  inset-block-start: 58px;
+  inset-inline: 16px;
+  display: grid;
+  justify-items: end;
+  pointer-events: none;
+}
+
+.connection-lifecycle > * {
+  pointer-events: auto;
 }
 
 .conversation-header {

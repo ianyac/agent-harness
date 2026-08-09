@@ -29,7 +29,7 @@ export type SessionRuntimeState = {
   readonly status: SessionRuntimeStatus;
 };
 
-type ServiceConfig = {
+export type ServiceConfig = {
   readonly base_workspace: string;
   readonly default_mode: BaseMode;
   readonly default_context_mode: ContextMode;
@@ -37,12 +37,24 @@ type ServiceConfig = {
   readonly context_modes: ContextMode[];
 };
 
+export type CreateSessionOptions = {
+  readonly workspace: string;
+  readonly mode: BaseMode;
+  readonly contextMode: ContextMode;
+  readonly title?: string;
+};
+
+export type CreateSessionResult =
+  | { readonly ok: true; readonly session: SessionRecord }
+  | { readonly ok: false; readonly error: Error };
+
 export type SessionsModel = {
   readonly sessions: SessionRecord[];
   readonly activeSessionId: string | null;
   readonly loading: boolean;
   readonly error: Error | null;
-  readonly createSession: () => Promise<void>;
+  readonly config: ServiceConfig | null;
+  readonly createSession: (options?: CreateSessionOptions) => Promise<CreateSessionResult>;
   readonly selectSession: (sessionId: string) => void;
   readonly renameSession: (sessionId: string, title: string) => Promise<void>;
   readonly archiveSession: (sessionId: string) => Promise<void>;
@@ -59,7 +71,7 @@ function errorFrom(value: unknown): Error {
 
 export function useSessions(client: ApiClient | null): SessionsModel {
   const [sessions, setSessions] = useState<SessionRecord[]>([]);
-  const [, setConfig] = useState<ServiceConfig | null>(null);
+  const [config, setConfig] = useState<ServiceConfig | null>(null);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [loading, setLoading] = useState(client !== null);
   const [error, setError] = useState<Error | null>(null);
@@ -157,21 +169,45 @@ export function useSessions(client: ApiClient | null): SessionsModel {
     void refresh();
   }, [client, commitActiveSession, commitConfig, commitSessions, refresh]);
 
-  const createSession = useCallback(async () => {
+  const createSession = useCallback(async (
+    options?: CreateSessionOptions,
+  ): Promise<CreateSessionResult> => {
     const serviceConfig = configRef.current;
-    if (client === null || serviceConfig === null) return;
+    if (client === null || serviceConfig === null) {
+      return { ok: false, error: new Error("The local service is not ready.") };
+    }
+    const request = options ?? {
+      workspace: serviceConfig.base_workspace,
+      mode: serviceConfig.default_mode,
+      contextMode: serviceConfig.default_context_mode,
+      title: "New chat",
+    };
+    if (
+      !request.workspace.startsWith("/")
+      || request.workspace.includes("\0")
+      || request.workspace.trim() !== request.workspace
+      || !serviceConfig.modes.includes(request.mode)
+      || !serviceConfig.context_modes.includes(request.contextMode)
+      || (request.title !== undefined && request.title.trim() === "")
+    ) {
+      const validationError = new Error("Invalid session creation options.");
+      setError(validationError);
+      return { ok: false, error: validationError };
+    }
     const requestClient = client;
     const epoch = clientEpochRef.current;
     const selectionIntent = ++selectionIntentRef.current;
     mutationVersionRef.current += 1;
     try {
       const created = await requestClient.post<SessionRecord>("/api/sessions", {
-        workspace: serviceConfig.base_workspace,
-        mode: serviceConfig.default_mode,
-        context_mode: serviceConfig.default_context_mode,
-        title: "New chat",
+        workspace: request.workspace,
+        mode: request.mode,
+        context_mode: request.contextMode,
+        title: request.title ?? "New chat",
       });
-      if (!isCurrentClient(requestClient, epoch)) return;
+      if (!isCurrentClient(requestClient, epoch)) {
+        return { ok: false, error: new Error("The session client was replaced.") };
+      }
       mutationVersionRef.current += 1;
       commitSessions([
         created,
@@ -181,8 +217,11 @@ export function useSessions(client: ApiClient | null): SessionsModel {
         commitActiveSession(created.session_id);
       }
       setError(null);
+      return { ok: true, session: created };
     } catch (value) {
-      if (isCurrentClient(requestClient, epoch)) setError(errorFrom(value));
+      const operationError = errorFrom(value);
+      if (isCurrentClient(requestClient, epoch)) setError(operationError);
+      return { ok: false, error: operationError };
     }
   }, [client, commitActiveSession, commitSessions, isCurrentClient]);
 
@@ -265,6 +304,7 @@ export function useSessions(client: ApiClient | null): SessionsModel {
     activeSessionId,
     loading,
     error,
+    config,
     createSession,
     selectSession,
     renameSession,

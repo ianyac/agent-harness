@@ -1,0 +1,158 @@
+.overlay {
+  position: fixed;
+  z-index: 80;
+  inset: 0;
+  background: color-mix(in srgb, #000 30%, transparent);
+}
+
+.dialog {
+  position: fixed;
+  z-index: 81;
+  inset-block: 20px;
+  inset-inline-end: 20px;
+  width: min(520px, calc(100vw - 40px));
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-card);
+  color: var(--color-ink);
+  background: var(--color-surface);
+  box-shadow: 0 18px 50px color-mix(in srgb, #000 25%, transparent);
+  overflow: hidden;
+}
+
+.header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 20px 20px 14px;
+  border-block-end: 1px solid var(--color-border);
+}
+
+.title,
+.section h2 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.description,
+.help {
+  color: var(--color-ink-muted);
+}
+
+.description {
+  margin: 4px 0 0;
+}
+
+.iconButton {
+  display: grid;
+  flex: 0 0 44px;
+  width: 44px;
+  min-height: 44px;
+  border: 0;
+  border-radius: var(--radius-control);
+  color: inherit;
+  background: transparent;
+  place-items: center;
+  cursor: pointer;
+}
+
+.scrollArea {
+  max-height: calc(100dvh - 130px);
+  padding: 4px 20px 24px;
+  overflow: auto;
+}
+
+.section {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  padding: 18px 0;
+  border: 0;
+  border-block-end: 1px solid var(--color-border);
+}
+
+.section > legend,
+.section > h2 {
+  padding: 0;
+  font-weight: 650;
+}
+
+.inlineChoices {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.choice,
+.toggle {
+  display: flex;
+  align-items: center;
+  min-height: 44px;
+  gap: 9px;
+}
+
+.inlineChoices .choice {
+  padding-inline: 10px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-control);
+}
+
+.field {
+  display: grid;
+  gap: 5px;
+}
+
+.field select {
+  min-height: 44px;
+  padding: 7px 10px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-control);
+  color: inherit;
+  background: var(--color-page);
+}
+
+.nestedFieldset {
+  display: grid;
+  gap: 2px;
+  margin: 0;
+  padding: 8px 0 0;
+  border: 0;
+}
+
+.help {
+  margin: 0;
+  font-size: 12px;
+}
+
+.shortcutList,
+.pathList {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+}
+
+.shortcutList > div,
+.pathList > div {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: 12px;
+}
+
+.shortcutList dd,
+.pathList dd {
+  margin: 0;
+}
+
+.pathList code {
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+@media (max-width: 600px) {
+  .dialog {
+    inset: 8px;
+    width: auto;
+  }
+}

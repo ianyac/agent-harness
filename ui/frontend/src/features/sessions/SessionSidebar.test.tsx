@@ -1,6 +1,6 @@
 import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ApiClient } from "../../api/http";
 import { SessionSidebar } from "./SessionSidebar";
@@ -39,6 +39,31 @@ afterEach(() => {
 });
 
 describe("SessionSidebar", () => {
+  it("accepts a live controlled collapse preference without weakening the named rail controls", async () => {
+    const user = userEvent.setup();
+    const onCollapsedChange = vi.fn();
+    const props = {
+      sessions: [session()],
+      activeSessionId: "session-1",
+      runtimeBySession: {},
+      collapsed: false,
+      onCollapsedChange,
+      onCreate: () => {},
+      onSelect: () => {},
+      onRename: () => {},
+      onArchive: () => {},
+      onSearch: () => {},
+      onOpenSettings: () => {},
+    } as const;
+    const { rerender } = render(<SessionSidebar {...props} />);
+    await user.click(screen.getByRole("button", { name: "Collapse sidebar" }));
+    expect(onCollapsedChange).toHaveBeenCalledWith(true);
+    rerender(<SessionSidebar {...props} collapsed />);
+    expect(screen.getByRole("navigation", { name: "Sessions" })).toHaveAttribute("data-collapsed", "true");
+    expect(screen.getByRole("button", { name: "New chat" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Settings" })).toBeVisible();
+  });
+
   it("groups unarchived sessions by local recency and keeps workspace in each row name", () => {
     const sessions = [
       session(),

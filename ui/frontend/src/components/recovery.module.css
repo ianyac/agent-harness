@@ -1,0 +1,66 @@
+.recovery {
+  display: grid;
+  width: min(100%, 620px);
+  gap: 12px;
+  margin: auto;
+  padding: 24px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-card);
+  background: var(--color-surface);
+}
+
+.recovery h1,
+.recovery p {
+  margin: 0;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.actions button {
+  display: inline-flex;
+  align-items: center;
+  min-height: 44px;
+  gap: 7px;
+  padding: 8px 13px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-control);
+  color: inherit;
+  background: var(--color-page);
+  cursor: pointer;
+}
+
+.actionError {
+  color: var(--color-danger-text);
+}
+
+.connection {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--color-ink-muted);
+  font-size: 12px;
+}
+
+.reconnectBanner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  border-block-end: 1px solid var(--color-attention);
+  background: color-mix(in srgb, var(--color-attention) 12%, var(--color-surface));
+}
+
+.reconnectBanner button {
+  min-height: 44px;
+  padding: 7px 12px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-control);
+  color: inherit;
+  background: var(--color-surface);
+  cursor: pointer;
+}

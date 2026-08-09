@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { App } from "./App";
 import { ApiClient } from "./api/http";
+import type { PlatformAdapter } from "./platform/types";
 import type { SessionRecord } from "./features/sessions/useSessions";
 import { event } from "./protocol/fixtures";
 import { emptyTranscript, transcriptReducer } from "./protocol/reducer";
@@ -18,6 +19,16 @@ const storage = {
   getItem: () => null,
   setItem: () => {},
 };
+
+function platformAdapter(changes: Partial<PlatformAdapter> = {}): PlatformAdapter {
+  return {
+    kind: "browser",
+    getServiceConnection: async () => connection,
+    chooseWorkspace: async () => null,
+    notify: async () => {},
+    ...changes,
+  };
+}
 
 function session(changes: Partial<SessionRecord> = {}): SessionRecord {
   return {
@@ -76,9 +87,286 @@ async function selectSession(user: ReturnType<typeof userEvent.setup>, title: st
   );
 }
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.useRealTimers();
+  vi.unstubAllGlobals();
+});
 
 describe("App", () => {
+  it("creates the first real session from onboarding with persisted future defaults exactly once", async () => {
+    const user = userEvent.setup();
+    const values = new Map<string, string>([[
+      "agent-harness:preferences",
+      JSON.stringify({
+        version: 1,
+        appearance: "system",
+        defaultMode: "readOnly",
+        contextMode: "folding",
+        notifyPermissions: false,
+        notifyCompletions: false,
+        sidebarCollapsed: false,
+      }),
+    ]]);
+    const preferenceStorage = {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => { values.set(key, value); },
+    };
+    const createBodies: unknown[] = [];
+    const fetchRequest: typeof fetch = async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : input.toString());
+      if (url.pathname === "/api/config") return Response.json({
+        base_workspace: "/work/base",
+        default_mode: "default",
+        default_context_mode: "compaction",
+        modes: ["default", "acceptAll", "readOnly"],
+        context_modes: ["compaction", "folding"],
+      });
+      if (url.pathname === "/api/sessions" && init?.method === "GET") return Response.json([]);
+      if (url.pathname === "/api/sessions" && init?.method === "POST") {
+        createBodies.push(JSON.parse(String(init.body)));
+        return Response.json(session({
+          session_id: "first-real",
+          workspace: "/work/first",
+          title: "New chat",
+          mode: "readOnly",
+          context_mode: "folding",
+        }), { status: 201 });
+      }
+      return new Response(null, { status: 404 });
+    };
+    render(
+      <App
+        client={clientWith(fetchRequest)}
+        platformAdapter={platformAdapter()}
+        preferenceStorage={preferenceStorage}
+        sidebarStorage={storage}
+        draftStorage={storage}
+      />,
+    );
+
+    const path = await screen.findByRole("textbox", { name: "Workspace path" });
+    await user.clear(path);
+    await user.type(path, "/work/first");
+    await user.dblClick(screen.getByRole("button", { name: "Start local session" }));
+    expect(createBodies).toEqual([{
+      workspace: "/work/first",
+      mode: "readOnly",
+      context_mode: "folding",
+      title: "New chat",
+    }]);
+    expect(await screen.findByRole("heading", { name: "first" })).toBeVisible();
+    expect(screen.queryByRole("heading", { name: "Start locally" })).not.toBeInTheDocument();
+  });
+
+  it("bypasses first run, opens internal Settings from sidebar and palette, and applies defaults only to later New chat", async () => {
+    const user = userEvent.setup();
+    const onSessionEvent = vi.fn();
+    const createBodies: unknown[] = [];
+    const fetchRequest: typeof fetch = async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : input.toString());
+      if (url.pathname === "/api/config") return Response.json({
+        base_workspace: "/work/base",
+        default_mode: "default",
+        default_context_mode: "compaction",
+        modes: ["default", "acceptAll", "readOnly"],
+        context_modes: ["compaction", "folding"],
+      });
+      if (url.pathname === "/api/sessions" && init?.method === "GET") return Response.json([session()]);
+      if (url.pathname === "/api/sessions" && init?.method === "POST") {
+        createBodies.push(JSON.parse(String(init.body)));
+        return Response.json(session({ session_id: "future", workspace: "/work/base", title: "New chat", mode: "acceptAll", context_mode: "folding" }), { status: 201 });
+      }
+      return new Response(null, { status: 404 });
+    };
+    render(
+      <App
+        client={clientWith(fetchRequest)}
+        platformAdapter={platformAdapter()}
+        preferenceStorage={storage}
+        sidebarStorage={storage}
+        draftStorage={storage}
+        transcriptBySession={{ "session-a": emptyTranscript() }}
+        onSessionEvent={onSessionEvent}
+      />,
+    );
+    expect(await screen.findByRole("heading", { name: "project-a" })).toBeVisible();
+    expect(screen.queryByRole("heading", { name: "Start locally" })).not.toBeInTheDocument();
+    const navigation = screen.getByRole("navigation", { name: "Sessions" });
+
+    await user.click(screen.getByRole("button", { name: "Settings" }));
+    await user.selectOptions(screen.getByRole("combobox", { name: "Default permission mode" }), "acceptAll");
+    await user.click(screen.getByRole("radio", { name: "Recoverable folding" }));
+    await user.click(screen.getByRole("checkbox", { name: "Collapse sidebar" }));
+    expect(navigation).toHaveAttribute("data-collapsed", "true");
+    await user.keyboard("{Escape}");
+    expect(onSessionEvent).not.toHaveBeenCalled();
+
+    await user.keyboard("{Meta>}k{/Meta}");
+    await user.click(screen.getByRole("button", { name: "Open settings" }));
+    expect(screen.getByRole("dialog", { name: "Settings" })).toBeVisible();
+    await user.keyboard("{Escape}");
+    await user.click(screen.getByRole("button", { name: "New chat" }));
+    await waitFor(() => expect(createBodies).toHaveLength(1));
+    expect(createBodies[0]).toEqual({
+      workspace: "/work/base",
+      mode: "acceptAll",
+      context_mode: "folding",
+      title: "New chat",
+    });
+    expect(onSessionEvent).not.toHaveBeenCalled();
+  });
+
+  it("projects any transcript turn failure through the stable turn recovery view", async () => {
+    const active = session();
+    render(
+      <App
+        client={clientWithSessions([active])}
+        platformAdapter={platformAdapter()}
+        sidebarStorage={storage}
+        draftStorage={storage}
+        transcriptBySession={{
+          [active.session_id]: {
+            ...emptyTranscript(),
+            error: { category: "provider_internal_detail", message: "secret provider trace" },
+          },
+        }}
+      />,
+    );
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "The turn stopped before it completed.",
+    );
+    expect(screen.getByRole("alert")).not.toHaveTextContent("secret provider trace");
+  });
+
+  it("checks authenticated health before exposing a platform client as connected", async () => {
+    const paths: string[] = [];
+    const fetchRequest: typeof fetch = async (input) => {
+      const path = new URL(input instanceof Request ? input.url : input.toString()).pathname;
+      paths.push(path);
+      if (path === "/api/health") return Response.json({ status: "ok" });
+      if (path === "/api/config") return Response.json({
+        base_workspace: "/work/base",
+        default_mode: "default",
+        default_context_mode: "compaction",
+        modes: ["default", "acceptAll", "readOnly"],
+        context_modes: ["compaction", "folding"],
+      });
+      if (path === "/api/sessions") return Response.json([session()]);
+      return new Response(null, { status: 404 });
+    };
+    vi.stubGlobal("fetch", fetchRequest);
+    render(
+      <App
+        platformAdapter={platformAdapter()}
+        sidebarStorage={storage}
+        draftStorage={storage}
+      />,
+    );
+    expect(await screen.findByRole("heading", { name: "project-a" })).toBeVisible();
+    expect(paths[0]).toBe("/api/health");
+    expect(screen.getByRole("status", { name: "Local service connected" })).toBeVisible();
+  });
+
+  it("derives zero-session onboarding checking and ready states from current session readiness", async () => {
+    const sessions = deferred<Response>();
+    const config = deferred<Response>();
+    const fetchRequest: typeof fetch = async (input) => {
+      const path = new URL(input instanceof Request ? input.url : input.toString()).pathname;
+      return path === "/api/sessions" ? sessions.promise : config.promise;
+    };
+    render(
+      <App
+        client={clientWith(fetchRequest)}
+        platformAdapter={platformAdapter()}
+        sidebarStorage={storage}
+        draftStorage={storage}
+      />,
+    );
+    expect(screen.getByRole("status", { name: "Checking local service" })).toBeVisible();
+    expect(screen.queryByRole("textbox", { name: "Workspace path" })).not.toBeInTheDocument();
+
+    sessions.resolve(Response.json([]));
+    config.resolve(Response.json({
+      base_workspace: "/work/base",
+      default_mode: "default",
+      default_context_mode: "compaction",
+      modes: ["default", "acceptAll", "readOnly"],
+      context_modes: ["compaction", "folding"],
+    }));
+    expect(await screen.findByRole("textbox", { name: "Workspace path" })).toHaveValue("/work/base");
+  });
+
+  it("escalates a current refresh failure after ten seconds and a successful retry clears it", async () => {
+    vi.useFakeTimers();
+    let lists = 0;
+    const fetchRequest: typeof fetch = async (input) => {
+      const path = new URL(input instanceof Request ? input.url : input.toString()).pathname;
+      if (path === "/api/config") return Response.json({
+        base_workspace: "/work/base",
+        default_mode: "default",
+        default_context_mode: "compaction",
+        modes: ["default", "acceptAll", "readOnly"],
+        context_modes: ["compaction", "folding"],
+      });
+      if (path === "/api/sessions") {
+        lists += 1;
+        return lists === 1
+          ? Response.json({ error: { type: "request_failed", message: "Service unavailable" } }, { status: 503 })
+          : Response.json([session()]);
+      }
+      return new Response(null, { status: 404 });
+    };
+    render(
+      <App
+        client={clientWith(fetchRequest)}
+        platformAdapter={platformAdapter()}
+        sidebarStorage={storage}
+        draftStorage={storage}
+      />,
+    );
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(screen.getByRole("status", { name: "Local service reconnecting" })).toBeVisible();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+    expect(screen.getByRole("alert")).toHaveTextContent("Still reconnecting to the local service");
+    fireEvent.click(screen.getByRole("button", { name: "Retry connection" }));
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(screen.getByRole("status", { name: "Local service connected" })).toBeVisible();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    vi.useRealTimers();
+  });
+
+  it("does not let a stale failed refresh flip a replacement client into reconnecting", async () => {
+    const oldSessions = deferred<Response>();
+    const oldConfig = deferred<Response>();
+    const oldClient = clientWith(async (input) => {
+      const path = new URL(input instanceof Request ? input.url : input.toString()).pathname;
+      return path === "/api/sessions" ? oldSessions.promise : oldConfig.promise;
+    });
+    const replacement = clientWithSessions([session()]);
+    const props = {
+      platformAdapter: platformAdapter(),
+      sidebarStorage: storage,
+      draftStorage: storage,
+    };
+    const { rerender } = render(<App {...props} client={oldClient} />);
+    rerender(<App {...props} client={replacement} />);
+    expect(await screen.findByRole("heading", { name: "project-a" })).toBeVisible();
+
+    oldSessions.resolve(Response.json({ error: { type: "request_failed", message: "Old failure" } }, { status: 503 }));
+    oldConfig.resolve(Response.json({
+      base_workspace: "/work/old",
+      default_mode: "default",
+      default_context_mode: "compaction",
+      modes: ["default", "acceptAll", "readOnly"],
+      context_modes: ["compaction", "folding"],
+    }));
+    await act(async () => { await Promise.resolve(); });
+    expect(screen.queryByRole("status", { name: "Local service reconnecting" })).not.toBeInTheDocument();
+    expect(screen.getByRole("status", { name: "Local service connected" })).toBeVisible();
+  });
+
   it("opens selected activity detail from the transcript and overview from the header", async () => {
     const user = userEvent.setup();
     const active = session();

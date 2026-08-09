@@ -9,6 +9,8 @@ export interface PlatformAdapter {
   chooseWorkspace(): Promise<string | null>;
   notify(input: { title: string; body: string }): Promise<void>;
   openLogs?: () => Promise<void>;
+  restartService?: () => Promise<void>;
+  quit?: () => Promise<void>;
 }
 
 const capabilityPattern = /^[A-Za-z0-9_-]{43}$/;

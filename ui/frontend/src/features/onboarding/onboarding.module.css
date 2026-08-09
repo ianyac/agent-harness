@@ -1,0 +1,102 @@
+.onboarding,
+.checking {
+  display: grid;
+  min-height: 100dvh;
+  padding: 24px;
+  background: var(--color-page);
+  place-items: center;
+}
+
+.checking {
+  align-content: center;
+  gap: 8px;
+  color: var(--color-ink-muted);
+}
+
+.card {
+  display: grid;
+  width: min(100%, 520px);
+  gap: 14px;
+  padding: 28px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-conversation);
+  background: var(--color-surface);
+  box-shadow: 0 18px 50px color-mix(in srgb, #000 10%, transparent);
+}
+
+.card h1,
+.card p {
+  margin: 0;
+}
+
+.trust {
+  color: var(--color-ink-muted);
+  font-size: 13px;
+}
+
+.field {
+  display: grid;
+  gap: 6px;
+}
+
+.field input,
+.field select {
+  min-height: 44px;
+  padding: 8px 10px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-control);
+  color: inherit;
+  background: var(--color-page);
+}
+
+.contextChoices {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.contextChoices label {
+  display: flex;
+  align-items: center;
+  min-height: 44px;
+  gap: 8px;
+}
+
+.primaryButton,
+.secondaryButton,
+.card section button {
+  min-height: 44px;
+  padding: 8px 14px;
+  border-radius: var(--radius-control);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.primaryButton {
+  border: 1px solid var(--color-ink);
+  color: var(--color-surface);
+  background: var(--color-ink);
+}
+
+.secondaryButton,
+.card section button {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  gap: 8px;
+  border: 1px solid var(--color-border);
+  color: inherit;
+  background: var(--color-page);
+}
+
+.workspace {
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+.error {
+  color: var(--color-danger-text);
+}

@@ -54,6 +54,17 @@ function SessionsHarness({ api }: { api: ApiClient }) {
       <output aria-label="Session error">{model.error?.message ?? "none"}</output>
       <button type="button" onClick={() => void model.refresh()}>Refresh</button>
       <button type="button" onClick={() => void model.createSession()}>Create</button>
+      <button type="button" onClick={() => void model.createSession({
+        workspace: "/work/explicit",
+        mode: "readOnly",
+        contextMode: "folding",
+        title: "Explicit chat",
+      })}>Create explicit</button>
+      <button type="button" onClick={() => void model.createSession({
+        workspace: "relative/work",
+        mode: "readOnly",
+        contextMode: "folding",
+      })}>Create invalid</button>
       <button type="button" onClick={() => model.selectSession("session-1")}>Select session-1</button>
       <button type="button" onClick={() => model.selectSession("session-2")}>Select session-2</button>
       <button type="button" onClick={() => void model.renameSession("session-1", "First rename")}>
@@ -70,6 +81,50 @@ function SessionsHarness({ api }: { api: ApiClient }) {
 afterEach(cleanup);
 
 describe("useSessions async authority", () => {
+  it("uses explicit validated workspace and defaults for a future session", async () => {
+    const user = userEvent.setup();
+    let createBody: unknown;
+    const api = client(async (input, init) => {
+      const path = new URL(input instanceof Request ? input.url : input.toString()).pathname;
+      if (path === "/api/config") return Response.json(config);
+      if (path === "/api/sessions" && init?.method === "GET") return Response.json([]);
+      if (path === "/api/sessions" && init?.method === "POST") {
+        createBody = JSON.parse(String(init.body));
+        return Response.json(session("explicit", "Explicit chat"), { status: 201 });
+      }
+      return new Response(null, { status: 404 });
+    });
+    render(<SessionsHarness api={api} />);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Create explicit" })).toBeEnabled());
+
+    await user.click(screen.getByRole("button", { name: "Create explicit" }));
+    expect(await screen.findByText("Explicit chat", { selector: "output" })).toBeVisible();
+    expect(createBody).toEqual({
+      workspace: "/work/explicit",
+      mode: "readOnly",
+      context_mode: "folding",
+      title: "Explicit chat",
+    });
+  });
+
+  it("rejects invalid explicit options before dispatch", async () => {
+    const user = userEvent.setup();
+    let creates = 0;
+    const api = client(async (input, init) => {
+      const path = new URL(input instanceof Request ? input.url : input.toString()).pathname;
+      if (path === "/api/config") return Response.json(config);
+      if (path === "/api/sessions" && init?.method === "GET") return Response.json([]);
+      if (path === "/api/sessions" && init?.method === "POST") creates += 1;
+      return new Response(null, { status: 404 });
+    });
+    render(<SessionsHarness api={api} />);
+    await user.click(await screen.findByRole("button", { name: "Create invalid" }));
+    expect(creates).toBe(0);
+    expect(screen.getByRole("status", { name: "Session error" })).toHaveTextContent(
+      "Invalid session creation options.",
+    );
+  });
+
   it("ignores a slow refresh from a superseded client", async () => {
     const oldSessions = deferred<Response>();
     const oldConfig = deferred<Response>();

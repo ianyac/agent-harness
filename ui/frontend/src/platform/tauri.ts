@@ -43,6 +43,12 @@ export function createTauriPlatform(invoke: NativeInvoke = defaultInvoke): Platf
     async openLogs(): Promise<void> {
       await invoke<void>("open_logs");
     },
+    async restartService(): Promise<void> {
+      await invoke<void>("restart_service");
+    },
+    async quit(): Promise<void> {
+      await invoke<void>("quit");
+    },
   });
 }
 

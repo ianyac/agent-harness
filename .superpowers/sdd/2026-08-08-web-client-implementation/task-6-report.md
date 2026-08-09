@@ -218,3 +218,135 @@ Result: PASS with no whitespace errors.
 None. The real socket-owning parent still needs to implement
 `onStopSession(sessionId)` using its authoritative active turn id; that is an
 intentional boundary, not missing behavior inside this task.
+
+## Fix round 1/5 — Important review findings
+
+This round resolves only the four Important findings in `task-6-review.md`.
+The three Minor findings (`aria-expanded`, 32 px mode targets, and idle/stopping
+Escape behavior) remain intentionally unchanged.
+
+### Focused RED evidence
+
+Queue-clear authority:
+
+```text
+cd ui/frontend
+npm test -- --run src/features/conversation/Composer.test.tsx -t "queue clear|delayed clear|rejected queue"
+```
+
+Result before implementation: 3 failed, 16 skipped. A delayed clear overwrote
+new text/mode, an old-session clear contaminated the newly selected session,
+and a rejected clear had no reconciliation/retry path.
+
+Delivery authority:
+
+```text
+cd ui/frontend
+npm test -- --run src/features/conversation/Composer.test.tsx -t "deduplicates|newer failed|same-text|prior-session"
+```
+
+Result before implementation: 5 failed, 19 skipped. Duplicate Command+Enter
+dispatched twice; older success hid the newer Retry; same-text re-edit was
+cleared; prior-session success cleared the new session; and prior-session
+rejection exposed an error in the new session.
+
+IME suggestion selection:
+
+```text
+cd ui/frontend
+npm test -- --run src/features/conversation/Composer.test.tsx -t "slash suggestion with composition"
+```
+
+Result before implementation: 1 failed, 24 skipped. Composition Enter selected
+the slash command and removed `/pl` instead of leaving composition in control.
+
+Feedback contrast:
+
+```text
+cd ui/frontend
+npm test -- --run src/features/conversation/Composer.test.tsx -t "theme-aware error feedback"
+```
+
+Result before implementation: 1 failed, 25 skipped because no theme-aware
+`--color-danger-text` token existed.
+
+### Authority and reconciliation implementation
+
+- Both delivery and queue-clear operations carry the originating stable
+  `sessionId`, session epoch, edit revision, and a monotonic operation id.
+  Completion effects require both current-operation identity and matching edit
+  authority. Stale success/rejection is ignored.
+- The current operation is registered synchronously before calling `onEvent`,
+  so repeated Command+Enter and repeated clear actions for the same edit are
+  deduplicated at the action boundary without disabling the textarea.
+- A successful delayed clear restores queued text/mode only if its authority is
+  unchanged. Otherwise it preserves newer input and exposes a per-session
+  `Queue reconciliation` action that appends the cleared text without replacing
+  the current draft or mode.
+- A failed clear stays associated with its originating session and offers an
+  exact retry. Switching sessions neither applies nor displays that result in
+  the newly selected session.
+- Delivery retry stores the exact typed event on the authoritative operation.
+  Reverse-order completion, same-text re-edit, and session reuse cannot clear
+  or mis-report a newer draft.
+- Every Enter action is gated before slash selection or delivery by native IME
+  state, the composition ref, and one immediate post-composition Enter guard.
+
+### Contrast evidence
+
+Visible 12 px feedback now uses normal-text-safe theme tokens. The test reads
+the shipped token stylesheet and computes WCAG sRGB contrast ratios:
+
+```text
+error light:       #9f463f on #ffffff = 6.14:1
+error dark:        #d87970 on #24251f = 5.07:1
+neutral light:     #6e7067 on #ffffff = 5.03:1
+neutral dark:      #a9aba1 on #24251f = 6.64:1
+more-contrast light (ink):             14.33:1
+more-contrast dark (ink):              13.75:1
+```
+
+Failure feedback retains its named live status and uses `data-tone="error"`;
+non-error reconciliation feedback uses the existing readable muted-ink token.
+
+### Final GREEN verification
+
+```text
+cd ui/frontend
+npm test -- --run src/features/conversation/Composer.test.tsx src/features/conversation/ConversationSearch.test.tsx src/App.test.tsx
+```
+
+Result: 3 files passed, 36 tests passed, 0 failed (Composer 26, App 3,
+ConversationSearch 7).
+
+```text
+cd ui/frontend
+npm test -- --run
+```
+
+Result: 13 files passed, 147 tests passed, 0 failed.
+
+```text
+cd ui/frontend
+npm run typecheck
+```
+
+Result: PASS (`tsc -b --pretty false`).
+
+```text
+cd ui/frontend
+npm run build
+```
+
+Result: PASS; Vite transformed 1,930 modules and built the production bundle.
+An initial fix-round build exposed a new 500.34 kB main-chunk advisory (the
+fresh pre-fix Task 6 build was 497.44 kB). The Vite config now applies a real
+Rollup split for the existing `react-markdown`/`remark-gfm` dependency graph;
+it does not raise or silence the warning threshold. The final build has a
+333.80 kB main chunk and a 165.72 kB markdown chunk, with no warning.
+
+```text
+git diff --check
+```
+
+Result: PASS with no whitespace errors.

@@ -26,6 +26,33 @@ type ComposerProps = {
 
 type Submission = Extract<ClientEvent, { type: "send_message" | "queue_message" }>;
 
+type EditAuthority = {
+  readonly sessionId: string;
+  readonly sessionEpoch: number;
+  readonly editRevision: number;
+};
+
+type ClearOperation = EditAuthority & {
+  readonly operationId: number;
+  readonly queued: QueuedMessage;
+};
+
+type QueueReconciliation = {
+  readonly kind: "failed" | "saved";
+  readonly operation: ClearOperation;
+};
+
+type DeliveryOperation = EditAuthority & {
+  readonly operationId: number;
+  readonly submission: Submission;
+};
+
+function hasSameEditAuthority(left: EditAuthority, right: EditAuthority) {
+  return left.sessionId === right.sessionId &&
+    left.sessionEpoch === right.sessionEpoch &&
+    left.editRevision === right.editRevision;
+}
+
 const commands: ReadonlyArray<{
   readonly command: string;
   readonly label: string;
@@ -65,10 +92,23 @@ export function Composer({
   const [mode, setMode] = useState<TurnMode>("base");
   const [suggestionsDismissed, setSuggestionsDismissed] = useState(false);
   const [activeSuggestion, setActiveSuggestion] = useState(0);
-  const [pending, setPending] = useState<Submission | null>(null);
-  const [messageError, setMessageError] = useState(false);
+  const [deliveryErrors, setDeliveryErrors] = useState<
+    ReadonlyMap<string, DeliveryOperation>
+  >(() => new Map());
   const [turnError, setTurnError] = useState(false);
+  const [clearPendingSessions, setClearPendingSessions] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+  const [queueReconciliations, setQueueReconciliations] = useState<
+    ReadonlyMap<string, QueueReconciliation>
+  >(() => new Map());
   const composing = useRef(false);
+  const postCompositionEnter = useRef(false);
+  const editAuthority = useRef<EditAuthority>({ sessionId, sessionEpoch: 0, editRevision: 0 });
+  const nextDeliveryOperationId = useRef(0);
+  const currentDeliveryOperations = useRef(new Map<string, DeliveryOperation>());
+  const nextClearOperationId = useRef(0);
+  const currentClearOperations = useRef(new Map<string, ClearOperation>());
   const textboxRef = useRef<HTMLTextAreaElement>(null);
   const stopRef = useRef<HTMLButtonElement>(null);
   const previousRunning = useRef(running);
@@ -80,14 +120,26 @@ export function Composer({
   );
   const suggestionsOpen = !suggestionsDismissed && matchingCommands.length > 0;
   const blank = draft.trim() === "";
+  const deliveryError = deliveryErrors.get(sessionId) ?? null;
+  const queueReconciliation = queueReconciliations.get(sessionId) ?? null;
+  const clearPending = clearPendingSessions.has(sessionId);
+
+  if (editAuthority.current.sessionId !== sessionId) {
+    editAuthority.current = {
+      sessionId,
+      sessionEpoch: editAuthority.current.sessionEpoch + 1,
+      editRevision: 0,
+    };
+  }
 
   useEffect(() => {
     setMode("base");
     setSuggestionsDismissed(false);
     setActiveSuggestion(0);
-    setPending(null);
-    setMessageError(false);
+    setDeliveryErrors(new Map());
     setTurnError(false);
+    composing.current = false;
+    postCompositionEnter.current = false;
   }, [sessionId]);
 
   useEffect(() => {
@@ -100,15 +152,43 @@ export function Composer({
     setSuggestionsDismissed(false);
   }, [draft]);
 
-  const deliver = async (submission: Submission) => {
-    setPending(submission);
-    setMessageError(false);
+  const setDeliveryError = (
+    errorSessionId: string,
+    operation: DeliveryOperation | null,
+  ) => {
+    setDeliveryErrors((current) => {
+      const next = new Map(current);
+      if (operation === null) next.delete(errorSessionId);
+      else next.set(errorSessionId, operation);
+      return next;
+    });
+  };
+
+  const deliver = async (submission: Submission, retryOperation?: DeliveryOperation) => {
+    const origin = retryOperation ?? editAuthority.current;
+    const active = currentDeliveryOperations.current.get(origin.sessionId);
+    if (active !== undefined && hasSameEditAuthority(active, origin)) return;
+    nextDeliveryOperationId.current += 1;
+    const operation: DeliveryOperation = {
+      sessionId: origin.sessionId,
+      sessionEpoch: origin.sessionEpoch,
+      editRevision: origin.editRevision,
+      operationId: nextDeliveryOperationId.current,
+      submission,
+    };
+    currentDeliveryOperations.current.set(operation.sessionId, operation);
+    setDeliveryError(operation.sessionId, null);
     try {
       await onEvent(submission);
-      setDraft((current) => current === submission.text ? "" : current);
-      setPending(null);
+      if (currentDeliveryOperations.current.get(operation.sessionId) !== operation) return;
+      currentDeliveryOperations.current.delete(operation.sessionId);
+      if (hasSameEditAuthority(editAuthority.current, operation)) setDraft("");
     } catch {
-      setMessageError(true);
+      if (currentDeliveryOperations.current.get(operation.sessionId) !== operation) return;
+      currentDeliveryOperations.current.delete(operation.sessionId);
+      if (hasSameEditAuthority(editAuthority.current, operation)) {
+        setDeliveryError(operation.sessionId, operation);
+      }
     }
   };
 
@@ -121,20 +201,91 @@ export function Composer({
     });
   };
 
-  const clearQueue = async () => {
+  const markEdited = () => {
+    setDeliveryError(editAuthority.current.sessionId, null);
+    editAuthority.current = {
+      ...editAuthority.current,
+      editRevision: editAuthority.current.editRevision + 1,
+    };
+  };
+
+  const changeMode = (next: TurnMode) => {
+    if (next !== mode) markEdited();
+    setMode(next);
+  };
+
+  const setQueueReconciliation = (
+    reconciliationSessionId: string,
+    reconciliation: QueueReconciliation | null,
+  ) => {
+    setQueueReconciliations((current) => {
+      const next = new Map(current);
+      if (reconciliation === null) next.delete(reconciliationSessionId);
+      else next.set(reconciliationSessionId, reconciliation);
+      return next;
+    });
+  };
+
+  const setClearPending = (pendingSessionId: string, value: boolean) => {
+    setClearPendingSessions((current) => {
+      const next = new Set(current);
+      if (value) next.add(pendingSessionId);
+      else next.delete(pendingSessionId);
+      return next;
+    });
+  };
+
+  const clearQueue = async (retryOperation?: ClearOperation) => {
+    const queuedMessage = retryOperation?.queued ?? queued;
+    const operationSessionId = retryOperation?.sessionId ?? sessionId;
+    if (
+      queuedMessage === null ||
+      currentClearOperations.current.has(operationSessionId)
+    ) return;
+    const origin: EditAuthority = retryOperation ?? editAuthority.current;
+    nextClearOperationId.current += 1;
+    const operation: ClearOperation = {
+      ...origin,
+      operationId: nextClearOperationId.current,
+      queued: queuedMessage,
+    };
+    currentClearOperations.current.set(operation.sessionId, operation);
+    setQueueReconciliation(operation.sessionId, null);
+    setClearPending(operation.sessionId, true);
     try {
       await onEvent({ type: "clear_queued_message" });
-      setDraft(queued?.text ?? "");
-      setMode(queued?.mode ?? "base");
-      textboxRef.current?.focus();
+      if (currentClearOperations.current.get(operation.sessionId) !== operation) return;
+      currentClearOperations.current.delete(operation.sessionId);
+      setClearPending(operation.sessionId, false);
+      if (hasSameEditAuthority(editAuthority.current, operation)) {
+        markEdited();
+        setDraft(operation.queued.text);
+        setMode(operation.queued.mode);
+        textboxRef.current?.focus();
+      } else {
+        setQueueReconciliation(operation.sessionId, { kind: "saved", operation });
+      }
     } catch {
-      setMessageError(true);
+      if (currentClearOperations.current.get(operation.sessionId) !== operation) return;
+      currentClearOperations.current.delete(operation.sessionId);
+      setClearPending(operation.sessionId, false);
+      setQueueReconciliation(operation.sessionId, { kind: "failed", operation });
     }
+  };
+
+  const appendClearedFollowUp = (operation: ClearOperation) => {
+    markEdited();
+    setDraft((current) => current === ""
+      ? operation.queued.text
+      : `${current}\n${operation.queued.text}`);
+    setQueueReconciliation(operation.sessionId, null);
+    textboxRef.current?.focus();
   };
 
   const chooseCommand = (index: number) => {
     const selected = matchingCommands[index];
     if (selected === undefined) return;
+    markEdited();
     setMode(selected.mode);
     setDraft(draft.replace(/^\/\S+\s*/, ""));
     setSuggestionsDismissed(true);
@@ -173,7 +324,12 @@ export function Composer({
               <span className={styles.queuedLabel}>Queued · {queued.mode === "plan" ? "Plan" : "Base"}</span>
               <span className={styles.queuedText}>{queued.text}</span>
             </div>
-            <button type="button" aria-label="Edit queued follow-up" onClick={() => void clearQueue()}>
+            <button
+              type="button"
+              aria-label="Edit queued follow-up"
+              disabled={clearPending}
+              onClick={() => void clearQueue()}
+            >
               <X aria-hidden="true" size={16} />
             </button>
           </div>
@@ -208,14 +364,28 @@ export function Composer({
             rows={3}
             placeholder={running ? "Add a follow-up…" : "Message Agent Harness…"}
             value={draft}
-            onChange={(event) => setDraft(event.target.value)}
+            onChange={(event) => {
+              markEdited();
+              setDraft(event.target.value);
+            }}
             onCompositionStart={() => {
               composing.current = true;
+              postCompositionEnter.current = false;
             }}
             onCompositionEnd={() => {
               composing.current = false;
+              postCompositionEnter.current = true;
             }}
             onKeyDown={(event) => {
+              if (event.key !== "Enter") postCompositionEnter.current = false;
+              if (event.key === "Enter") {
+                if (event.nativeEvent.isComposing || composing.current) return;
+                if (postCompositionEnter.current) {
+                  postCompositionEnter.current = false;
+                  event.preventDefault();
+                  return;
+                }
+              }
               if (suggestionsOpen && event.key === "ArrowDown") {
                 event.preventDefault();
                 setActiveSuggestion((index) => (index + 1) % matchingCommands.length);
@@ -238,9 +408,7 @@ export function Composer({
                 event.metaKey &&
                 !event.altKey &&
                 !event.ctrlKey &&
-                !event.shiftKey &&
-                !event.nativeEvent.isComposing &&
-                !composing.current
+                !event.shiftKey
               ) {
                 event.preventDefault();
                 submit();
@@ -263,7 +431,7 @@ export function Composer({
               type="button"
               aria-label="Base mode"
               aria-pressed={mode === "base"}
-              onClick={() => setMode("base")}
+              onClick={() => changeMode("base")}
             >
               Base
             </button>
@@ -271,7 +439,7 @@ export function Composer({
               type="button"
               aria-label="Plan mode"
               aria-pressed={mode === "plan"}
-              onClick={() => setMode("plan")}
+              onClick={() => changeMode("plan")}
             >
               Plan
             </button>
@@ -312,13 +480,55 @@ export function Composer({
           )}
         </div>
 
-        {messageError && pending !== null ? (
-          <div className={styles.feedback} role="status" aria-label="Message status">
+        {deliveryError !== null ? (
+          <div
+            className={styles.feedback}
+            role="status"
+            aria-label="Message status"
+            data-tone="error"
+          >
             <span>Message not sent. Your draft is safe.</span>
-            <button type="button" aria-label="Retry message" onClick={() => void deliver(pending)}>
+            <button
+              type="button"
+              aria-label="Retry message"
+              onClick={() => void deliver(deliveryError.submission, deliveryError)}
+            >
               <RotateCcw aria-hidden="true" size={15} />
               Retry
             </button>
+          </div>
+        ) : null}
+        {queueReconciliation !== null ? (
+          <div
+            className={styles.feedback}
+            role="status"
+            aria-label="Queue reconciliation"
+            data-tone={queueReconciliation.kind === "failed" ? "error" : "neutral"}
+          >
+            {queueReconciliation.kind === "failed" ? (
+              <>
+                <span>Queued follow-up was not cleared.</span>
+                <button
+                  type="button"
+                  aria-label="Retry clearing follow-up"
+                  onClick={() => void clearQueue(queueReconciliation.operation)}
+                >
+                  <RotateCcw aria-hidden="true" size={15} />
+                  Retry
+                </button>
+              </>
+            ) : (
+              <>
+                <span>Cleared follow-up saved: {queueReconciliation.operation.queued.text}</span>
+                <button
+                  type="button"
+                  aria-label="Append cleared follow-up"
+                  onClick={() => appendClearedFollowUp(queueReconciliation.operation)}
+                >
+                  Append
+                </button>
+              </>
+            )}
           </div>
         ) : null}
         <span className={styles.srOnly} role="status" aria-label="Turn status" aria-live="polite">

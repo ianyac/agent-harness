@@ -5,8 +5,18 @@ import { defineConfig } from "vite";
 
 export default defineConfig({
   base: "./",
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          markdown: ["react-markdown", "remark-gfm"],
+        },
+      },
+    },
+  },
   plugins: [react()],
   test: {
+    css: true,
     environment: "jsdom",
     setupFiles: "./src/test/setup.ts",
   },

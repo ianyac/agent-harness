@@ -9,6 +9,7 @@
   --color-attention: #c58b35;
   --color-danger: #b95d55;
   --color-danger-strong: #9f463f;
+  --color-danger-text: #9f463f;
   --color-accent: #386f52;
   --color-focus-ring: #386f52;
   --color-border: #d8d8d1;
@@ -41,6 +42,7 @@
     --color-ink: #f2f2ec;
     --color-ink-muted: #a9aba1;
     --color-ink-small: #a9aba1;
+    --color-danger-text: #d87970;
     --color-accent: #9cc9a7;
     --color-focus-ring: #9cc9a7;
     --color-border: #393a34;
@@ -55,6 +57,7 @@
   --color-ink: #292b24;
   --color-ink-muted: #6e7067;
   --color-ink-small: #63655d;
+  --color-danger-text: #9f463f;
   --color-accent: #386f52;
   --color-focus-ring: #386f52;
   --color-border: #d8d8d1;
@@ -68,6 +71,7 @@
   --color-ink: #f2f2ec;
   --color-ink-muted: #a9aba1;
   --color-ink-small: #a9aba1;
+  --color-danger-text: #d87970;
   --color-accent: #9cc9a7;
   --color-focus-ring: #9cc9a7;
   --color-border: #393a34;
@@ -85,6 +89,7 @@
   :root {
     --color-ink-muted: var(--color-ink);
     --color-ink-small: var(--color-ink);
+    --color-danger-text: var(--color-ink);
     --color-border: var(--color-ink);
     --focus-ring: 0 0 0 4px var(--color-focus-ring);
   }

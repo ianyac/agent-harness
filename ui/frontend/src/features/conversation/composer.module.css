@@ -197,8 +197,12 @@
   justify-content: space-between;
   gap: 8px;
   padding: 2px 7px 7px 12px;
-  color: var(--color-danger);
+  color: var(--color-ink-muted);
   font-size: 12px;
+}
+
+.feedback[data-tone="error"] {
+  color: var(--color-danger-text);
 }
 
 .feedback button {

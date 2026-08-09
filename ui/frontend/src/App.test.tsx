@@ -1,10 +1,11 @@
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { App } from "./App";
 import { ApiClient } from "./api/http";
 import type { SessionRecord } from "./features/sessions/useSessions";
+import { emptyTranscript } from "./protocol/reducer";
 
 const connection = {
   baseUrl: "http://127.0.0.1:4010",
@@ -91,6 +92,7 @@ describe("App", () => {
       <App
         client={clientWith(fetchRequest)}
         sidebarStorage={storage}
+        draftStorage={storage}
         onSessionEvent={onSessionEvent}
       />,
     );
@@ -120,5 +122,63 @@ describe("App", () => {
       expect(screen.queryByRole("dialog", { name: "Enable accept all?" })).not.toBeInTheDocument(),
     );
     expect(onSessionEvent).not.toHaveBeenCalled();
+  });
+
+  it("routes typed composer events for the active session and keeps Command+F ownership singular", async () => {
+    const user = userEvent.setup();
+    const onSessionEvent = vi.fn();
+    const fetchRequest: typeof fetch = async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : input.toString());
+      if (url.pathname === "/api/config") {
+        return Response.json({
+          base_workspace: "/work/project-a",
+          default_mode: "default",
+          default_context_mode: "compaction",
+          modes: ["default", "acceptAll", "readOnly"],
+          context_modes: ["compaction", "folding"],
+        });
+      }
+      if (url.pathname === "/api/sessions" && init?.method === "GET") {
+        return Response.json([session()]);
+      }
+      return new Response(null, { status: 404 });
+    };
+    const transcript = {
+      ...emptyTranscript(),
+      messages: [{ role: "assistant", content: "Searchable answer" }],
+    };
+
+    render(
+      <App
+        client={clientWith(fetchRequest)}
+        sidebarStorage={storage}
+        draftStorage={storage}
+        transcriptBySession={{ "session-a": transcript }}
+        onSessionEvent={onSessionEvent}
+      />,
+    );
+
+    const textbox = await screen.findByRole("textbox", { name: "Message" });
+    expect(screen.getByText("Searchable answer")).toBeVisible();
+    await user.type(textbox, "routed message");
+    await user.keyboard("{Meta>}{Enter}{/Meta}");
+
+    expect(onSessionEvent).toHaveBeenCalledWith("session-a", {
+      type: "send_message",
+      text: "routed message",
+      mode: "base",
+    });
+    await waitFor(() => expect(textbox).toHaveValue(""));
+    await user.type(textbox, "draft survives search");
+    await act(async () => {
+      fireEvent.keyDown(window, { key: "f", metaKey: true });
+      await Promise.resolve();
+    });
+    expect(screen.getAllByRole("searchbox", { name: "Search conversation" })).toHaveLength(1);
+    expect(textbox).toHaveValue("draft survives search");
+    await user.click(screen.getByRole("button", { name: "Close conversation search" }));
+    await waitFor(() =>
+      expect(screen.queryByRole("searchbox", { name: "Search conversation" })).not.toBeInTheDocument(),
+    );
   });
 });

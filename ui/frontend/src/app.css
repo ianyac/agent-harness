@@ -18,8 +18,9 @@
 .conversation-shell {
   display: grid;
   flex: 1;
-  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr) auto;
   min-width: 0;
+  min-height: 100dvh;
 }
 
 .conversation-header {
@@ -34,8 +35,7 @@
   font-weight: 600;
 }
 
-.transcript {
-  width: min(100%, var(--transcript-measure));
+.conversation-main {
   min-height: 0;
-  margin-inline: auto;
+  overflow: hidden;
 }

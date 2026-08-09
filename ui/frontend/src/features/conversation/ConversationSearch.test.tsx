@@ -33,6 +33,7 @@ describe("Conversation search", () => {
     const user = userEvent.setup();
     render(
       <Conversation
+        ownsSearchShortcut
         state={state([
           { role: "user", content: "Alpha starts here, then alpha repeats." },
           { role: "assistant", content: "The final alpha is here." },
@@ -61,6 +62,7 @@ describe("Conversation search", () => {
     const user = userEvent.setup();
     render(
       <Conversation
+        ownsSearchShortcut
         state={state([
           { role: "user", content: "First needle" },
           { role: "assistant", content: "Second needle" },
@@ -82,6 +84,7 @@ describe("Conversation search", () => {
     const user = userEvent.setup();
     render(
       <Conversation
+        ownsSearchShortcut
         state={state([
           { role: "user", content: "One match" },
           { role: "assistant", content: "Another match" },
@@ -107,6 +110,7 @@ describe("Conversation search", () => {
     const user = userEvent.setup();
     render(
       <Conversation
+        ownsSearchShortcut
         state={state([
           { role: "user", content: "First needle" },
           { role: "assistant", content: "Second needle" },
@@ -139,6 +143,7 @@ describe("Conversation search", () => {
     const user = userEvent.setup();
     render(
       <Conversation
+        ownsSearchShortcut
         state={state([
           { role: "user", content: "Keep-alpha-without padding." },
           { role: "assistant", content: "Only this has one exact  alpha  occurrence." },
@@ -157,6 +162,7 @@ describe("Conversation search", () => {
     const user = userEvent.setup();
     render(
       <Conversation
+        ownsSearchShortcut
         state={state([{ role: "assistant", content: "Searchable" }])}
         openInspector={() => {}}
       />,
@@ -166,5 +172,31 @@ describe("Conversation search", () => {
     const search = screen.getByRole("searchbox", { name: "Search conversation" });
     expect(search).toHaveFocus();
     expect(getComputedStyle(search).outlineStyle).toBe("solid");
+  });
+
+  it("does not intercept Command+F when this instance does not own the shortcut", () => {
+    render(
+      <>
+        <label>
+          Draft
+          <textarea defaultValue="keep typing" />
+        </label>
+        <Conversation state={state([])} openInspector={() => {}} />
+      </>,
+    );
+    const draft = screen.getByRole("textbox", { name: "Draft" });
+    draft.focus();
+    const shortcut = new KeyboardEvent("keydown", {
+      key: "f",
+      metaKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+
+    window.dispatchEvent(shortcut);
+
+    expect(shortcut.defaultPrevented).toBe(false);
+    expect(draft).toHaveFocus();
+    expect(screen.queryByRole("searchbox", { name: "Search conversation" })).not.toBeInTheDocument();
   });
 });

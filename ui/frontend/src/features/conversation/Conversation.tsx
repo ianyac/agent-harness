@@ -19,6 +19,7 @@ type ConversationProps = {
   readonly state: TranscriptState;
   readonly openInspector: (activityId: string) => void;
   readonly copyText?: CopyText;
+  readonly ownsSearchShortcut?: boolean;
 };
 
 const NEAR_BOTTOM_PX = 80;
@@ -31,7 +32,12 @@ function isActivityGroup(item: GroupedTimelineItem): item is ActivityGroup {
   return Array.isArray(item);
 }
 
-export function Conversation({ state, openInspector, copyText }: ConversationProps) {
+export function Conversation({
+  state,
+  openInspector,
+  copyText,
+  ownsSearchShortcut = false,
+}: ConversationProps) {
   const instanceId = useId().replaceAll(":", "");
   const scrollerRef = useRef<HTMLDivElement>(null);
   const wasNearBottom = useRef(true);
@@ -88,6 +94,7 @@ export function Conversation({ state, openInspector, copyText }: ConversationPro
   const contentVersion = `${state.generation}:${state.lastSequence}:${visibleMessages.length}:${state.streamingText.length}:${state.activityOrder.length}`;
 
   useEffect(() => {
+    if (!ownsSearchShortcut) return;
     const onKeyDown = (event: KeyboardEvent) => {
       if (!event.metaKey || event.ctrlKey || event.altKey || event.shiftKey || event.repeat) return;
       if (event.key.toLocaleLowerCase() !== "f") return;
@@ -99,7 +106,7 @@ export function Conversation({ state, openInspector, copyText }: ConversationPro
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [searchOpen]);
+  }, [ownsSearchShortcut, searchOpen]);
 
   useEffect(() => {
     if (previousRunning.current && !state.running) {

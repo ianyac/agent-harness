@@ -8,7 +8,9 @@ import type {
   GroupedTimelineItem,
   TimelineMarker,
 } from "../activity/groupActivities";
-import type { ActivityItem, TranscriptState } from "../../protocol/types";
+import { PermissionCard } from "../permissions/PermissionCard";
+import { PlanReviewCard } from "../plan-review/PlanReviewCard";
+import type { ActivityItem, ClientEvent, TranscriptState } from "../../protocol/types";
 import type { CopyText } from "./CodeBlock";
 import { ConversationSearch } from "./ConversationSearch";
 import type { SearchableMessage } from "./ConversationSearch";
@@ -20,6 +22,7 @@ type ConversationProps = {
   readonly openInspector: (activityId: string) => void;
   readonly copyText?: CopyText;
   readonly ownsSearchShortcut?: boolean;
+  readonly onSessionEvent?: (event: ClientEvent) => void | Promise<void>;
 };
 
 const NEAR_BOTTOM_PX = 80;
@@ -37,6 +40,7 @@ export function Conversation({
   openInspector,
   copyText,
   ownsSearchShortcut = false,
+  onSessionEvent = () => {},
 }: ConversationProps) {
   const instanceId = useId().replaceAll(":", "");
   const scrollerRef = useRef<HTMLDivElement>(null);
@@ -181,6 +185,29 @@ export function Conversation({
               );
             }
             if (item.kind === "boundary") return null;
+            if (item.kind === "permission") {
+              return (
+                <PermissionCard
+                  key={`permission-${item.request.requestId}`}
+                  request={item.request}
+                  resolution={item.resolution}
+                  active={state.permission?.requestId === item.request.requestId}
+                  safety={state.safety}
+                  onAnswer={onSessionEvent}
+                />
+              );
+            }
+            if (item.kind === "plan_review") {
+              return (
+                <PlanReviewCard
+                  key={`plan-review-${item.request.requestId}`}
+                  request={item.request}
+                  resolution={item.resolution}
+                  active={state.planReview?.requestId === item.request.requestId}
+                  onAnswer={onSessionEvent}
+                />
+              );
+            }
             return (
               <Message
                 key={`timeline-${timelineIndex}`}

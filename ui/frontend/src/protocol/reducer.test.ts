@@ -89,9 +89,27 @@ describe("transcriptReducer", () => {
       { kind: "activity", activityId: "read-1" },
       { kind: "assistant", text: "I found context.", messageIndex: 0 },
       { kind: "activity", activityId: "read-2" },
-      { kind: "boundary", boundary: "permission" },
+      {
+        kind: "permission",
+        request: {
+          turnId: "t1",
+          requestId: "p1",
+          action: "write_file",
+          scope: "README.md",
+          reason: "Needs an edit",
+        },
+        resolution: null,
+      },
       { kind: "activity", activityId: "write-1" },
-      { kind: "boundary", boundary: "plan_review" },
+      {
+        kind: "plan_review",
+        request: {
+          turnId: "t1",
+          requestId: "r1",
+          plan: "1. Make the change",
+        },
+        resolution: null,
+      },
       { kind: "activity", activityId: "agent-1" },
       { kind: "activity", activityId: "bash-1" },
       { kind: "boundary", boundary: "activity_error" },
@@ -473,6 +491,116 @@ describe("transcriptReducer", () => {
     expect(state.planReview?.requestId).toBe("r2");
     state = transcriptReducer(state, event("plan_approval_resolved", { sequence: 8, request_id: "r2" }));
     expect(state.planReview).toBeNull();
+  });
+
+  it("anchors every permission request and updates only its matching historical decision", () => {
+    let state = transcriptReducer(emptyTranscript(), event("turn_started", { sequence: 1 }));
+    state = transcriptReducer(state, event("assistant_delta", { sequence: 2, text: "Before" }));
+    state = transcriptReducer(state, event("permission_requested", {
+      sequence: 3,
+      request_id: "permission-one",
+      action: "write_file",
+      scope: '{"path":"README.md"}',
+      reason: "The file must be updated",
+    }));
+    state = transcriptReducer(state, event("activity_started", {
+      sequence: 4,
+      activity_id: "read-after-permission",
+    }));
+    state = transcriptReducer(state, event("permission_requested", {
+      sequence: 5,
+      request_id: "permission-two",
+      action: "web_fetch",
+      scope: '{"url":"https://example.com"}',
+      reason: "Current documentation is needed",
+    }));
+    state = transcriptReducer(state, event("permission_resolved", {
+      sequence: 6,
+      request_id: "permission-one",
+      answer: "no",
+    }));
+
+    expect(state.permission?.requestId).toBe("permission-two");
+    expect(timelineOf(state)).toEqual([
+      { kind: "assistant", text: "Before", messageIndex: null },
+      {
+        kind: "permission",
+        request: {
+          turnId: "t1",
+          requestId: "permission-one",
+          action: "write_file",
+          scope: '{"path":"README.md"}',
+          reason: "The file must be updated",
+        },
+        resolution: { answer: "no" },
+      },
+      { kind: "activity", activityId: "read-after-permission" },
+      {
+        kind: "permission",
+        request: {
+          turnId: "t1",
+          requestId: "permission-two",
+          action: "web_fetch",
+          scope: '{"url":"https://example.com"}',
+          reason: "Current documentation is needed",
+        },
+        resolution: null,
+      },
+    ]);
+  });
+
+  it("keeps resolved plan reviews anchored after clearing the matching active request", () => {
+    let state = transcriptReducer(emptyTranscript(), event("turn_started", { sequence: 1 }));
+    state = transcriptReducer(state, event("activity_started", {
+      sequence: 2,
+      activity_id: "plan-context",
+    }));
+    state = transcriptReducer(state, event("plan_approval_requested", {
+      sequence: 3,
+      request_id: "plan-one",
+      plan: "## Proposed plan\n\n1. Make the change",
+    }));
+    state = transcriptReducer(state, event("plan_approval_resolved", {
+      sequence: 4,
+      request_id: "plan-one",
+      approved: false,
+      feedback: "Add verification",
+    }));
+    state = transcriptReducer(state, event("assistant_delta", { sequence: 5, text: "Revising" }));
+
+    expect(state.planReview).toBeNull();
+    expect(timelineOf(state)).toEqual([
+      { kind: "activity", activityId: "plan-context" },
+      {
+        kind: "plan_review",
+        request: {
+          turnId: "t1",
+          requestId: "plan-one",
+          plan: "## Proposed plan\n\n1. Make the change",
+        },
+        resolution: { approved: false, feedback: "Add verification" },
+      },
+      { kind: "assistant", text: "Revising", messageIndex: null },
+    ]);
+  });
+
+  it("clears active blockers at a terminal event without removing anchored decisions", () => {
+    let state = transcriptReducer(emptyTranscript(), event("turn_started", { sequence: 1 }));
+    state = transcriptReducer(state, event("permission_requested", {
+      sequence: 2,
+      request_id: "terminal-permission",
+    }));
+    state = transcriptReducer(state, event("turn_cancelled", { sequence: 3 }));
+
+    expect(state.permission).toBeNull();
+    expect(timelineOf(state)).toEqual([
+      expect.objectContaining({
+        kind: "permission",
+        request: expect.objectContaining({ requestId: "terminal-permission" }),
+        resolution: null,
+      }),
+      { kind: "boundary", boundary: "turn_completion" },
+    ]);
   });
 
   it("restores queue state from snapshots and consumes it when the next turn starts", () => {

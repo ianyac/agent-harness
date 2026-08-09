@@ -396,6 +396,88 @@ describe("Conversation", () => {
     expect(screen.queryByText("Draft after")).not.toBeInTheDocument();
   });
 
+  it("renders persistent decisions at their chronological transcript anchors", () => {
+    let state = transcriptReducer(emptyTranscript(), event("turn_started", { sequence: 1 }));
+    state = transcriptReducer(state, event("assistant_delta", { sequence: 2, text: "Before permission" }));
+    state = transcriptReducer(state, event("permission_requested", {
+      sequence: 3,
+      request_id: "anchored-permission",
+      action: "write_file",
+      scope: '{"path":"README.md"}',
+      reason: "Update the project readme",
+    }));
+    state = transcriptReducer(state, event("permission_resolved", {
+      sequence: 4,
+      request_id: "anchored-permission",
+      answer: "yes",
+    }));
+    state = transcriptReducer(state, event("activity_started", {
+      sequence: 5,
+      activity_id: "work-between-decisions",
+      name: "write_file",
+    }));
+    state = transcriptReducer(state, event("plan_approval_requested", {
+      sequence: 6,
+      request_id: "anchored-plan",
+      plan: "## Next steps\n\n1. Verify the change",
+    }));
+    render(<Conversation state={state} openInspector={() => {}} onSessionEvent={() => {}} />);
+
+    const narration = screen.getByText("Before permission").closest("article");
+    const permission = screen.getByRole("group", { name: "Permission review" });
+    const work = screen.getByRole("button", { name: /Open activity/ });
+    const plan = screen.getByRole("group", { name: "Plan review" });
+    expect((narration?.compareDocumentPosition(permission) ?? 0) & Node.DOCUMENT_POSITION_FOLLOWING)
+      .not.toBe(0);
+    expect(permission.compareDocumentPosition(work) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+    expect(work.compareDocumentPosition(plan) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+    expect(within(permission).getByRole("status", { name: "Permission resolved" }))
+      .toHaveTextContent("Allowed once");
+    expect(within(permission).queryByRole("button")).not.toBeInTheDocument();
+  });
+
+  it("routes exact permission and plan answers from the active anchored card", async () => {
+    const user = userEvent.setup();
+    const onSessionEvent = vi.fn();
+    const permissionState = transcriptReducer(
+      emptyTranscript(),
+      event("permission_requested", {
+        sequence: 1,
+        request_id: "permission-route",
+        action: "bash",
+        scope: '{"command":"npm test"}',
+      }),
+    );
+    const { rerender } = render(
+      <Conversation
+        state={permissionState}
+        openInspector={() => {}}
+        onSessionEvent={onSessionEvent}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: /^Always for this session/ }));
+    expect(onSessionEvent).toHaveBeenCalledWith({
+      type: "answer_permission",
+      request_id: "permission-route",
+      answer: "always",
+    });
+
+    const planState = transcriptReducer(emptyTranscript(), event("plan_approval_requested", {
+      sequence: 1,
+      request_id: "plan-route",
+      plan: "1. Run checks",
+    }));
+    rerender(
+      <Conversation state={planState} openInspector={() => {}} onSessionEvent={onSessionEvent} />,
+    );
+    await user.click(screen.getByRole("button", { name: "Approve plan" }));
+    expect(onSessionEvent).toHaveBeenLastCalledWith({
+      type: "answer_plan",
+      request_id: "plan-route",
+      approved: true,
+    });
+  });
+
   it("does not render or position visually empty structured authoritative messages", () => {
     let state = transcriptReducer(emptyTranscript(), event("turn_started", { sequence: 1 }));
     state = transcriptReducer(state, event("assistant_delta", { sequence: 2, text: "Draft before" }));

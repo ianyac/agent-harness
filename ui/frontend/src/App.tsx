@@ -121,6 +121,9 @@ export function App({
               state={activeTranscript}
               openInspector={() => onToggleActivity()}
               ownsSearchShortcut
+              onSessionEvent={(event) => activeSession === null
+                ? undefined
+                : onSessionEvent(activeSession.session_id, event)}
             />
           )}
         </main>

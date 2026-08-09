@@ -258,10 +258,33 @@ export type TranscriptBoundaryTimelineItem = {
   boundary: TranscriptBoundary;
 };
 
+export type PermissionResolution = {
+  answer: PermissionDecision;
+};
+
+export type PlanReviewResolution = {
+  approved: boolean;
+  feedback: string;
+};
+
+export type TranscriptPermissionTimelineItem = {
+  kind: "permission";
+  request: PermissionRequest;
+  resolution: PermissionResolution | null;
+};
+
+export type TranscriptPlanReviewTimelineItem = {
+  kind: "plan_review";
+  request: PlanReviewRequest;
+  resolution: PlanReviewResolution | null;
+};
+
 export type TranscriptTimelineItem =
   | TranscriptActivityTimelineItem
   | TranscriptAssistantTimelineItem
-  | TranscriptBoundaryTimelineItem;
+  | TranscriptBoundaryTimelineItem
+  | TranscriptPermissionTimelineItem
+  | TranscriptPlanReviewTimelineItem;
 
 export type TranscriptState = {
   generation: number;

@@ -5,7 +5,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
 import { ApiClient } from "./api/http";
 import type { SessionRecord } from "./features/sessions/useSessions";
-import { emptyTranscript } from "./protocol/reducer";
+import { event } from "./protocol/fixtures";
+import { emptyTranscript, transcriptReducer } from "./protocol/reducer";
 import type { ClientEvent } from "./protocol/types";
 
 const connection = {
@@ -211,6 +212,60 @@ describe("App", () => {
     await waitFor(() =>
       expect(screen.queryByRole("searchbox", { name: "Search conversation" })).not.toBeInTheDocument(),
     );
+  });
+
+  it("routes inline decisions with the active session identity", async () => {
+    const user = userEvent.setup();
+    const onSessionEvent = vi.fn();
+    const sessionA = session({
+      session_id: "decision-a",
+      title: "Decision A",
+      workspace: "/work/decision-a",
+    });
+    const sessionB = session({
+      session_id: "decision-b",
+      title: "Decision B",
+      workspace: "/work/decision-b",
+    });
+    const permissionState = transcriptReducer(emptyTranscript(), event("permission_requested", {
+      sequence: 1,
+      request_id: "permission-a",
+      action: "write_file",
+      scope: '{"path":"A.md"}',
+    }));
+    const planState = transcriptReducer(emptyTranscript(), event("plan_approval_requested", {
+      sequence: 1,
+      request_id: "plan-b",
+      plan: "1. Verify B",
+    }));
+
+    render(
+      <App
+        client={clientWithSessions([sessionA, sessionB])}
+        sidebarStorage={storage}
+        draftStorage={storage}
+        transcriptBySession={{
+          [sessionA.session_id]: permissionState,
+          [sessionB.session_id]: planState,
+        }}
+        onSessionEvent={onSessionEvent}
+      />,
+    );
+
+    await user.click(await screen.findByRole("button", { name: /^Allow once/ }));
+    expect(onSessionEvent).toHaveBeenCalledWith(sessionA.session_id, {
+      type: "answer_permission",
+      request_id: "permission-a",
+      answer: "yes",
+    });
+
+    await selectSession(user, sessionB.title);
+    await user.click(screen.getByRole("button", { name: "Approve plan" }));
+    expect(onSessionEvent).toHaveBeenLastCalledWith(sessionB.session_id, {
+      type: "answer_plan",
+      request_id: "plan-b",
+      approved: true,
+    });
   });
 
   it("restores an authoritative queue clear only to session A after it resolves while B is active", async () => {

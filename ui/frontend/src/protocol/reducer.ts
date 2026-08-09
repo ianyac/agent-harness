@@ -3,8 +3,10 @@ import type {
   ActivityItem,
   ActivityStarted,
   HarnessMessage,
+  PermissionDecision,
   ServerEvent,
   TranscriptBoundary,
+  TranscriptPlanReviewTimelineItem,
   TranscriptState,
   TranscriptTimelineItem,
 } from "./types";
@@ -148,6 +150,30 @@ function boundary(
   return [...timeline, { kind: "boundary", boundary: value }];
 }
 
+function resolvePermission(
+  timeline: readonly TranscriptTimelineItem[],
+  requestId: string,
+  answer: PermissionDecision,
+): TranscriptTimelineItem[] {
+  return timeline.map((item) =>
+    item.kind === "permission" && item.request.requestId === requestId
+      ? { ...item, resolution: { answer } }
+      : item,
+  );
+}
+
+function resolvePlanReview(
+  timeline: readonly TranscriptTimelineItem[],
+  requestId: string,
+  resolution: NonNullable<TranscriptPlanReviewTimelineItem["resolution"]>,
+): TranscriptTimelineItem[] {
+  return timeline.map((item) =>
+    item.kind === "plan_review" && item.request.requestId === requestId
+      ? { ...item, resolution }
+      : item,
+  );
+}
+
 function discardUncommittedAssistants(
   timeline: readonly TranscriptTimelineItem[],
 ): TranscriptTimelineItem[] {
@@ -235,31 +261,46 @@ export function transcriptReducer(state: TranscriptState, event: ServerEvent): T
       };
     }
     case "permission_requested":
-      return {
-        ...accepted,
-        timeline: boundary(state.timeline, "permission"),
-        permission: {
+      {
+        const request = {
           turnId: event.turn_id,
           requestId: event.request_id,
           action: event.action,
           scope: event.scope,
           reason: event.reason,
-        },
-      };
+        };
+        return {
+          ...accepted,
+          timeline: [...state.timeline, { kind: "permission", request, resolution: null }],
+          permission: request,
+        };
+      }
     case "permission_resolved":
       return {
         ...accepted,
+        timeline: resolvePermission(state.timeline, event.request_id, event.answer),
         permission: state.permission?.requestId === event.request_id ? null : state.permission,
       };
     case "plan_approval_requested":
-      return {
-        ...accepted,
-        timeline: boundary(state.timeline, "plan_review"),
-        planReview: { turnId: event.turn_id, requestId: event.request_id, plan: event.plan },
-      };
+      {
+        const request = {
+          turnId: event.turn_id,
+          requestId: event.request_id,
+          plan: event.plan,
+        };
+        return {
+          ...accepted,
+          timeline: [...state.timeline, { kind: "plan_review", request, resolution: null }],
+          planReview: request,
+        };
+      }
     case "plan_approval_resolved":
       return {
         ...accepted,
+        timeline: resolvePlanReview(state.timeline, event.request_id, {
+          approved: event.approved,
+          feedback: event.feedback,
+        }),
         planReview: state.planReview?.requestId === event.request_id ? null : state.planReview,
       };
     case "context_updated":

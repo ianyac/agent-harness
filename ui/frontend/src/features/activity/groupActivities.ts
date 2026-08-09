@@ -2,10 +2,16 @@ import type {
   ActivityItem,
   TranscriptAssistantTimelineItem,
   TranscriptBoundaryTimelineItem,
+  TranscriptPermissionTimelineItem,
+  TranscriptPlanReviewTimelineItem,
 } from "../../protocol/types";
 
 export type ActivityGroup = readonly ActivityItem[];
-export type TimelineMarker = TranscriptAssistantTimelineItem | TranscriptBoundaryTimelineItem;
+export type TimelineMarker =
+  | TranscriptAssistantTimelineItem
+  | TranscriptBoundaryTimelineItem
+  | TranscriptPermissionTimelineItem
+  | TranscriptPlanReviewTimelineItem;
 export type GroupedTimelineItem = ActivityGroup | TimelineMarker;
 
 function isRoutineActivity(activity: ActivityItem): boolean {

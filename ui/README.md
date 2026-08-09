@@ -21,6 +21,25 @@ uv run pytest
 The test bootstrap uses the repository's vendored `vendor/tiktoken` cache, so
 test execution does not need network access for tokenizer assets.
 
+The browser acceptance suite serves the built Vite application on loopback,
+uses syntactically valid low-value fixture capabilities, denies unexpected
+network access, and drives the real browser adapter, HTTP client, session
+socket, reducer, and application components:
+
+```bash
+cd frontend
+npm test -- --run
+npm run typecheck
+npm run build
+npm run e2e
+```
+
+The `bundled-chromium` Playwright project covers 1440, 1100, 900, and 720 px
+layouts, keyboard/focus journeys, unsuppressed axe checks, reduced motion, and
+the approved deterministic baselines under `e2e/visual.spec.ts-snapshots/`.
+Traces and failure screenshots contain fixture data only; never run these
+fixtures with a real API capability or credential.
+
 ## Run in a browser
 
 Build the shared frontend, then start the loopback-only service from this

@@ -94,7 +94,7 @@
 }
 
 .modes button {
-  min-height: 28px;
+  min-height: 32px;
   padding-inline: 9px;
   font-size: 12px;
 }
@@ -223,7 +223,7 @@
   border: 0;
 }
 
-@media (max-width: 640px) {
+@media (max-width: 799px) {
   .composerRegion {
     padding: 0 12px 12px;
   }

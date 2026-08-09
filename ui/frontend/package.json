@@ -9,7 +9,7 @@
     "test": "vitest",
     "test:task4-browser": "node scripts/task4-browser-probe.mjs",
     "test:watch": "vitest --watch",
-    "e2e": "playwright test --pass-with-no-tests e2e",
+    "e2e": "playwright test e2e",
     "typecheck": "tsc -b --pretty false"
   },
   "dependencies": {

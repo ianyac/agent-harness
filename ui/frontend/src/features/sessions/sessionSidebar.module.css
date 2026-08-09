@@ -213,8 +213,8 @@
   inset-block-start: 4px;
   inset-inline-end: 2px;
   display: grid;
-  width: 28px;
-  min-height: 28px;
+  width: 32px;
+  min-height: 32px;
   padding: 0;
   place-items: center;
   cursor: pointer;
@@ -254,7 +254,7 @@
 
 .renameForm {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 28px 28px;
+  grid-template-columns: minmax(0, 1fr) 32px 32px;
   width: 100%;
   gap: 2px;
 }
@@ -288,6 +288,7 @@
   border-radius: 6px;
   color: inherit;
   background: transparent;
+  min-height: 32px;
   place-items: center;
 }
 

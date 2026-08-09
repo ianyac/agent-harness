@@ -122,9 +122,7 @@ export function PermissionCard({
       });
       if (operationRef.current !== operation) return;
       setSubmission("submitted");
-      const target = focusOrigin.current;
-      focusOrigin.current = null;
-      if (target?.isConnected) target.focus();
+      cardRef.current?.focus();
     } catch (reason) {
       if (operationRef.current !== operation) return;
       operationRef.current = null;

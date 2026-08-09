@@ -58,6 +58,7 @@ describe("transcriptReducer", () => {
       generation: 1,
       sequence: 4,
       turnId: "t1",
+      submissionId: null,
     });
   });
 
@@ -68,7 +69,17 @@ describe("transcriptReducer", () => {
     let state = transcriptReducer(emptyTranscript(), event("turn_started", { sequence: 1 }));
     state = transcriptReducer(state, event(eventType, { sequence: 2 }));
 
-    expect(state.terminal).toEqual({ kind, generation: 1, sequence: 2, turnId: "t1" });
+    expect(state.terminal).toEqual({ kind, generation: 1, sequence: 2, turnId: "t1", submissionId: null });
+  });
+
+  it("retains the started submission identity on a failed terminal", () => {
+    let state = transcriptReducer(emptyTranscript(), event("turn_started", {
+      sequence: 1,
+      submission_id: "submission-exact",
+    }));
+    state = transcriptReducer(state, event("turn_failed", { sequence: 2 }));
+
+    expect(state.terminal?.submissionId).toBe("submission-exact");
   });
 
   it("retains real current-turn boundaries and reconciles narration in chronological order", () => {

@@ -228,12 +228,12 @@ describe("PlanReviewCard", () => {
     expect(screen.queryByRole("button", { name: "Approve plan" })).not.toBeInTheDocument();
   });
 
-  it("focuses on arrival and restores connected focus only after a successful answer", async () => {
+  it("focuses on arrival and restores connected focus only after authority resolves", async () => {
     const user = userEvent.setup();
     render(<button type="button">Composer</button>);
     const origin = screen.getByRole("button", { name: "Composer" });
     origin.focus();
-    render(
+    const cardView = render(
       <PlanReviewCard request={request} resolution={null} active onAnswer={() => {}} />,
     );
 
@@ -243,6 +243,15 @@ describe("PlanReviewCard", () => {
       "Plan review requested",
     );
     await user.click(screen.getByRole("button", { name: "Approve plan" }));
+    await waitFor(() => expect(card).toHaveFocus());
+    cardView.rerender(
+      <PlanReviewCard
+        request={request}
+        resolution={{ approved: true, feedback: "" }}
+        active={false}
+        onAnswer={() => {}}
+      />,
+    );
     await waitFor(() => expect(origin).toHaveFocus());
   });
 

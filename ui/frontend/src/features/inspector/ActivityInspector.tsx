@@ -220,7 +220,7 @@ export function ActivityInspector({
               <span aria-hidden="true" className={styles.resizeRule} data-resize-rule />
             </div>
           ) : null}
-          <header className={styles.header}>
+          <div className={styles.header}>
             <div>
               <Dialog.Title>Activity inspector</Dialog.Title>
               <Dialog.Description>
@@ -243,7 +243,7 @@ export function ActivityInspector({
                 </button>
               </Dialog.Close>
             </div>
-          </header>
+          </div>
           <div className={styles.content}>
             {selected === undefined ? (
               <div className={styles.overview}>

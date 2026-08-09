@@ -29,7 +29,10 @@ type SessionSocketOptions = {
   readonly createWebSocket?: WebSocketFactory;
   readonly initialState?: TranscriptState;
   readonly onStateChange?: (state: TranscriptState) => void;
+  readonly onLifecycleChange?: (lifecycle: SessionSocketLifecycle) => void;
 };
+
+export type SessionSocketLifecycle = "connecting" | "connected" | "reconnecting";
 
 const openReadyState = 1;
 const reconnectMaximumMs = 10_000;
@@ -64,6 +67,7 @@ export class SessionSocket {
   readonly #createWebSocket: WebSocketFactory;
   readonly #listeners = new Set<(state: TranscriptState) => void>();
   readonly #outbound: string[] = [];
+  readonly #onLifecycleChange?: (lifecycle: SessionSocketLifecycle) => void;
   #state: TranscriptState;
   #socket: SessionSocketWebSocket | undefined;
   #socketEpoch = 0;
@@ -71,6 +75,7 @@ export class SessionSocket {
   #reconnectAttempt = 0;
   #reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   #disposed = false;
+  #lifecycle: SessionSocketLifecycle = "connecting";
 
   constructor(options: SessionSocketOptions) {
     this.#connection = normalizeServiceConnection(options.connection);
@@ -78,6 +83,7 @@ export class SessionSocket {
     this.#url = socketUrl(this.#connection.baseUrl, this.#sessionId);
     this.#createWebSocket = options.createWebSocket ?? createNativeWebSocket;
     this.#state = options.initialState ?? emptyTranscript();
+    this.#onLifecycleChange = options.onLifecycleChange;
     if (options.onStateChange !== undefined) {
       this.#listeners.add(options.onStateChange);
     }
@@ -211,6 +217,7 @@ export class SessionSocket {
       }
       this.#snapshotReady = true;
       this.#reconnectAttempt = 0;
+      this.#publishLifecycle("connected");
       this.#flush(socket);
       this.#publish(next);
       return;
@@ -282,6 +289,7 @@ export class SessionSocket {
 
   #scheduleReconnect(): void {
     if (this.#disposed || this.#reconnectTimer !== undefined) return;
+    this.#publishLifecycle("reconnecting");
     const exponent = Math.min(this.#reconnectAttempt, 4);
     const delay = Math.min(1_000 * 2 ** exponent, reconnectMaximumMs);
     this.#reconnectAttempt += 1;
@@ -295,6 +303,12 @@ export class SessionSocket {
     if (this.#reconnectTimer === undefined) return;
     clearTimeout(this.#reconnectTimer);
     this.#reconnectTimer = undefined;
+  }
+
+  #publishLifecycle(next: SessionSocketLifecycle): void {
+    if (this.#lifecycle === next) return;
+    this.#lifecycle = next;
+    this.#onLifecycleChange?.(next);
   }
 
   #isCurrent(epoch: number, socket: SessionSocketWebSocket): boolean {

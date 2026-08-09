@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { ApiClient } from "./api/http";
+import { useSessionSockets } from "./api/useSessionSockets";
 import { CommandPalette } from "./components/CommandPalette";
 import { ConnectionStatus as ServiceStatus } from "./components/ConnectionStatus";
 import { RecoveryView } from "./components/RecoveryView";
@@ -22,7 +23,7 @@ import { NotificationObserver } from "./features/settings/NotificationObserver";
 import { Settings } from "./features/settings/Settings";
 import type { PreferenceStorage } from "./features/settings/preferences";
 import { usePreferences } from "./features/settings/preferences";
-import type { PlatformAdapter } from "./platform/types";
+import type { PlatformAdapter, ServiceConnection } from "./platform/types";
 import { emptyTranscript } from "./protocol/reducer";
 import type { ClientEvent, SendMessage, TranscriptState, TranscriptTerminal } from "./protocol/types";
 
@@ -83,11 +84,11 @@ type AppProps = {
 
 export function App({
   client: providedClient,
-  runtimeBySession = {},
-  transcriptBySession = {},
+  runtimeBySession: providedRuntimeBySession,
+  transcriptBySession: providedTranscriptBySession,
   branchBySession = {},
-  onSessionEvent = () => {},
-  onStopSession = () => {},
+  onSessionEvent: providedOnSessionEvent,
+  onStopSession: providedOnStopSession,
   onOpenSettings = () => {},
   onToggleActivity = () => {},
   onLocateWorkspace = () => {},
@@ -100,12 +101,13 @@ export function App({
 }: AppProps) {
   const [connection, setConnection] = useState<{
     readonly client: ApiClient | null;
+    readonly service: ServiceConnection | null;
     readonly status: ConnectionStatus;
     readonly platform: PlatformAdapter | null;
   }>(() =>
     providedClient === undefined
-      ? { client: null, status: "connecting", platform: platformAdapter ?? null }
-      : { client: providedClient, status: "connected", platform: platformAdapter ?? null },
+      ? { client: null, service: null, status: "connecting", platform: platformAdapter ?? null }
+      : { client: providedClient, service: null, status: "connected", platform: platformAdapter ?? null },
   );
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -130,14 +132,14 @@ export function App({
     if (providedClient !== undefined) {
       bootstrapPendingRef.current = false;
       setBootstrapLifecycle(null);
-      setConnection({ client: providedClient, status: "connected", platform: platformAdapter ?? null });
+      setConnection({ client: providedClient, service: null, status: "connected", platform: platformAdapter ?? null });
       return;
     }
     let current = true;
     let currentPlatform = platformAdapter ?? null;
     bootstrapPendingRef.current = true;
     setBootstrapLifecycle({ status: "checking", attempt: bootstrapAttempt, retrying: true });
-    setConnection({ client: null, status: "connecting", platform: platformAdapter ?? null });
+    setConnection({ client: null, service: null, status: "connecting", platform: platformAdapter ?? null });
     const loadPlatform = platformAdapter === undefined
       ? import("./platform").then(({ platform }) => platform)
       : Promise.resolve(platformAdapter);
@@ -147,13 +149,13 @@ export function App({
         const service = await platform.getServiceConnection();
         const client = new ApiClient(service);
         await client.get<ServiceHealth>("/api/health");
-        return { platform, client };
+        return { platform, client, service };
       })
-      .then(({ platform, client }) => {
+      .then(({ platform, client, service }) => {
         if (current) {
           bootstrapPendingRef.current = false;
           setBootstrapLifecycle(null);
-          setConnection({ client, status: "connected", platform });
+          setConnection({ client, service, status: "connected", platform });
         }
       })
       .catch(() => {
@@ -164,7 +166,7 @@ export function App({
             attempt: bootstrapAttempt,
             retrying: false,
           });
-          setConnection({ client: null, status: "connecting", platform: currentPlatform });
+          setConnection({ client: null, service: null, status: "connecting", platform: currentPlatform });
         }
       });
     return () => {
@@ -179,6 +181,15 @@ export function App({
   };
 
   const sessionsModel = useSessions(connection.client, sidebarStorage);
+  const sessionIds = useMemo(
+    () => sessionsModel.sessions.map((session) => session.session_id),
+    [sessionsModel.sessions],
+  );
+  const socketModel = useSessionSockets(connection.service, sessionIds);
+  const runtimeBySession = providedRuntimeBySession ?? socketModel.runtimeBySession;
+  const transcriptBySession = providedTranscriptBySession ?? socketModel.transcriptBySession;
+  const onSessionEvent = providedOnSessionEvent ?? socketModel.send;
+  const onStopSession = providedOnStopSession ?? socketModel.stop;
   const activeSession = useMemo(
     () =>
       sessionsModel.sessions.find(
@@ -305,7 +316,23 @@ export function App({
         observedTurnRef.current.delete(sessionId);
       }
       const activeTurn = transcript.activeTurn;
-      if (activeTurn === null) continue;
+      if (activeTurn === null) {
+        const terminal = transcript.terminal;
+        if (terminal?.submissionId === null || terminal?.submissionId === undefined) continue;
+        const candidate = pendingSubmissionRef.current.get(sessionId)?.get(terminal.submissionId);
+        if (
+          candidate !== undefined
+          && candidate.client === connection.client
+          && candidate.dispatcher === onSessionEvent
+          && candidate.generation === terminal.generation
+        ) {
+          boundSubmissionRef.current.set(sessionId, { ...candidate, turnId: terminal.turnId });
+          pendingSubmissionRef.current.delete(sessionId);
+          queuedSubmissionRef.current.delete(sessionId);
+          setRetryRevision((revision) => revision + 1);
+        }
+        continue;
+      }
       const identity = `${activeTurn.generation}:${activeTurn.sequence}:${activeTurn.turnId}:${activeTurn.submissionId ?? "legacy"}`;
       if (observedTurnRef.current.get(sessionId) === identity) continue;
       observedTurnRef.current.set(sessionId, identity);
@@ -431,6 +458,8 @@ export function App({
   const sessionReadiness = sessionsModel.refreshError !== null
     ? "reconnecting" as const
     : sessionsModel.loading ? "checking" as const : "connected" as const;
+  const activeSocketReconnecting = activeSession !== null
+    && socketModel.lifecycleBySession[activeSession.session_id] === "reconnecting";
   const showingFirstRun = connection.client !== null
     && sessionsModel.sessions.length === 0
     && (sessionsModel.loading || sessionsModel.config !== null);
@@ -489,6 +518,14 @@ export function App({
               onRetry={retryBootstrap}
             />
           </div>
+        ) : activeSocketReconnecting && activeSession !== null ? (
+          <div className="connection-lifecycle">
+            <ServiceStatus
+              status="reconnecting"
+              attemptKey={activeSession.session_id}
+              onRetry={() => socketModel.reconnect(activeSession.session_id)}
+            />
+          </div>
         ) : connection.client === null || sessionReadiness === "connected" ? null : (
           <div className="connection-lifecycle">
             <ServiceStatus
@@ -531,6 +568,8 @@ export function App({
               error={{
                 category: activeTranscript.error.category === "session_resume_error"
                   || activeTranscript.error.category === "session_resume_failure"
+                  || activeTranscript.error.category === "missing_workspace"
+                  || activeTranscript.error.category === "invalid_workspace"
                   ? activeTranscript.error.category
                   : "turn_failure",
                 message: activeTranscript.error.message,

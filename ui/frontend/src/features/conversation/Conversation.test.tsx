@@ -319,6 +319,13 @@ describe("Conversation", () => {
             { role: "assistant", content: "Authoritative answer" },
           ),
           streamingText: "",
+          terminal: {
+            kind: "completed",
+            generation: 1,
+            sequence: 2,
+            turnId: "turn-complete",
+            submissionId: null,
+          },
         })}
         openInspector={() => {}}
       />,

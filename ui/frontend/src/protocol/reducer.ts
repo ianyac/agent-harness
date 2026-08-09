@@ -345,6 +345,7 @@ export function transcriptReducer(state: TranscriptState, event: ServerEvent): T
           generation: event.generation,
           sequence: event.sequence,
           turnId: event.turn_id,
+          submissionId: state.activeTurn?.submissionId ?? null,
         },
       };
     }
@@ -358,6 +359,7 @@ export function transcriptReducer(state: TranscriptState, event: ServerEvent): T
           generation: event.generation,
           sequence: event.sequence,
           turnId: event.turn_id,
+          submissionId: state.activeTurn?.submissionId ?? null,
         },
       };
     case "turn_failed":
@@ -370,6 +372,7 @@ export function transcriptReducer(state: TranscriptState, event: ServerEvent): T
           generation: event.generation,
           sequence: event.sequence,
           turnId: event.turn_id,
+          submissionId: state.activeTurn?.submissionId ?? null,
         },
       };
     case "safety_updated":

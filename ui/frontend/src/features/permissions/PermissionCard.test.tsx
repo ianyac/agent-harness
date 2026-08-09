@@ -239,13 +239,13 @@ describe("PermissionCard", () => {
     expect(screen.queryByRole("group", { name: "Permission decision" })).not.toBeInTheDocument();
   });
 
-  it("focuses a newly active request, announces its reason, and restores connected focus after success", async () => {
+  it("focuses a newly active request, announces its reason, and restores connected focus after authority resolves", async () => {
     const user = userEvent.setup();
     render(<button type="button">Previous target</button>);
     const previous = screen.getByRole("button", { name: "Previous target" });
     previous.focus();
     const onAnswer = vi.fn();
-    render(
+    const cardView = render(
       <PermissionCard
         request={request}
         resolution={null}
@@ -262,6 +262,16 @@ describe("PermissionCard", () => {
     );
 
     await user.click(screen.getByRole("button", { name: /^Deny/ }));
+    await waitFor(() => expect(card).toHaveFocus());
+    cardView.rerender(
+      <PermissionCard
+        request={request}
+        resolution={{ answer: "no" }}
+        active={false}
+        safety={safety}
+        onAnswer={onAnswer}
+      />,
+    );
     await waitFor(() => expect(previous).toHaveFocus());
   });
 

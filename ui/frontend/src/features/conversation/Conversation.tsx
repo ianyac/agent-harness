@@ -114,12 +114,12 @@ export function Conversation({
 
   useEffect(() => {
     if (previousRunning.current && !state.running) {
-      setAnnouncement("Response complete");
+      setAnnouncement(state.terminal?.kind === "completed" ? "Response complete" : "");
     } else if (state.running) {
       setAnnouncement("");
     }
     previousRunning.current = state.running;
-  }, [state.running]);
+  }, [state.running, state.terminal]);
 
   useLayoutEffect(() => {
     const scroller = scrollerRef.current;

@@ -243,6 +243,7 @@ export type TranscriptTerminal = {
   generation: number;
   sequence: number;
   turnId: string;
+  submissionId: SubmissionId | null;
 };
 
 export type TranscriptActiveTurn = {

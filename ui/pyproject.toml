@@ -20,6 +20,9 @@ dev = [
     "pytest-asyncio",
     "pytest-cov",
 ]
+packaging = [
+    "pyinstaller",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

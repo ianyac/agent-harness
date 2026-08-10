@@ -14,8 +14,8 @@ use std::{
 use base64::Engine as _;
 use rand::RngCore as _;
 use serde::Serialize;
-use tauri::{AppHandle, Emitter as _, Runtime};
-use tauri_plugin_shell::ShellExt as _;
+use tauri::path::BaseDirectory;
+use tauri::{AppHandle, Emitter as _, Manager as _, Runtime};
 use tokio::sync::{Mutex, watch};
 
 use crate::{
@@ -29,6 +29,10 @@ const PROCESS_DATA_CAPACITY: usize = 8;
 const MAX_CONSECUTIVE_OBSERVATION_FAILURES: usize = 3;
 const OBSERVER_CONTROL_CHECK_INTERVAL: Duration = Duration::from_millis(25);
 pub const SIDECAR_NAME: &str = "agent-harness-sidecar";
+// The PyInstaller one-directory bundle ships as a Tauri resource so its
+// Mach-O files keep stable inodes after install; macOS then validates them
+// once instead of on every launch.
+pub const SIDECAR_RESOURCE_PATH: &str = "sidecar/agent-harness-sidecar";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleError {
@@ -287,12 +291,16 @@ impl SidecarEventStream for TauriSidecarEventStream {
 
 impl<R: Runtime> SidecarSpawner for TauriSidecarSpawner<R> {
     fn spawn(&self, bootstrap: BootstrapInput) -> Result<SpawnedSidecar, SpawnFailure> {
-        let command = self
+        let binary = self
             .app
-            .shell()
-            .sidecar(SIDECAR_NAME)
+            .path()
+            .resolve(SIDECAR_RESOURCE_PATH, BaseDirectory::Resource)
             .map_err(|_| SpawnFailure::new(LifecycleError::StartupFailed))?;
-        let mut command: std::process::Command = command.into();
+        let mut command = std::process::Command::new(binary);
+        command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
         validate_sidecar_command_transport(&command).map_err(SpawnFailure::new)?;
         let child = command
             .spawn()

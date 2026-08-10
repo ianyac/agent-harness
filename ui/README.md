@@ -72,6 +72,33 @@ interface.
 Use `--metadata-db /absolute/path/to/metadata.sqlite3` to override the default
 platform user-data database.
 
+## macOS app
+
+Build the PyInstaller sidecar bundle, then the Tauri app:
+
+```bash
+cd frontend
+npm run build
+cd ..
+packaging/build-sidecar.sh
+cd frontend
+npm run tauri:build
+```
+
+The sidecar is a one-directory PyInstaller bundle shipped as a Tauri resource
+(`Contents/Resources/sidecar/`) rather than a one-file `externalBin`: installed
+files keep stable inodes, so macOS validates their code signatures once per
+install instead of on every launch. Verify a built sidecar against the exact
+host contract with:
+
+```bash
+uv run python packaging/smoke_sidecar.py
+```
+
+The result lands in `desktop/src-tauri/target/release/bundle/macos/Harness.app`
+(plus a dmg). Local builds are ad-hoc signed; distribution needs Developer ID
+signing and notarization.
+
 ## Sidecar startup
 
 Native hosts use `--secret-stdin` and write exactly one newline-delimited JSON

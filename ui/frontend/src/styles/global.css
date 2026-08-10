@@ -25,6 +25,11 @@ select {
   font: inherit;
 }
 
+input[type="radio"],
+input[type="checkbox"] {
+  accent-color: var(--color-accent);
+}
+
 :focus-visible {
   outline: none;
   box-shadow: var(--focus-ring);

@@ -12,12 +12,6 @@ const connection = {
   token: "t".repeat(43),
 };
 
-const storedPreferences = new Map<string, string>();
-const sidebarStorage = {
-  getItem: (key: string) => storedPreferences.get(key) ?? null,
-  setItem: (key: string, value: string) => storedPreferences.set(key, value),
-};
-
 function session(changes: Partial<SessionRecord> = {}): SessionRecord {
   return {
     session_id: "session-1",
@@ -33,10 +27,7 @@ function session(changes: Partial<SessionRecord> = {}): SessionRecord {
   };
 }
 
-afterEach(() => {
-  cleanup();
-  storedPreferences.clear();
-});
+afterEach(cleanup);
 
 describe("SessionSidebar", () => {
   it("accepts a live controlled collapse preference without weakening the named rail controls", async () => {
@@ -62,9 +53,11 @@ describe("SessionSidebar", () => {
     expect(screen.getByRole("navigation", { name: "Sessions" })).toHaveAttribute("data-collapsed", "true");
     expect(screen.getByRole("button", { name: "New chat" })).toBeVisible();
     expect(screen.getByRole("button", { name: "Settings" })).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Expand sidebar" }));
+    expect(onCollapsedChange).toHaveBeenLastCalledWith(false);
   });
 
-  it("groups unarchived sessions by local recency and keeps workspace in each row name", () => {
+  it("groups the provided sessions by local recency and keeps workspace in each row name", () => {
     const sessions = [
       session(),
       session({
@@ -78,11 +71,6 @@ describe("SessionSidebar", () => {
         title: "Old notes",
         last_opened_at: "2026-08-01T04:00:00.000000+00:00",
       }),
-      session({
-        session_id: "archived",
-        title: "Archived work",
-        archived_at: "2026-08-09T05:00:00.000000+00:00",
-      }),
     ];
     const runtimeBySession: Readonly<Record<string, SessionRuntimeState>> = {
       "session-1": { status: "waiting_permission" },
@@ -95,7 +83,8 @@ describe("SessionSidebar", () => {
         activeSessionId="session-1"
         runtimeBySession={runtimeBySession}
         now={new Date("2026-08-09T12:00:00+08:00")}
-        storage={sidebarStorage}
+        collapsed={false}
+        onCollapsedChange={() => {}}
         onCreate={() => {}}
         onSelect={() => {}}
         onRename={() => {}}
@@ -119,44 +108,46 @@ describe("SessionSidebar", () => {
         name: /Review release.*other.*running in background/i,
       }),
     ).toBeVisible();
-    expect(within(navigation).queryByText("Archived work")).not.toBeInTheDocument();
   });
 
-  it("manual collapse persists while retaining named new-chat, search, and session controls", async () => {
+  it("shows session tooltips only in the collapsed rail while retaining named controls", async () => {
     const user = userEvent.setup();
-    render(
-      <SessionSidebar
-        {...{ connectionStatus: "disconnected" }}
-        sessions={[
-          session(),
-          session({
-            session_id: "session-2",
-            workspace: "/work/other",
-            title: "Review release",
-          }),
-        ]}
-        activeSessionId="session-1"
-        runtimeBySession={{}}
-        now={new Date("2026-08-09T12:00:00+08:00")}
-        storage={sidebarStorage}
-        onCreate={() => {}}
-        onSelect={() => {}}
-        onRename={() => {}}
-        onArchive={() => {}}
-        onSearch={() => {}}
-        onOpenSettings={() => {}}
-      />,
-    );
+    const props = {
+      sessions: [
+        session(),
+        session({
+          session_id: "session-2",
+          workspace: "/work/other",
+          title: "Review release",
+        }),
+      ],
+      activeSessionId: "session-1",
+      runtimeBySession: {},
+      connectionStatus: "disconnected",
+      now: new Date("2026-08-09T12:00:00+08:00"),
+      onCollapsedChange: () => {},
+      onCreate: () => {},
+      onSelect: () => {},
+      onRename: () => {},
+      onArchive: () => {},
+      onSearch: () => {},
+      onOpenSettings: () => {},
+    } as const;
+    const { rerender } = render(<SessionSidebar {...props} collapsed={false} />);
 
-    await user.click(screen.getByRole("button", { name: "Collapse sidebar" }));
+    const expandedSession = screen.getByRole("button", { name: /Ship navigation.*\/work\/acme/i });
+    await user.hover(expandedSession);
+    expect(screen.queryByRole("tooltip")).not.toBeInTheDocument();
+    await user.unhover(expandedSession);
 
+    rerender(<SessionSidebar {...props} collapsed />);
     const navigation = screen.getByRole("navigation", { name: "Sessions" });
     expect(navigation).toHaveAttribute("data-collapsed", "true");
-    expect(sidebarStorage.getItem("harness.sidebar.collapsed")).toBe("true");
     expect(screen.getByRole("button", { name: "New chat" })).toBeVisible();
     expect(screen.getByRole("button", { name: "Search sessions" })).toBeVisible();
     expect(screen.getByRole("button", { name: "Settings" })).toBeVisible();
     expect(screen.getByRole("status", { name: "Local service disconnected" })).toBeVisible();
+
     const shipSession = screen.getByRole("button", { name: /Ship navigation.*\/work\/acme/i });
     await user.hover(shipSession);
     expect(await screen.findByRole("tooltip")).toHaveTextContent("Ship navigation");
@@ -180,14 +171,14 @@ describe("SessionSidebar", () => {
     expect(screen.getByRole("button", { name: /More actions for Ship navigation/i })).toHaveFocus();
   });
 
-  it("uses distinct Lucide SVG icons for every accessible connection state in the rail", async () => {
-    const user = userEvent.setup();
+  it("uses distinct Lucide SVG icons for every accessible connection state in the rail", () => {
     const props = {
       sessions: [session()],
       activeSessionId: "session-1",
       runtimeBySession: {},
       now: new Date("2026-08-09T12:00:00+08:00"),
-      storage: sidebarStorage,
+      collapsed: true,
+      onCollapsedChange: () => {},
       onCreate: () => {},
       onSelect: () => {},
       onRename: () => {},
@@ -198,7 +189,6 @@ describe("SessionSidebar", () => {
     const { rerender } = render(
       <SessionSidebar {...props} connectionStatus="connecting" />,
     );
-    await user.click(screen.getByRole("button", { name: "Collapse sidebar" }));
 
     const iconFor = (accessibleName: string, state: string) => {
       const status = screen.getByRole("status", { name: accessibleName });
@@ -237,7 +227,8 @@ describe("SessionSidebar", () => {
         activeSessionId="today"
         runtimeBySession={{}}
         now={now}
-        storage={sidebarStorage}
+        collapsed={false}
+        onCollapsedChange={() => {}}
         onCreate={() => {}}
         onSelect={() => {}}
         onRename={() => {}}
@@ -311,7 +302,8 @@ describe("SessionSidebar", () => {
           activeSessionId={model.activeSessionId}
           runtimeBySession={{}}
           now={new Date("2026-08-09T12:00:00+08:00")}
-          storage={sidebarStorage}
+          collapsed={false}
+          onCollapsedChange={() => {}}
           onCreate={model.createSession}
           onSelect={model.selectSession}
           onRename={model.renameSession}

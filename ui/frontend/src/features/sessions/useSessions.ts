@@ -8,6 +8,7 @@ export type ContextMode = "compaction" | "folding";
 export type SessionRecord = {
   readonly session_id: string;
   readonly workspace: string;
+  readonly branch?: string | null;
   readonly title: string;
   readonly mode: BaseMode;
   readonly context_mode: ContextMode;
@@ -68,6 +69,12 @@ export type SessionCleanupError = {
 
 export type SessionCleanupStorage = Pick<Storage, "getItem" | "setItem">;
 
+type HeldSnapshot = {
+  readonly sessions: SessionRecord[];
+  readonly config: ServiceConfig | null;
+  readonly activeSessionId: string | null;
+};
+
 export type SessionsModel = {
   readonly sessions: SessionRecord[];
   readonly activeSessionId: string | null;
@@ -86,6 +93,8 @@ export type SessionsModel = {
   readonly archiveSession: (sessionId: string) => Promise<void>;
   readonly retryOperation: () => Promise<void>;
   readonly retryCleanup: () => Promise<void>;
+  readonly dismissOperationError: () => void;
+  readonly dismissCleanupError: () => void;
   readonly refresh: () => Promise<void>;
 };
 
@@ -176,6 +185,7 @@ export function useSessions(
   const [refreshError, setRefreshError] = useState<Error | null>(null);
   const [operationError, setOperationError] = useState<SessionOperationError | null>(null);
   const [cleanupError, setCleanupError] = useState<SessionCleanupError | null>(null);
+  const [held, setHeld] = useState<HeldSnapshot | null>(null);
   const sessionsRef = useRef<SessionRecord[]>([]);
   const configRef = useRef<ServiceConfig | null>(null);
   const activeSessionIdRef = useRef<string | null>(null);
@@ -338,6 +348,7 @@ export function useSessions(
     } finally {
       if (isCurrentClient(requestClient, epoch) && refreshRequestRef.current === request) {
         setLoading(false);
+        setHeld(null);
       }
     }
   }, [activateCleanupLedger, client, commitActiveSession, commitConfig, commitSessions, isCurrentClient]);
@@ -366,6 +377,13 @@ export function useSessions(
   }, [client]);
 
   useEffect(() => {
+    // Hold the outgoing client's committed view until the replacement client's
+    // first refresh settles, so consumers never see a transient empty list.
+    const snapshot: HeldSnapshot = {
+      sessions: sessionsRef.current,
+      config: configRef.current,
+      activeSessionId: activeSessionIdRef.current,
+    };
     commitSessions([]);
     commitConfig(null);
     commitActiveSession(null);
@@ -373,9 +391,11 @@ export function useSessions(
     commitOperationError(null);
     setCleanupError(null);
     if (client === null) {
+      setHeld(null);
       setLoading(false);
       return;
     }
+    setHeld(snapshot);
     setLoading(true);
     void refresh();
   }, [client, commitActiveSession, commitConfig, commitOperationError, commitSessions, refresh]);
@@ -604,14 +624,24 @@ export function useSessions(
     await runCleanup(authority);
   }, [runCleanup]);
 
+  const dismissOperationError = useCallback(() => {
+    operationErrorAuthorityRef.current += 1;
+    commitOperationError(null);
+  }, [commitOperationError]);
+
+  const dismissCleanupError = useCallback(() => {
+    // The ledger entry survives dismissal; only the surfaced error clears.
+    setCleanupError(null);
+  }, []);
+
   return {
-    sessions,
-    activeSessionId,
+    sessions: held === null ? sessions : held.sessions,
+    activeSessionId: held === null ? activeSessionId : held.activeSessionId,
     loading,
     refreshError,
     operationError,
     cleanupError,
-    config,
+    config: held === null ? config : held.config,
     createSession,
     invalidateCreate,
     selectSession,
@@ -619,6 +649,8 @@ export function useSessions(
     archiveSession,
     retryOperation,
     retryCleanup,
+    dismissOperationError,
+    dismissCleanupError,
     refresh,
   };
 }

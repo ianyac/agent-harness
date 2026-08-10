@@ -1,6 +1,6 @@
 import * as Dialog from "@radix-ui/react-dialog";
 import { Activity, MessageSquarePlus, Search, Settings } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 
 import type { SessionRecord } from "../features/sessions/useSessions";
 import { workspaceName } from "../features/sessions/SessionRow";
@@ -34,8 +34,10 @@ export function CommandPalette({
   onSelectSession,
 }: CommandPaletteProps) {
   const [query, setQuery] = useState("");
+  const [activeIndex, setActiveIndex] = useState(0);
   const focusOrigin = useRef<HTMLElement | null>(null);
   const searchInput = useRef<HTMLInputElement>(null);
+  const listboxId = useId();
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -94,13 +96,27 @@ export function CommandPalette({
   );
   const matchingSessions = useMemo(
     () =>
-      sessions.filter(
-        (session) =>
-          session.archived_at === null &&
-          `${session.title}\n${session.workspace}`.toLocaleLowerCase().includes(normalizedQuery),
+      sessions.filter((session) =>
+        `${session.title}\n${session.workspace}`.toLocaleLowerCase().includes(normalizedQuery),
       ),
     [normalizedQuery, sessions],
   );
+  const optionCount = matchingActions.length + matchingSessions.length;
+  const activeOption = optionCount === 0 ? 0 : Math.min(activeIndex, optionCount - 1);
+
+  useEffect(() => {
+    setActiveIndex(0);
+  }, [open, normalizedQuery, sessions]);
+
+  const activateOption = (index: number) => {
+    const action = matchingActions[index];
+    if (action !== undefined) {
+      runAndClose(action.run);
+      return;
+    }
+    const session = matchingSessions[index - matchingActions.length];
+    if (session !== undefined) runAndClose(() => onSelectSession(session.session_id));
+  };
 
   return (
     <Dialog.Root open={open} onOpenChange={onOpenChange}>
@@ -130,21 +146,51 @@ export function CommandPalette({
               ref={searchInput}
               type="search"
               aria-label="Search commands and sessions"
+              aria-autocomplete="list"
+              aria-controls={listboxId}
+              aria-activedescendant={optionCount === 0 ? undefined : `${listboxId}-${activeOption}`}
               placeholder="Search commands and sessions"
               value={query}
               onChange={(event) => setQuery(event.target.value)}
+              onKeyDown={(event) => {
+                if (optionCount === 0) return;
+                if (event.key === "ArrowDown") {
+                  event.preventDefault();
+                  setActiveIndex((activeOption + 1) % optionCount);
+                } else if (event.key === "ArrowUp") {
+                  event.preventDefault();
+                  setActiveIndex((activeOption - 1 + optionCount) % optionCount);
+                } else if (event.key === "Home") {
+                  event.preventDefault();
+                  setActiveIndex(0);
+                } else if (event.key === "End") {
+                  event.preventDefault();
+                  setActiveIndex(optionCount - 1);
+                } else if (event.key === "Enter") {
+                  event.preventDefault();
+                  activateOption(activeOption);
+                }
+              }}
             />
           </div>
-          <div className={styles.commandList}>
+          <div
+            className={styles.commandList}
+            role="listbox"
+            aria-label="Commands and sessions"
+            id={listboxId}
+          >
             {matchingActions.length > 0 ? (
-              <section aria-labelledby="command-actions-heading">
-                <h2 id="command-actions-heading" className={styles.commandHeading}>Actions</h2>
-                {matchingActions.map((action) => {
+              <div role="group" aria-labelledby="command-actions-heading">
+                <div id="command-actions-heading" className={styles.commandHeading}>Actions</div>
+                {matchingActions.map((action, index) => {
                   const Icon = action.icon;
                   return (
                     <button
                       key={action.id}
+                      id={`${listboxId}-${index}`}
                       type="button"
+                      role="option"
+                      aria-selected={index === activeOption}
                       className={styles.command}
                       data-command-id={action.id}
                       aria-keyshortcuts={
@@ -162,15 +208,18 @@ export function CommandPalette({
                     </button>
                   );
                 })}
-              </section>
+              </div>
             ) : null}
             {matchingSessions.length > 0 ? (
-              <section aria-labelledby="command-sessions-heading">
-                <h2 id="command-sessions-heading" className={styles.commandHeading}>Sessions</h2>
-                {matchingSessions.map((session) => (
+              <div role="group" aria-labelledby="command-sessions-heading">
+                <div id="command-sessions-heading" className={styles.commandHeading}>Sessions</div>
+                {matchingSessions.map((session, index) => (
                   <button
                     key={session.session_id}
+                    id={`${listboxId}-${matchingActions.length + index}`}
                     type="button"
+                    role="option"
+                    aria-selected={matchingActions.length + index === activeOption}
                     className={styles.command}
                     data-command-id={`session:${session.session_id}`}
                     onClick={() => runAndClose(() => onSelectSession(session.session_id))}
@@ -182,7 +231,7 @@ export function CommandPalette({
                     </span>
                   </button>
                 ))}
-              </section>
+              </div>
             ) : null}
             {matchingActions.length === 0 && matchingSessions.length === 0 ? (
               <p className={styles.emptyCommands}>No matching commands or sessions.</p>

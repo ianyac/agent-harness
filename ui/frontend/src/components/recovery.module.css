@@ -1,9 +1,11 @@
 .recovery {
   display: grid;
   width: min(100%, 620px);
+  max-height: 100%;
   gap: 12px;
   margin: auto;
   padding: 24px;
+  overflow-y: auto;
   border: 1px solid var(--color-border);
   border-radius: var(--radius-card);
   background: var(--color-surface);
@@ -63,4 +65,58 @@
   color: inherit;
   background: var(--color-surface);
   cursor: pointer;
+}
+
+.unrecoverableBanner {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  border-block-end: 1px solid var(--color-danger);
+  background: color-mix(in srgb, var(--color-danger) 10%, var(--color-surface));
+}
+
+.unrecoverableBanner p {
+  margin: 4px 0 0;
+}
+
+.unrecoverableBanner button,
+.operationActions button {
+  display: inline-flex;
+  align-items: center;
+  min-height: 44px;
+  gap: 6px;
+  padding: 7px 12px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-control);
+  color: inherit;
+  background: var(--color-surface);
+  cursor: pointer;
+}
+
+.operationBanner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 12px;
+  padding: 10px 14px;
+  border-block-end: 1px solid var(--color-danger);
+  background: color-mix(in srgb, var(--color-danger) 10%, var(--color-surface));
+}
+
+.operationCopy {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  min-width: 0;
+  margin: 0;
+  gap: 4px 8px;
+}
+
+.operationActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
 }

@@ -3,7 +3,7 @@ import { useEffect, useState } from "react";
 
 import styles from "./recovery.module.css";
 
-export type ServiceConnectionStatus = "checking" | "reconnecting" | "connected";
+export type ServiceConnectionStatus = "checking" | "reconnecting" | "connected" | "unrecoverable";
 
 type ConnectionStatusProps = {
   readonly status: ServiceConnectionStatus;
@@ -32,6 +32,26 @@ export function ConnectionStatus({
     const timer = window.setTimeout(() => setProlonged(true), 10_000);
     return () => window.clearTimeout(timer);
   }, [attemptKey, status]);
+
+  if (status === "unrecoverable") {
+    return (
+      <div className={styles.unrecoverableBanner} role="alert">
+        <div>
+          <strong>This tab lost its access to the local service</strong>
+          <p>
+            The access token lives only in this tab’s memory, so a page reload signs the
+            tab out. Reopen the fresh link printed by the local service (restart it if
+            needed) — your sessions and data are safe on disk.
+          </p>
+        </div>
+        {onRetry === undefined ? null : (
+          <button type="button" disabled={retrying} onClick={onRetry}>
+            Retry
+          </button>
+        )}
+      </div>
+    );
+  }
 
   const Icon = status === "checking"
     ? LoaderCircle

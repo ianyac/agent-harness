@@ -456,7 +456,7 @@ describe("App", () => {
 
     await user.click(await screen.findByRole("button", { name: "New chat" }));
     await user.keyboard("{Meta>}k{/Meta}");
-    await user.click(screen.getByRole("button", { name: /New chat.*⌘N/ }));
+    await user.click(screen.getByRole("option", { name: /New chat.*⌘N/ }));
     expect(creates).toBe(1);
 
     created.resolve(Response.json(session({ session_id: "created-once" }), { status: 201 }));
@@ -814,7 +814,7 @@ describe("App", () => {
     expect(onSessionEvent).not.toHaveBeenCalled();
 
     await user.keyboard("{Meta>}k{/Meta}");
-    await user.click(screen.getByRole("button", { name: "Open settings" }));
+    await user.click(screen.getByRole("option", { name: "Open settings" }));
     expect(screen.getByRole("dialog", { name: "Settings" })).toBeVisible();
     await user.keyboard("{Escape}");
     await user.click(screen.getByRole("button", { name: "New chat" }));
@@ -828,7 +828,7 @@ describe("App", () => {
     expect(onSessionEvent).not.toHaveBeenCalled();
   });
 
-  it("projects any transcript turn failure through the stable turn recovery view", async () => {
+  it("keeps the conversation usable and shows a sanitized notice on turn failure", async () => {
     const active = session();
     render(
       <App
@@ -845,9 +845,10 @@ describe("App", () => {
       />,
     );
     expect(await screen.findByRole("alert")).toHaveTextContent(
-      "The turn stopped before it completed.",
+      "The turn could not complete.",
     );
     expect(screen.getByRole("alert")).not.toHaveTextContent("secret provider trace");
+    expect(screen.getByRole("textbox", { name: "Message" })).toBeVisible();
   });
 
   it("retries the exact retained failed submission once under session, client, generation, and turn authority", async () => {
@@ -2331,11 +2332,11 @@ describe("App", () => {
     await user.click(await screen.findByRole("button", { name: "Activity" }));
     expect(screen.getByRole("dialog", { name: "Activity inspector" })).toBeVisible();
     await user.keyboard("{Meta>}k{/Meta}");
-    await user.click(screen.getByRole("button", { name: /Toggle activity.*⌘⇧I/ }));
+    await user.click(screen.getByRole("option", { name: /Toggle activity.*⌘⇧I/ }));
     expect(screen.queryByRole("dialog", { name: "Activity inspector" })).not.toBeInTheDocument();
 
     await user.keyboard("{Meta>}k{/Meta}");
-    await user.click(screen.getByRole("button", { name: /Toggle activity.*⌘⇧I/ }));
+    await user.click(screen.getByRole("option", { name: /Toggle activity.*⌘⇧I/ }));
     expect(screen.getAllByRole("dialog", { name: "Activity inspector" })).toHaveLength(1);
     expect(screen.queryByRole("region", { name: "Selected activity detail" })).not.toBeInTheDocument();
   });

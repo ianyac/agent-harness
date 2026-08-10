@@ -62,9 +62,33 @@ class RenameSessionRequest(BaseModel):
     title: str = Field(min_length=1, max_length=512)
 
 
+def _workspace_branch(workspace: Path) -> str | None:
+    """Read the checked-out branch from git metadata without running git."""
+    git_path = workspace / ".git"
+    try:
+        if git_path.is_file():
+            pointer = git_path.read_text(encoding="utf-8", errors="replace")
+            if not pointer.startswith("gitdir:"):
+                return None
+            git_dir = Path(pointer.split(":", 1)[1].strip())
+            if not git_dir.is_absolute():
+                git_dir = workspace / git_dir
+            head = git_dir / "HEAD"
+        else:
+            head = git_path / "HEAD"
+        content = head.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return None
+    prefix = "ref: refs/heads/"
+    if not content.startswith(prefix):
+        return None
+    return content[len(prefix):] or None
+
+
 def _session_json(record: SessionRecord) -> dict:
     payload = asdict(record)
     payload["workspace"] = str(record.workspace)
+    payload["branch"] = _workspace_branch(record.workspace)
     return payload
 
 

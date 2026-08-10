@@ -4,7 +4,7 @@ import { ApiClient } from "./api/http";
 import { useSessionSockets } from "./api/useSessionSockets";
 import { CommandPalette } from "./components/CommandPalette";
 import { ConnectionStatus as ServiceStatus } from "./components/ConnectionStatus";
-import { RecoveryView } from "./components/RecoveryView";
+import { RecoveryView, TurnFailureNotice } from "./components/RecoveryView";
 import { Composer } from "./features/conversation/Composer";
 import type { DraftStorage } from "./features/conversation/useDraft";
 import { Conversation } from "./features/conversation/Conversation";
@@ -31,6 +31,7 @@ import { NotificationObserver } from "./features/settings/NotificationObserver";
 import { Settings } from "./features/settings/Settings";
 import type { PreferenceStorage } from "./features/settings/preferences";
 import { usePreferences } from "./features/settings/preferences";
+import { ServiceConnectionUnavailableError } from "./platform/browser";
 import type {
   NativeMenuCommand,
   PlatformAdapter,
@@ -65,10 +66,25 @@ type RetryAuthority = {
 };
 
 type BootstrapLifecycle = {
-  readonly status: "checking" | "reconnecting";
+  readonly status: "checking" | "reconnecting" | "unrecoverable";
   readonly attempt: number;
   readonly retrying: boolean;
 };
+
+const SESSION_LEVEL_ERROR_CATEGORIES = new Set([
+  "session_resume_error",
+  "session_resume_failure",
+  "missing_workspace",
+  "invalid_workspace",
+  "credential_prerequisite",
+  "sidecar_second_crash",
+]);
+
+function chatTitle(text: string): string {
+  const firstLine = text.trim().split(/\r?\n/, 1)[0] ?? "";
+  const collapsed = firstLine.replace(/\s+/g, " ").trim();
+  return collapsed.length > 60 ? `${collapsed.slice(0, 59)}…` : collapsed;
+}
 
 function sessionRecency(session: SessionRecord): number {
   const timestamp = Date.parse(session.last_opened_at ?? session.updated_at);
@@ -205,6 +221,7 @@ export function App({
   const retrySubmittedRef = useRef(new Set<string>());
   const newChatPendingRef = useRef(false);
   const nativeMenuHandlersRef = useRef<Readonly<Record<NativeMenuCommand, () => void>> | null>(null);
+  const showingFirstRunRef = useRef(false);
   const bootstrapPendingRef = useRef(providedClient === undefined);
   const preferenceModel = usePreferences(preferenceStorage ?? sidebarStorage);
 
@@ -292,8 +309,21 @@ export function App({
           if (!current || sawLifecycleState) return;
           const candidateAuthority = ++authority;
           await activate(platform, service, candidateAuthority);
-        } catch {
-          if (!sawLifecycleState) failCurrent(platform, ++authority);
+        } catch (error) {
+          if (sawLifecycleState) return;
+          if (error instanceof ServiceConnectionUnavailableError) {
+            const candidateAuthority = ++authority;
+            if (!current || candidateAuthority !== authority) return;
+            bootstrapPendingRef.current = false;
+            setBootstrapLifecycle({
+              status: "unrecoverable",
+              attempt: bootstrapAttempt,
+              retrying: false,
+            });
+            setConnection({ client: null, service: null, status: "disconnected", platform });
+            return;
+          }
+          failCurrent(platform, ++authority);
         }
       })
       .catch(() => {
@@ -365,6 +395,14 @@ export function App({
     return true;
   };
   const routeSessionEvent = (sessionId: string, clientEvent: ClientEvent) => {
+    if (clientEvent.type === "send_message") {
+      const session = sessionsModel.sessions.find((record) => record.session_id === sessionId);
+      const transcript = transcriptBySession[sessionId] ?? emptyTranscriptState;
+      if (session?.title === "New chat" && transcript.messages.length === 0) {
+        const title = chatTitle(clientEvent.text);
+        if (title !== "") void sessionsModel.renameSession(sessionId, title);
+      }
+    }
     let candidate: SubmissionCandidate | undefined;
     let previousQueuedId: string | undefined;
     let clearingCandidateId: string | undefined;
@@ -703,17 +741,25 @@ export function App({
   useEffect(() => {
     if (selectedPlatform?.subscribeNativeMenu === undefined) return;
     return selectedPlatform.subscribeNativeMenu((command) => {
+      if (showingFirstRunRef.current) return;
       nativeMenuHandlersRef.current?.[command]?.();
     });
   }, [selectedPlatform]);
   const sessionReadiness = sessionsModel.refreshError !== null
     ? "reconnecting" as const
     : sessionsModel.loading ? "checking" as const : "connected" as const;
-  const activeSocketReconnecting = activeSession !== null
-    && socketModel.lifecycleBySession[activeSession.session_id] === "reconnecting";
+  const activeSocketLifecycle = activeSession === null
+    ? undefined
+    : socketModel.lifecycleBySession[activeSession.session_id];
+  const activeSocketReconnecting = activeSocketLifecycle === "reconnecting"
+    || activeSocketLifecycle === "failed";
   const showingFirstRun = connection.client !== null
     && sessionsModel.sessions.length === 0
     && (sessionsModel.loading || sessionsModel.config !== null);
+  showingFirstRunRef.current = showingFirstRun && !sessionsModel.loading;
+  const activeError = activeTranscript?.error ?? null;
+  const sessionLevelError = activeError !== null
+    && SESSION_LEVEL_ERROR_CATEGORIES.has(activeError.category);
   const nativeNewChatFailure: SessionOperationError | null = newChatWorkspaceFailed
     ? {
       kind: "create",
@@ -771,7 +817,6 @@ export function App({
         connectionStatus={connection.client !== null && sessionReadiness !== "connected"
           ? "connecting"
           : connection.status}
-        storage={sidebarStorage}
         collapsed={preferenceModel.preferences.sidebarCollapsed}
         onCollapsedChange={(sidebarCollapsed) => preferenceModel.update({ sidebarCollapsed })}
         onCreate={createFutureSession}
@@ -818,7 +863,7 @@ export function App({
             key={activeSession.session_id}
             sessionId={activeSession.session_id}
             workspace={activeSession.workspace}
-            branch={branchBySession[activeSession.session_id] ?? null}
+            branch={activeSession.branch ?? branchBySession[activeSession.session_id] ?? null}
             mode={activeSession.mode}
             onSetSessionMode={(event) => routeSessionEvent(activeSession.session_id, event)}
             onToggleActivity={openInspectorOverview}
@@ -829,50 +874,51 @@ export function App({
             <SessionOperationRecovery
               failure={nativeNewChatFailure}
               onRetry={createFutureSession}
+              onDismiss={() => setNewChatWorkspaceFailed(false)}
             />
           ) : sessionsModel.cleanupError !== null ? (
             <SessionOperationRecovery
               failure={sessionsModel.cleanupError}
               onRetry={sessionsModel.retryCleanup}
+              onDismiss={sessionsModel.dismissCleanupError}
             />
           ) : sessionsModel.operationError !== null ? (
             <SessionOperationRecovery
               failure={sessionsModel.operationError}
               onRetry={sessionsModel.retryOperation}
+              onDismiss={sessionsModel.dismissOperationError}
             />
-          ) : activeTranscript?.error !== null && activeTranscript?.error !== undefined && activeSession !== null && selectedPlatform !== null && selectedPlatform !== undefined ? (
+          ) : null}
+          {activeError !== null && sessionLevelError && activeSession !== null && selectedPlatform !== null && selectedPlatform !== undefined ? (
             <RecoveryView
-              key={activeTranscript.terminal === null
+              key={activeTranscript?.terminal == null
                 ? `${activeSession.session_id}:recovery`
                 : terminalKey(activeSession.session_id, activeTranscript.terminal)}
-              error={{
-                category: activeTranscript.error.category === "session_resume_error"
-                  || activeTranscript.error.category === "session_resume_failure"
-                  || activeTranscript.error.category === "missing_workspace"
-                  || activeTranscript.error.category === "invalid_workspace"
-                  ? activeTranscript.error.category
-                  : "turn_failure",
-                message: activeTranscript.error.message,
-              }}
+              error={activeError}
               sessionId={activeSession.session_id}
               platform={selectedPlatform}
               onArchive={sessionsModel.archiveSession}
               onRetry={retryFailedSubmission}
             />
           ) : activeTranscript === null ? null : (
-            <Conversation
-              key={`conversation-${activeSession?.session_id}`}
-              state={activeTranscript}
-              optimisticUserMessages={optimisticUserMessages}
-              openInspector={(activityId) => {
-                onToggleActivity();
-                inspector.openActivity(activityId, activeElement());
-              }}
-              ownsSearchShortcut
-              onSessionEvent={(event) => activeSession === null
-                ? undefined
-                : routeSessionEvent(activeSession.session_id, event)}
-            />
+            <>
+              <Conversation
+                key={`conversation-${activeSession?.session_id}`}
+                state={activeTranscript}
+                optimisticUserMessages={optimisticUserMessages}
+                openInspector={(activityId) => {
+                  onToggleActivity();
+                  inspector.openActivity(activityId, activeElement());
+                }}
+                ownsSearchShortcut
+                onSessionEvent={(event) => activeSession === null
+                  ? undefined
+                  : routeSessionEvent(activeSession.session_id, event)}
+              />
+              {activeError !== null ? (
+                <TurnFailureNotice onRetry={retryFailedSubmission} />
+              ) : null}
+            </>
           )}
         </main>
         {activeSession !== null && activeTranscript !== null ? (

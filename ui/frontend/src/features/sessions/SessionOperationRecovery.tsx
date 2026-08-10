@@ -1,4 +1,4 @@
-import { RefreshCw } from "lucide-react";
+import { RefreshCw, X } from "lucide-react";
 import { useRef, useState } from "react";
 
 import { ApiError } from "../../api/http";
@@ -8,12 +8,13 @@ import styles from "../../components/recovery.module.css";
 type SessionOperationRecoveryProps = {
   readonly failure: SessionOperationError | SessionCleanupError;
   readonly onRetry: () => void | Promise<void>;
+  readonly onDismiss?: () => void;
 };
 
 function operationName(kind: SessionOperationError["kind"] | SessionCleanupError["kind"]): string {
   if (kind === "create") return "New chat";
   if (kind === "rename") return "Rename";
-  if (kind === "cleanup") return "cleanup";
+  if (kind === "cleanup") return "Cleanup";
   return "Archive";
 }
 
@@ -42,7 +43,11 @@ function copy(
   return { title: "Session wasn’t archived", body: "The session remains available." };
 }
 
-export function SessionOperationRecovery({ failure, onRetry }: SessionOperationRecoveryProps) {
+export function SessionOperationRecovery({
+  failure,
+  onRetry,
+  onDismiss,
+}: SessionOperationRecoveryProps) {
   const [pending, setPending] = useState(false);
   const pendingRef = useRef(false);
   const safeCopy = copy(failure);
@@ -61,14 +66,21 @@ export function SessionOperationRecovery({ failure, onRetry }: SessionOperationR
   };
 
   return (
-    <section className={styles.recovery} role="alert" aria-label="Session operation failed">
-      <h1>{safeCopy.title}</h1>
-      <p>{safeCopy.body}</p>
-      <div className={styles.actions}>
+    <div className={styles.operationBanner} role="alert" aria-label="Session operation failed">
+      <p className={styles.operationCopy}>
+        <strong>{safeCopy.title}</strong>
+        <span>{safeCopy.body}</span>
+      </p>
+      <div className={styles.operationActions}>
         <button type="button" disabled={pending} onClick={() => void retry()}>
-          <RefreshCw aria-hidden="true" size={18} /> Retry {label}
+          <RefreshCw aria-hidden="true" size={15} /> Retry {label}
         </button>
+        {onDismiss === undefined ? null : (
+          <button type="button" onClick={onDismiss}>
+            <X aria-hidden="true" size={15} /> Dismiss
+          </button>
+        )}
       </div>
-    </section>
+    </div>
   );
 }

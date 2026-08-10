@@ -35,6 +35,10 @@ const copyByCategory: Readonly<Record<string, { readonly title: string; readonly
     body: "This session could not be reopened.",
   },
   turn_failure: {
+    title: "Turn failed",
+    body: "The turn could not complete. The conversation was rolled back to the last completed message, and your draft is preserved.",
+  },
+  turn_cancelled: {
     title: "Turn stopped",
     body: "The turn stopped before it completed.",
   },
@@ -44,10 +48,58 @@ const copyByCategory: Readonly<Record<string, { readonly title: string; readonly
   },
 };
 
-const genericCopy = {
-  title: "Recovery needed",
-  body: "Something went wrong. Your local session data was not changed.",
+type TurnFailureNoticeProps = {
+  readonly onRetry?: () => void | Promise<void>;
 };
+
+/**
+ * Compact strip for turn-level failures; the transcript stays visible. Copy is
+ * fixed because raw provider messages may leak internals.
+ */
+export function TurnFailureNotice({ onRetry }: TurnFailureNoticeProps) {
+  const [pending, setPending] = useState(false);
+  const [failed, setFailed] = useState(false);
+  const pendingRef = useRef(false);
+
+  const retry = async (action: () => void | Promise<void>) => {
+    if (pendingRef.current) return;
+    pendingRef.current = true;
+    setPending(true);
+    setFailed(false);
+    try {
+      await action();
+    } catch {
+      setFailed(true);
+    } finally {
+      pendingRef.current = false;
+      setPending(false);
+    }
+  };
+
+  return (
+    <div className={styles.operationBanner} role="alert">
+      <p className={styles.operationCopy}>
+        <strong>Turn failed</strong>
+        <span>
+          The turn could not complete. The conversation was rolled back to the
+          last completed message, and your draft is preserved.
+        </span>
+      </p>
+      <div className={styles.operationActions}>
+        {onRetry === undefined ? null : (
+          <button type="button" disabled={pending} onClick={() => void retry(onRetry)}>
+            <RefreshCw aria-hidden="true" size={18} /> Retry
+          </button>
+        )}
+        {failed ? (
+          <p className={styles.operationCopy} role="status" aria-label="Recovery action failed">
+            The recovery action failed.
+          </p>
+        ) : null}
+      </div>
+    </div>
+  );
+}
 
 export function RecoveryView({
   error,
@@ -56,7 +108,10 @@ export function RecoveryView({
   onArchive,
   onRetry,
 }: RecoveryViewProps) {
-  const copy = copyByCategory[error.category] ?? genericCopy;
+  // Unknown categories behave exactly like turn_failure so callers can pass
+  // raw provider categories through without pre-normalizing them.
+  const category = error.category in copyByCategory ? error.category : "turn_failure";
+  const copy = copyByCategory[category];
   const [pending, setPending] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const pendingRef = useRef(false);
@@ -82,8 +137,8 @@ export function RecoveryView({
     }
   };
 
-  const workspaceError = error.category === "invalid_workspace" || error.category === "missing_workspace";
-  const crashed = error.category === "sidecar_second_crash";
+  const workspaceError = category === "invalid_workspace" || category === "missing_workspace";
+  const crashed = category === "sidecar_second_crash";
 
   return (
     <section className={styles.recovery} role="alert" aria-labelledby="recovery-title">
@@ -99,7 +154,7 @@ export function RecoveryView({
           "turn_failure",
           "session_resume_failure",
           "session_resume_error",
-        ].includes(error.category) ? null : (
+        ].includes(category) ? null : (
           <button type="button" disabled={pending} onClick={() => void run(onRetry)}>
             <RefreshCw aria-hidden="true" size={18} /> Retry
           </button>

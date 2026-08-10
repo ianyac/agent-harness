@@ -10,13 +10,10 @@ import {
   Search,
   Settings,
 } from "lucide-react";
-import { useState } from "react";
 
 import { SessionRow } from "./SessionRow";
 import type { SessionRecord, SessionRuntimeState } from "./useSessions";
 import styles from "./sessionSidebar.module.css";
-
-const collapsePreferenceKey = "harness.sidebar.collapsed";
 
 type GroupName = "Today" | "Yesterday" | "Earlier";
 
@@ -28,9 +25,8 @@ type SessionSidebarProps = {
   readonly runtimeBySession: Readonly<Record<string, SessionRuntimeState>>;
   readonly connectionStatus?: ConnectionStatus;
   readonly now?: Date;
-  readonly storage?: Pick<Storage, "getItem" | "setItem">;
-  readonly collapsed?: boolean;
-  readonly onCollapsedChange?: (collapsed: boolean) => void;
+  readonly collapsed: boolean;
+  readonly onCollapsedChange: (collapsed: boolean) => void;
   readonly onCreate: () => void | Promise<unknown>;
   readonly onSelect: (sessionId: string) => void;
   readonly onRename: (sessionId: string, title: string) => void | Promise<void>;
@@ -51,30 +47,13 @@ function groupName(session: SessionRecord, now: Date): GroupName {
   return "Earlier";
 }
 
-function browserStorage(): Pick<Storage, "getItem" | "setItem"> | undefined {
-  try {
-    return window.localStorage;
-  } catch {
-    return undefined;
-  }
-}
-
-function initialCollapsed(storage: Pick<Storage, "getItem" | "setItem"> | undefined): boolean {
-  try {
-    return storage?.getItem(collapsePreferenceKey) === "true";
-  } catch {
-    return false;
-  }
-}
-
 export function SessionSidebar({
   sessions,
   activeSessionId,
   runtimeBySession,
   connectionStatus = "connecting",
   now = new Date(),
-  storage,
-  collapsed: controlledCollapsed,
+  collapsed,
   onCollapsedChange,
   onCreate,
   onSelect,
@@ -83,29 +62,13 @@ export function SessionSidebar({
   onSearch,
   onOpenSettings,
 }: SessionSidebarProps) {
-  const effectiveStorage = storage ?? (controlledCollapsed === undefined ? browserStorage() : undefined);
-  const [localCollapsed, setLocalCollapsed] = useState(() => initialCollapsed(effectiveStorage));
-  const collapsed = controlledCollapsed ?? localCollapsed;
-  const visibleSessions = sessions.filter((session) => session.archived_at === null);
   const groups: Record<GroupName, SessionRecord[]> = {
     Today: [],
     Yesterday: [],
     Earlier: [],
   };
-  for (const session of visibleSessions) groups[groupName(session, now)].push(session);
+  for (const session of sessions) groups[groupName(session, now)].push(session);
 
-  const toggleCollapsed = () => {
-    const next = !collapsed;
-    if (controlledCollapsed === undefined) {
-      setLocalCollapsed(next);
-      try {
-        effectiveStorage?.setItem(collapsePreferenceKey, String(next));
-      } catch {
-        // Preference storage is optional; the current view remains usable.
-      }
-    }
-    onCollapsedChange?.(next);
-  };
   const connectionLabel = {
     connecting: "Local service connecting",
     connected: "Local service connected",
@@ -184,6 +147,7 @@ export function SessionSidebar({
                     key={session.session_id}
                     session={session}
                     active={session.session_id === activeSessionId}
+                    collapsed={collapsed}
                     runtime={runtimeBySession[session.session_id]}
                     onSelect={onSelect}
                     onRename={onRename}
@@ -211,7 +175,7 @@ export function SessionSidebar({
           type="button"
           className={styles.collapseButton}
           aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
-          onClick={toggleCollapsed}
+          onClick={() => onCollapsedChange(!collapsed)}
         >
           {collapsed ? (
             <ChevronRight aria-hidden="true" size={18} />

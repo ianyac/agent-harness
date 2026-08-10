@@ -10,6 +10,7 @@ import styles from "./sessionSidebar.module.css";
 type SessionRowProps = {
   readonly session: SessionRecord;
   readonly active: boolean;
+  readonly collapsed: boolean;
   readonly runtime?: SessionRuntimeState;
   readonly onSelect: (sessionId: string) => void;
   readonly onRename: (sessionId: string, title: string) => void | Promise<void>;
@@ -40,6 +41,7 @@ function statusText(runtime: SessionRuntimeState | undefined, active: boolean): 
 export function SessionRow({
   session,
   active,
+  collapsed,
   runtime,
   onSelect,
   onRename,
@@ -70,39 +72,45 @@ export function SessionRow({
     setRenaming(open);
   };
 
+  const sessionButton = (
+    <button
+      type="button"
+      className={styles.sessionButton}
+      aria-label={accessibleName}
+      aria-current={active ? "page" : undefined}
+      onClick={() => onSelect(session.session_id)}
+    >
+      <Circle
+        className={styles.statusIcon}
+        data-status={runtime?.status ?? "idle"}
+        aria-hidden="true"
+        size={12}
+        fill="currentColor"
+      />
+      <span className={styles.sessionCopy} aria-hidden="true">
+        <span className={styles.sessionTitle}>{session.title}</span>
+        <span className={styles.workspace}>{workspace}</span>
+        {status === null ? null : <span className={styles.statusText}>{status}</span>}
+      </span>
+    </button>
+  );
+
   return (
     <li className={styles.row} data-active={active || undefined}>
-      <Tooltip.Root>
-        <Tooltip.Trigger asChild>
-          <button
-            type="button"
-            className={styles.sessionButton}
-            aria-label={accessibleName}
-            aria-current={active ? "page" : undefined}
-            onClick={() => onSelect(session.session_id)}
-          >
-            <Circle
-              className={styles.statusIcon}
-              data-status={runtime?.status ?? "idle"}
-              aria-hidden="true"
-              size={12}
-              fill="currentColor"
-            />
-            <span className={styles.sessionCopy} aria-hidden="true">
-              <span className={styles.sessionTitle}>{session.title}</span>
-              <span className={styles.workspace}>{workspace}</span>
-              {status === null ? null : <span className={styles.statusText}>{status}</span>}
-            </span>
-          </button>
-        </Tooltip.Trigger>
-        <Tooltip.Portal>
-          <Tooltip.Content className={styles.sessionTooltip} side="right" sideOffset={8}>
-            <strong>{session.title}</strong>
-            <span>{session.workspace}</span>
-            {status === null ? null : <span>{status}</span>}
-          </Tooltip.Content>
-        </Tooltip.Portal>
-      </Tooltip.Root>
+      {collapsed ? (
+        <Tooltip.Root>
+          <Tooltip.Trigger asChild>{sessionButton}</Tooltip.Trigger>
+          <Tooltip.Portal>
+            <Tooltip.Content className={styles.sessionTooltip} side="right" sideOffset={8}>
+              <strong>{session.title}</strong>
+              <span>{session.workspace}</span>
+              {status === null ? null : <span>{status}</span>}
+            </Tooltip.Content>
+          </Tooltip.Portal>
+        </Tooltip.Root>
+      ) : (
+        sessionButton
+      )}
       <Dialog.Root open={renaming} onOpenChange={changeRenameOpen}>
         <DropdownMenu.Root>
           <DropdownMenu.Trigger asChild>

@@ -69,10 +69,12 @@ test("retained superseded-session cleanup can be retried", async ({ page, author
     );
   });
   await page.goto(authority.entryPath);
-  await expect(page.getByRole("heading", { name: "Cleanup needs another try" })).toBeVisible();
-  await page.getByRole("button", { name: "Retry cleanup" }).click();
-  await expect(page.getByRole("heading", { name: "Cleanup needs another try" })).toBeVisible();
-  await page.getByRole("button", { name: "Retry cleanup" }).click();
-  await expect(page.getByRole("heading", { name: "Cleanup needs another try" })).toHaveCount(0);
+  const cleanupBanner = page.getByRole("alert").filter({ hasText: "Cleanup needs another try" });
+  await expect(cleanupBanner).toBeVisible();
+  await expect(page.getByRole("textbox", { name: "Message" })).toBeVisible();
+  await cleanupBanner.getByRole("button", { name: "Retry Cleanup" }).click();
+  await expect(cleanupBanner).toBeVisible();
+  await cleanupBanner.getByRole("button", { name: "Retry Cleanup" }).click();
+  await expect(page.getByRole("alert").filter({ hasText: "Cleanup needs another try" })).toHaveCount(0);
   await expect(page.getByRole("textbox", { name: "Message" })).toBeVisible();
 });

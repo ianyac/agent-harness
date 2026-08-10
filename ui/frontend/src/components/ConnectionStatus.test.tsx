@@ -1,4 +1,4 @@
-import { act, cleanup, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ConnectionStatus } from "./ConnectionStatus";
@@ -42,5 +42,31 @@ describe("ConnectionStatus", () => {
       signatures.push(region.querySelector("svg")?.innerHTML ?? "");
     }
     expect(new Set(signatures)).toHaveLength(3);
+  });
+
+  it("renders honest terminal copy for an unrecoverable tab with no reconnecting affordance", () => {
+    vi.useFakeTimers();
+    const onRetry = vi.fn();
+    render(<ConnectionStatus status="unrecoverable" attemptKey="tab:1" onRetry={onRetry} />);
+
+    const alert = screen.getByRole("alert");
+    expect(alert).toHaveTextContent("This tab lost its access to the local service");
+    expect(alert).toHaveTextContent(/page reload signs the tab\s+out/);
+    expect(alert).toHaveTextContent("your sessions and data are safe on disk");
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    expect(alert).not.toHaveTextContent("Still reconnecting");
+
+    act(() => vi.advanceTimersByTime(20_000));
+    expect(screen.getAllByRole("alert")).toHaveLength(1);
+    expect(screen.getByRole("alert")).not.toHaveTextContent("Still reconnecting");
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(onRetry).toHaveBeenCalledTimes(1);
+  });
+
+  it("omits the secondary retry control when no retry handler is wired", () => {
+    render(<ConnectionStatus status="unrecoverable" attemptKey="tab:1" />);
+    expect(screen.getByRole("alert")).toHaveTextContent("This tab lost its access to the local service");
+    expect(screen.queryByRole("button")).not.toBeInTheDocument();
   });
 });

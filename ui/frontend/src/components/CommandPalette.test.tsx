@@ -79,19 +79,19 @@ describe("CommandPalette", () => {
     await user.keyboard("{Meta>}k{/Meta}");
 
     expect(screen.getByRole("dialog", { name: "Command palette" })).toBeVisible();
-    expect(screen.getByRole("button", { name: /New chat.*⌘N/ })).toHaveAttribute(
+    expect(screen.getByRole("option", { name: /New chat.*⌘N/ })).toHaveAttribute(
       "data-command-id",
       "action:new-chat",
     );
-    expect(screen.getByRole("button", { name: /Open settings/ })).toHaveAttribute(
+    expect(screen.getByRole("option", { name: /Open settings/ })).toHaveAttribute(
       "data-command-id",
       "action:open-settings",
     );
-    expect(screen.getByRole("button", { name: /Toggle activity.*⌘⇧I/ })).toHaveAttribute(
+    expect(screen.getByRole("option", { name: /Toggle activity.*⌘⇧I/ })).toHaveAttribute(
       "data-command-id",
       "action:toggle-activity",
     );
-    expect(screen.getByRole("button", { name: /Trace retries.*payments-api/ })).toHaveAttribute(
+    expect(screen.getByRole("option", { name: /Trace retries.*payments-api/ })).toHaveAttribute(
       "data-command-id",
       "session:session-api",
     );
@@ -105,14 +105,14 @@ describe("CommandPalette", () => {
 
     const search = screen.getByRole("searchbox", { name: "Search commands and sessions" });
     await user.type(search, "Trace retries");
-    expect(screen.getByRole("button", { name: /Trace retries.*payments-api/ })).toBeVisible();
-    expect(screen.queryByRole("button", { name: /Polish navigation/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("option", { name: /Trace retries.*payments-api/ })).toBeVisible();
+    expect(screen.queryByRole("option", { name: /Polish navigation/ })).not.toBeInTheDocument();
     await user.clear(search);
     await user.type(search, "dashboard-ui");
 
-    expect(screen.getByRole("button", { name: /Polish navigation.*dashboard-ui/ })).toBeVisible();
-    expect(screen.queryByRole("button", { name: /Trace retries/ })).not.toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: /Polish navigation.*dashboard-ui/ }));
+    expect(screen.getByRole("option", { name: /Polish navigation.*dashboard-ui/ })).toBeVisible();
+    expect(screen.queryByRole("option", { name: /Trace retries/ })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("option", { name: /Polish navigation.*dashboard-ui/ }));
     expect(onSelectSession).toHaveBeenCalledWith("session-ui");
     expect(screen.queryByRole("dialog", { name: "Command palette" })).not.toBeInTheDocument();
   });
@@ -141,12 +141,74 @@ describe("CommandPalette", () => {
     );
 
     await user.keyboard("{Meta>}k{/Meta}");
-    await user.click(screen.getByRole("button", { name: "Open settings" }));
+    await user.click(screen.getByRole("option", { name: "Open settings" }));
     expect(onOpenSettings).toHaveBeenCalledOnce();
 
     await user.keyboard("{Meta>}k{/Meta}");
-    await user.click(screen.getByRole("button", { name: /Toggle activity.*⌘⇧I/ }));
+    await user.click(screen.getByRole("option", { name: /Toggle activity.*⌘⇧I/ }));
     expect(onToggleActivity).toHaveBeenCalledOnce();
+  });
+
+  it("supports listbox arrow navigation with wraparound and Home/End jumps", async () => {
+    const user = userEvent.setup();
+    render(<Harness onNewChat={() => {}} />);
+    await user.keyboard("{Meta>}k{/Meta}");
+
+    const input = screen.getByRole("searchbox", { name: "Search commands and sessions" });
+    const options = screen.getAllByRole("option");
+    expect(options).toHaveLength(5);
+    expect(screen.getByRole("listbox", { name: "Commands and sessions" })).toBeVisible();
+    expect(options[0]).toHaveAttribute("aria-selected", "true");
+    expect(input).toHaveAttribute("aria-activedescendant", options[0].id);
+    expect(input).toHaveAttribute("aria-controls", screen.getByRole("listbox", { name: "Commands and sessions" }).id);
+
+    await user.keyboard("{ArrowDown}");
+    expect(options[1]).toHaveAttribute("aria-selected", "true");
+    expect(options[0]).toHaveAttribute("aria-selected", "false");
+    expect(input).toHaveAttribute("aria-activedescendant", options[1].id);
+
+    await user.keyboard("{ArrowUp}{ArrowUp}");
+    expect(options[4]).toHaveAttribute("aria-selected", "true");
+    await user.keyboard("{ArrowDown}");
+    expect(options[0]).toHaveAttribute("aria-selected", "true");
+
+    await user.keyboard("{End}");
+    expect(options[4]).toHaveAttribute("aria-selected", "true");
+    await user.keyboard("{Home}");
+    expect(options[0]).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("activates the active option with Enter", async () => {
+    const user = userEvent.setup();
+    const onSelectSession = vi.fn();
+    render(<Harness onNewChat={() => {}} onSelectSession={onSelectSession} />);
+    await user.keyboard("{Meta>}k{/Meta}");
+
+    await user.keyboard("{ArrowDown}{ArrowDown}{ArrowDown}");
+    expect(screen.getByRole("option", { name: /Trace retries.*payments-api/ }))
+      .toHaveAttribute("aria-selected", "true");
+    await user.keyboard("{Enter}");
+
+    expect(onSelectSession).toHaveBeenCalledWith("session-api");
+    expect(screen.queryByRole("dialog", { name: "Command palette" })).not.toBeInTheDocument();
+  });
+
+  it("defaults the active option to the first result whenever the query changes", async () => {
+    const user = userEvent.setup();
+    const onNewChat = vi.fn();
+    render(<Harness onNewChat={onNewChat} />);
+    await user.keyboard("{Meta>}k{/Meta}");
+
+    await user.keyboard("{ArrowDown}{ArrowDown}");
+    const input = screen.getByRole("searchbox", { name: "Search commands and sessions" });
+    await user.type(input, "chat");
+
+    const option = screen.getByRole("option", { name: /New chat/ });
+    expect(screen.getAllByRole("option")).toHaveLength(1);
+    expect(option).toHaveAttribute("aria-selected", "true");
+    expect(input).toHaveAttribute("aria-activedescendant", option.id);
+    await user.keyboard("{Enter}");
+    expect(onNewChat).toHaveBeenCalledOnce();
   });
 
   it("stages search focus and restores the invoking control after Escape", async () => {

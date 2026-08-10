@@ -31,9 +31,10 @@ describe("RecoveryView", () => {
     ["invalid_workspace", "The workspace is unavailable."],
     ["session_resume_failure", "This session could not be reopened."],
     ["session_resume_error", "This session could not be reopened."],
-    ["turn_failure", "The turn stopped before it completed."],
+    ["turn_failure", "The turn could not complete. The conversation was rolled back to the last completed message, and your draft is preserved."],
+    ["turn_cancelled", "The turn stopped before it completed."],
     ["sidecar_second_crash", "The local service stopped again."],
-    ["unexpected", "Something went wrong. Your local session data was not changed."],
+    ["unexpected", "The turn could not complete. The conversation was rolled back to the last completed message, and your draft is preserved."],
   ])("maps %s to stable safe recovery copy", (category, copy) => {
     render(
       <RecoveryView
@@ -66,6 +67,48 @@ describe("RecoveryView", () => {
     expect(onArchive).toHaveBeenCalledWith("session-stable");
     expect((await axe.run(container, { rules: { "color-contrast": { enabled: false } } })).violations).toEqual([]);
     await act(async () => archive.resolve());
+  });
+
+  it("distinguishes a failed turn headline from a cancelled one and offers cancelled turns no retry", () => {
+    const { rerender } = render(
+      <RecoveryView
+        error={{ category: "turn_failure", message: "failed" }}
+        sessionId="session-stable"
+        platform={adapter()}
+        onArchive={async () => {}}
+        onRetry={async () => {}}
+      />,
+    );
+    expect(screen.getByRole("heading", { name: "Turn failed" })).toBeVisible();
+
+    rerender(
+      <RecoveryView
+        error={{ category: "turn_cancelled", message: "stopped" }}
+        sessionId="session-stable"
+        platform={adapter()}
+        onArchive={async () => {}}
+        onRetry={async () => {}}
+      />,
+    );
+    expect(screen.getByRole("heading", { name: "Turn stopped" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+  });
+
+  it("treats an unknown raw category exactly like turn_failure, including retry", async () => {
+    const user = userEvent.setup();
+    const onRetry = vi.fn().mockResolvedValue(undefined);
+    render(
+      <RecoveryView
+        error={{ category: "provider_meltdown", message: "raw provider category" }}
+        sessionId="session-stable"
+        platform={adapter()}
+        onArchive={async () => {}}
+        onRetry={onRetry}
+      />,
+    );
+    expect(screen.getByRole("heading", { name: "Turn failed" })).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Retry" }));
+    expect(onRetry).toHaveBeenCalledTimes(1);
   });
 
   it.each(["turn_failure", "session_resume_failure", "session_resume_error"])(

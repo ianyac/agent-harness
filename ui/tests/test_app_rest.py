@@ -180,6 +180,29 @@ def test_create_list_load_rename_and_archive_session(
     assert client.get("/api/sessions").json() == []
 
 
+def test_session_payload_reports_workspace_branch_when_detectable(
+    client: TestClient, workspace: Path
+):
+    created = create_session(client, workspace)
+    assert created["branch"] is None
+
+    git_dir = workspace / ".git"
+    git_dir.mkdir()
+    (git_dir / "HEAD").write_text("ref: refs/heads/feature/polish\n", encoding="utf-8")
+    listed = client.get("/api/sessions").json()[0]
+    assert listed["branch"] == "feature/polish"
+
+    (git_dir / "HEAD").write_text("1234567890abcdef\n", encoding="utf-8")
+    assert client.get("/api/sessions").json()[0]["branch"] is None
+
+    shutil.rmtree(git_dir)
+    linked = workspace / "linked"
+    linked.mkdir()
+    (linked / "HEAD").write_text("ref: refs/heads/worktree-branch\n", encoding="utf-8")
+    (workspace / ".git").write_text(f"gitdir: {linked}\n", encoding="utf-8")
+    assert client.get("/api/sessions").json()[0]["branch"] == "worktree-branch"
+
+
 def test_health_and_config_are_authenticated_and_describe_public_choices(
     client: TestClient, workspace: Path
 ):

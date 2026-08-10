@@ -149,7 +149,7 @@ test("permission, error, inspector, first-run, and increased-contrast states hav
   authority.emit({
     type: "turn_failed", turn_id: "axe-turn", error_category: "turn_failure", message: "fixture detail",
   });
-  await expect(page.getByRole("heading", { name: "Turn stopped" })).toBeVisible();
+  await expect(page.getByRole("alert").filter({ hasText: "Turn failed" })).toBeVisible();
   await assertAxe(page);
 });
 

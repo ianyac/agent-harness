@@ -2,6 +2,7 @@ import { useEffect, useRef } from "react";
 
 import type { PlatformAdapter } from "../../platform/types";
 import type { TranscriptState } from "../../protocol/types";
+import { workspaceName } from "../sessions/SessionRow";
 import type { SessionRecord } from "../sessions/useSessions";
 import type { Preferences } from "./preferences";
 
@@ -30,10 +31,6 @@ function observation(state: TranscriptState): Observation {
       ? `${state.terminal.generation}:${state.terminal.sequence}:${state.terminal.turnId}`
       : null,
   };
-}
-
-function workspaceName(path: string): string {
-  return path.split("/").filter(Boolean).at(-1) ?? path;
 }
 
 export function NotificationObserver({

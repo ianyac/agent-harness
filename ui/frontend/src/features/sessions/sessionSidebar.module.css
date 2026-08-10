@@ -526,7 +526,8 @@
 }
 
 .command:hover,
-.command:focus-visible {
+.command:focus-visible,
+.command[aria-selected="true"] {
   background: color-mix(in srgb, var(--color-accent) 13%, transparent);
 }
 

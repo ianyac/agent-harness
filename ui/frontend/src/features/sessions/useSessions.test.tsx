@@ -93,6 +93,7 @@ function SessionsHarness({ api, storage }: { api: ApiClient; storage?: LedgerSto
       </button>
       <button type="button" onClick={() => void model.archiveSession("session-1")}>Archive</button>
       <button type="button" onClick={() => void model.retryOperation()}>Retry operation</button>
+      <button type="button" onClick={() => model.dismissOperationError()}>Dismiss operation</button>
     </>
   );
 }
@@ -123,6 +124,34 @@ function CleanupHarness({ api, storage }: { api: ApiClient; storage: LedgerStora
       <button type="button" onClick={() => void model.renameSession("current", "Current renamed")}>Rename current</button>
       <button type="button" onClick={() => void model.refresh()}>Refresh</button>
       <button type="button" onClick={() => void model.retryCleanup()}>Retry cleanup</button>
+      <button type="button" onClick={() => model.dismissCleanupError()}>Dismiss cleanup</button>
+    </>
+  );
+}
+
+type RenderFrame = {
+  readonly sessions: number;
+  readonly loading: boolean;
+  readonly config: boolean;
+};
+
+function firstRunGateOpen(frames: readonly RenderFrame[]): boolean {
+  return frames.some((frame) => frame.sessions === 0 && (frame.loading || frame.config));
+}
+
+function RecordingHarness({ api, frames }: { api: ApiClient; frames: RenderFrame[] }) {
+  const model = useSessions(api);
+  frames.push({
+    sessions: model.sessions.length,
+    loading: model.loading,
+    config: model.config !== null,
+  });
+  return (
+    <>
+      <output aria-label="Session titles">{model.sessions.map((item) => item.title).join("|")}</output>
+      <output aria-label="Session readiness">{model.loading ? "loading" : "ready"}</output>
+      <output aria-label="Config readiness">{model.config === null ? "none" : "ready"}</output>
+      <output aria-label="Refresh error">{model.refreshError?.message ?? "none"}</output>
     </>
   );
 }
@@ -745,5 +774,158 @@ describe("useSessions async authority", () => {
       ),
     );
     expect(screen.getByRole("status", { name: "Active session" })).toHaveTextContent("session-2");
+  });
+
+  it("holds the previous client's sessions and config until the replacement's first refresh commits", async () => {
+    const frames: RenderFrame[] = [];
+    const oldClient = client(async (input) => {
+      const path = new URL(input instanceof Request ? input.url : input.toString()).pathname;
+      return Response.json(path === "/api/sessions" ? [session("old-session")] : config);
+    });
+    const newList = deferred<Response>();
+    const newClient = client(async (input) => {
+      const path = new URL(input instanceof Request ? input.url : input.toString()).pathname;
+      return path === "/api/sessions" ? newList.promise : Response.json(config);
+    });
+
+    const { rerender } = render(<RecordingHarness api={oldClient} frames={frames} />);
+    await screen.findByText("old-session", { selector: "output" });
+    frames.length = 0;
+
+    rerender(<RecordingHarness api={newClient} frames={frames} />);
+    expect(screen.getByRole("status", { name: "Session titles" })).toHaveTextContent("old-session");
+    expect(screen.getByRole("status", { name: "Session readiness" })).toHaveTextContent("loading");
+    expect(screen.getByRole("status", { name: "Config readiness" })).toHaveTextContent("ready");
+
+    newList.resolve(Response.json([session("new-session")]));
+    await screen.findByText("new-session", { selector: "output" });
+    expect(screen.getByRole("status", { name: "Session readiness" })).toHaveTextContent("ready");
+    expect(firstRunGateOpen(frames)).toBe(false);
+  });
+
+  it("commits the replacement client's empty state only after its first refresh settles with a failure", async () => {
+    const frames: RenderFrame[] = [];
+    const oldClient = client(async (input) => {
+      const path = new URL(input instanceof Request ? input.url : input.toString()).pathname;
+      return Response.json(path === "/api/sessions" ? [session("old-session")] : config);
+    });
+    const gate = deferred<void>();
+    const newClient = client(async () => {
+      await gate.promise;
+      return new Response(null, { status: 503 });
+    });
+
+    const { rerender } = render(<RecordingHarness api={oldClient} frames={frames} />);
+    await screen.findByText("old-session", { selector: "output" });
+    frames.length = 0;
+
+    rerender(<RecordingHarness api={newClient} frames={frames} />);
+    expect(screen.getByRole("status", { name: "Session titles" })).toHaveTextContent("old-session");
+    expect(screen.getByRole("status", { name: "Session readiness" })).toHaveTextContent("loading");
+
+    gate.resolve();
+    await waitFor(() =>
+      expect(screen.getByRole("status", { name: "Session readiness" })).toHaveTextContent("ready"),
+    );
+    expect(screen.getByRole("status", { name: "Session titles" })).toBeEmptyDOMElement();
+    expect(screen.getByRole("status", { name: "Config readiness" })).toHaveTextContent("none");
+    expect(screen.getByRole("status", { name: "Refresh error" })).not.toHaveTextContent("none");
+    expect(firstRunGateOpen(frames)).toBe(false);
+  });
+
+  it("dismisses a surfaced operation error and leaves nothing to retry", async () => {
+    const user = userEvent.setup();
+    let patches = 0;
+    const api = client(async (input, init) => {
+      const path = new URL(input instanceof Request ? input.url : input.toString()).pathname;
+      if (path === "/api/config") return Response.json(config);
+      if (path === "/api/sessions" && init?.method === "GET") {
+        return Response.json([session("session-1", "Original")]);
+      }
+      if (init?.method === "PATCH") {
+        patches += 1;
+        return Response.json({ error: { type: "invalid_title", message: "Bad title" } }, { status: 422 });
+      }
+      return new Response(null, { status: 404 });
+    });
+    render(<SessionsHarness api={api} />);
+    await screen.findByText("Original", { selector: "output" });
+
+    await user.click(screen.getByRole("button", { name: "First rename" }));
+    expect(await screen.findByRole("status", { name: "Operation error" }))
+      .toHaveTextContent("rename:invalid_title");
+    await user.click(screen.getByRole("button", { name: "Dismiss operation" }));
+    expect(screen.getByRole("status", { name: "Operation error" })).toHaveTextContent("none");
+
+    await user.click(screen.getByRole("button", { name: "Retry operation" }));
+    expect(patches).toBe(1);
+    expect(screen.getByRole("status", { name: "Operation error" })).toHaveTextContent("none");
+  });
+
+  it("does not let an in-flight operation resurrect a dismissed error", async () => {
+    const user = userEvent.setup();
+    const patch = deferred<Response>();
+    const api = client(async (input, init) => {
+      const path = new URL(input instanceof Request ? input.url : input.toString()).pathname;
+      if (path === "/api/config") return Response.json(config);
+      if (path === "/api/sessions" && init?.method === "GET") {
+        return Response.json([session("session-1", "Original")]);
+      }
+      if (init?.method === "PATCH") return patch.promise;
+      return new Response(null, { status: 404 });
+    });
+    render(<SessionsHarness api={api} />);
+    await screen.findByText("Original", { selector: "output" });
+
+    await user.click(screen.getByRole("button", { name: "First rename" }));
+    await user.click(screen.getByRole("button", { name: "Dismiss operation" }));
+    await act(async () => {
+      patch.resolve(new Response(null, { status: 500 }));
+    });
+    expect(screen.getByRole("status", { name: "Operation error" })).toHaveTextContent("none");
+  });
+
+  it("dismisses a surfaced cleanup error while retaining the hidden-session ledger", async () => {
+    const user = userEvent.setup();
+    const staleCreate = deferred<Response>();
+    const values = new Map<string, string>();
+    const storage: LedgerStorage = {
+      getItem: (key) => values.get(key) ?? null,
+      setItem: (key, value) => { values.set(key, value); },
+    };
+    let staleExists = false;
+    const api = client(async (input, init) => {
+      const path = new URL(input instanceof Request ? input.url : input.toString()).pathname;
+      if (path === "/api/health") {
+        return Response.json({ status: "ok", service_id: testServiceId });
+      }
+      if (path === "/api/config") return Response.json(config);
+      if (path === "/api/sessions" && init?.method === "GET") {
+        return Response.json([
+          ...(staleExists ? [session("stale", "Stale create")] : []),
+          session("current", "Current"),
+        ]);
+      }
+      if (path === "/api/sessions" && init?.method === "POST") return staleCreate.promise;
+      if (init?.method === "DELETE") return new Response(null, { status: 503 });
+      return new Response(null, { status: 404 });
+    }, true);
+    render(<CleanupHarness api={api} storage={storage} />);
+    await screen.findByText("Current", { selector: "output" });
+
+    await user.click(screen.getByRole("button", { name: "Create stale" }));
+    await user.click(screen.getByRole("button", { name: "Supersede" }));
+    staleExists = true;
+    staleCreate.resolve(Response.json(session("stale", "Stale create"), { status: 201 }));
+    expect(await screen.findByRole("status", { name: "Cleanup status" }))
+      .toHaveTextContent("cleanup:stale");
+
+    await user.click(screen.getByRole("button", { name: "Dismiss cleanup" }));
+    expect(screen.getByRole("status", { name: "Cleanup status" })).toHaveTextContent("none");
+
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    await waitFor(() => expect(screen.getByRole("status", { name: "Cleanup status" }))
+      .toHaveTextContent("cleanup:stale"));
+    expect(screen.getByRole("status", { name: "Session titles" })).not.toHaveTextContent("Stale create");
   });
 });

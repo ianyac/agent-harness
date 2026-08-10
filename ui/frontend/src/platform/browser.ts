@@ -19,6 +19,18 @@ type BrowserCapture =
 
 let browserCapture: BrowserCapture | undefined;
 
+export type ServiceConnectionUnavailableKind = "token-lost";
+
+export class ServiceConnectionUnavailableError extends Error {
+  readonly kind: ServiceConnectionUnavailableKind;
+
+  constructor(kind: ServiceConnectionUnavailableKind, message: string) {
+    super(message);
+    this.name = "ServiceConnectionUnavailableError";
+    this.kind = kind;
+  }
+}
+
 function staticCapability(pathname: string): string | null {
   const match = /^\/_app\/([A-Za-z0-9_-]{43})(?:\/.*)?$/.exec(pathname);
   return match?.[1] ?? null;
@@ -51,6 +63,14 @@ function readBrowserConnection(environment: BrowserEnvironment): ServiceConnecti
     if (pathCapability === null) {
       throw new Error("Missing or invalid browser static capability.");
     }
+    if (token === null && fragment === "") {
+      // A valid app path with no fragment at all means the token was consumed
+      // by an earlier page lifetime (reload); it cannot be recovered here.
+      throw new ServiceConnectionUnavailableError(
+        "token-lost",
+        "The service access token was lost with the previous page lifetime.",
+      );
+    }
     if (token === null || token === pathCapability) {
       throw new Error("Missing or invalid browser API capability.");
     }
@@ -72,11 +92,22 @@ function readBrowserConnection(environment: BrowserEnvironment): ServiceConnecti
 export function createBrowserPlatform(
   environment: BrowserEnvironment = window,
 ): PlatformAdapter {
-  const connection = readBrowserConnection(environment);
+  let capture:
+    | { readonly connection: ServiceConnection; readonly unavailable?: never }
+    | { readonly connection?: never; readonly unavailable: ServiceConnectionUnavailableError };
+  try {
+    capture = { connection: readBrowserConnection(environment) };
+  } catch (error) {
+    // Token loss is terminal for this page lifetime but must not prevent the
+    // platform from loading; it surfaces through getServiceConnection instead.
+    if (!(error instanceof ServiceConnectionUnavailableError)) throw error;
+    capture = { unavailable: error };
+  }
   return Object.freeze({
     kind: "browser" as const,
     async getServiceConnection(): Promise<ServiceConnection> {
-      return connection;
+      if (capture.unavailable !== undefined) throw capture.unavailable;
+      return capture.connection;
     },
     async chooseWorkspace(): Promise<null> {
       return null;

@@ -1734,20 +1734,35 @@ def test_folding_purge_keeps_public_and_live_session_log_on_one_inode(
         session_path = (
             workspace / ".agent" / "sessions" / f"{session_id}.jsonl"
         )
-        runtime.messages = messages
-        runtime.session_log.record_turn(messages)
-        runtime.folding.sync(messages, runtime.tools)
+        # Folding state is owned by the session's worker lane thread.
+        lane = manager._lane(session_id)
+        loop = asyncio.get_running_loop()
+
+        def seed() -> None:
+            runtime.messages = messages
+            runtime.session_log.record_turn(messages)
+            runtime.folding.sync(messages, runtime.tools)
+
+        await loop.run_in_executor(lane, seed)
         before_purge_inode = session_path.stat().st_ino
 
-        runtime.folding.delete("m2.r0")
+        await loop.run_in_executor(
+            lane, lambda: runtime.folding.delete("m2.r0")
+        )
 
         assert secret not in session_path.read_text()
         assert session_path.stat().st_ino != before_purge_inode
         assert session_path.stat().st_ino == os.fstat(
             runtime.session_log._descriptor
         ).st_ino
-        runtime.messages.append({"role": "assistant", "content": "after purge"})
-        runtime.session_log.record_turn(runtime.messages)
+
+        def append_after_purge() -> None:
+            runtime.messages.append(
+                {"role": "assistant", "content": "after purge"}
+            )
+            runtime.session_log.record_turn(runtime.messages)
+
+        await loop.run_in_executor(lane, append_after_purge)
         persisted = session_path.read_text()
         assert secret not in persisted
         assert "after purge" in persisted

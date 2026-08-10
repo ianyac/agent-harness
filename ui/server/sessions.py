@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import copy
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -203,10 +204,12 @@ class _SessionChannel:
         session_id: str,
         runtime: HarnessRuntime,
         metadata: MetadataStore,
+        lane: ThreadPoolExecutor,
     ) -> None:
         self.session_id = session_id
         self.runtime = runtime
         self.metadata = metadata
+        self.lane = lane
         self.generation = 0
         self.current: SessionConnection | None = None
         self.relay = _EventRelay()
@@ -356,14 +359,16 @@ class _SessionChannel:
         submission_id: str | None,
     ) -> None:
         try:
-            await asyncio.to_thread(
-                runner.run,
-                text,
-                mode,
-                turn_id,
-                self.relay,
-                token,
-                submission_id,
+            await asyncio.get_running_loop().run_in_executor(
+                self.lane,
+                lambda: runner.run(
+                    text,
+                    mode,
+                    turn_id,
+                    self.relay,
+                    token,
+                    submission_id,
+                ),
             )
         finally:
             durability_failed = getattr(
@@ -1350,9 +1355,31 @@ class SessionManager:
         self._runtimes: dict[str, HarnessRuntime] = {}
         self._channels: dict[str, _SessionChannel] = {}
         self._session_lifecycle: dict[str, str] = {}
+        self._lanes: dict[str, ThreadPoolExecutor] = {}
         self._runtime_lock = asyncio.Lock()
         self._closed = False
         self._metadata_closed = False
+
+    def _lane(self, session_id: str) -> ThreadPoolExecutor:
+        """Return the session's dedicated worker lane.
+
+        Runtime construction, turns, and teardown all run on this single
+        thread because folding sessions hold a sqlite connection that must
+        only ever be touched from its creating thread.
+        """
+        lane = self._lanes.get(session_id)
+        if lane is None:
+            lane = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix=f"session-lane-{session_id}",
+            )
+            self._lanes[session_id] = lane
+        return lane
+
+    def _retire_lane(self, session_id: str) -> None:
+        lane = self._lanes.pop(session_id, None)
+        if lane is not None:
+            lane.shutdown(wait=False)
 
     @staticmethod
     def _validated_workspace(workspace: Path | str) -> Path:
@@ -2310,21 +2337,32 @@ class SessionManager:
             # The public RuntimeConfig contract validates constructible modes
             # before HarnessRuntime opens any session artifacts.
             self._runtime_config(provisional)
-            runtime = self._construct_new_runtime(provisional)
+            lane = self._lane(session_id)
+            loop = asyncio.get_running_loop()
+            try:
+                runtime = await loop.run_in_executor(
+                    lane, self._construct_new_runtime, provisional
+                )
+            except BaseException:
+                self._retire_lane(session_id)
+                raise
             lease = self._secure_runtime_lease(runtime)
             try:
                 if lease is not None:
                     lease.publish()
                 record = self.metadata.create_session(provisional)
             except BaseException as error:
-                self._abort_after_failure(runtime, error)
+                await loop.run_in_executor(
+                    lane, self._abort_after_failure, runtime, error
+                )
+                self._retire_lane(session_id)
                 raise
             if lease is not None:
                 lease.commit()
             self._runtimes[session_id] = runtime
             return record
 
-    def _open_runtime_locked(self, session_id: object) -> HarnessRuntime:
+    async def _open_runtime_locked(self, session_id: object) -> HarnessRuntime:
         self._ensure_open()
         record = self._required_record(session_id)
         lifecycle = self._session_lifecycle.get(record.session_id)
@@ -2343,14 +2381,25 @@ class SessionManager:
                 create_parents=False,
             )
             return existing
-        runtime = self._construct_runtime(record)
+        lane = self._lane(record.session_id)
+        loop = asyncio.get_running_loop()
+        try:
+            runtime = await loop.run_in_executor(
+                lane, self._construct_runtime, record
+            )
+        except BaseException:
+            self._retire_lane(record.session_id)
+            raise
         lease = self._secure_runtime_lease(runtime)
         try:
             if lease is not None:
                 lease.publish()
             self.metadata.touch_session(record.session_id)
         except BaseException as error:
-            self._abort_after_failure(runtime, error)
+            await loop.run_in_executor(
+                lane, self._abort_after_failure, runtime, error
+            )
+            self._retire_lane(record.session_id)
             raise
         if lease is not None:
             lease.commit()
@@ -2359,17 +2408,19 @@ class SessionManager:
 
     async def open_runtime(self, session_id: object) -> HarnessRuntime:
         async with self._runtime_lock:
-            return self._open_runtime_locked(session_id)
+            return await self._open_runtime_locked(session_id)
 
     async def connect(self, session_id: object) -> SessionConnection:
         """Claim the next WebSocket generation for an existing session."""
         loop = asyncio.get_running_loop()
         async with self._runtime_lock:
-            runtime = self._open_runtime_locked(session_id)
+            runtime = await self._open_runtime_locked(session_id)
             validated = validate_session_id(session_id)
             channel = self._channels.get(validated)
             if channel is None:
-                channel = _SessionChannel(validated, runtime, self.metadata)
+                channel = _SessionChannel(
+                    validated, runtime, self.metadata, self._lane(validated)
+                )
                 self._channels[validated] = channel
             return channel.connect(loop)
 
@@ -2427,7 +2478,9 @@ class SessionManager:
             runtime = self._runtimes.get(record.session_id)
             if runtime is not None:
                 try:
-                    runtime.close()
+                    await asyncio.get_running_loop().run_in_executor(
+                        self._lane(record.session_id), runtime.close
+                    )
                 except BaseException:
                     self._session_lifecycle[record.session_id] = "cleanup_failed"
                     if channel is not None:
@@ -2435,6 +2488,7 @@ class SessionManager:
                     raise
                 self._runtimes.pop(record.session_id, None)
                 self._channels.pop(record.session_id, None)
+                self._retire_lane(record.session_id)
             try:
                 self.metadata.archive_session(record.session_id)
             except BaseException:
@@ -2444,6 +2498,7 @@ class SessionManager:
                 raise
             self._channels.pop(record.session_id, None)
             self._session_lifecycle.pop(record.session_id, None)
+            self._retire_lane(record.session_id)
 
     @staticmethod
     def _abort_after_failure(
@@ -2489,7 +2544,9 @@ class SessionManager:
                 if session_id in self._channels and session_id not in worker_ready:
                     continue
                 try:
-                    runtime.close()
+                    await asyncio.get_running_loop().run_in_executor(
+                        self._lane(session_id), runtime.close
+                    )
                 except Exception as error:
                     errors.append(error)
                     self._session_lifecycle[session_id] = "cleanup_failed"
@@ -2511,5 +2568,7 @@ class SessionManager:
                     errors.append(error)
                 else:
                     self._metadata_closed = True
+            for session_id in tuple(self._lanes):
+                self._retire_lane(session_id)
         if errors:
             raise ExceptionGroup("session manager close failed", errors)

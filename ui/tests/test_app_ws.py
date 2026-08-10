@@ -989,6 +989,49 @@ def test_set_session_mode_emits_updated_safety_without_constructing_plan(service
             assert updated["safety"]["mode"] == "readOnly"
 
 
+def test_resumed_folding_session_runs_turns_on_its_worker_lane(tmp_path: Path):
+    """Resume opens the folding sqlite ledger during runtime construction;
+    the turn must execute on that same lane thread or sqlite rejects it."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    settings = AppSettings(
+        metadata_path=tmp_path / "metadata.sqlite3",
+        base_workspace=workspace,
+        launch_secret=SECRET,
+        allowed_origins=frozenset({ORIGIN}),
+    )
+
+    first_app = create_app(settings, lambda: WholeTextLLM("first reply"))
+    with TestClient(first_app, base_url=ORIGIN) as client:
+        created = client.post(
+            "/api/sessions",
+            headers=REST_HEADERS,
+            json={
+                "workspace": str(workspace),
+                "mode": "default",
+                "context_mode": "folding",
+                "title": "Folding lane",
+            },
+        )
+        assert created.status_code == 201, created.text
+        session_id = created.json()["session_id"]
+        with connect(client, session_id) as ws:
+            ws.receive_json()
+            ws.send_json({"type": "send_message", "text": "first", "mode": "base"})
+            _, completed = receive_until(ws, "turn_completed")
+            assert completed["final_text"] == "first reply"
+
+    restarted_app = create_app(settings, lambda: WholeTextLLM("resumed reply"))
+    with TestClient(restarted_app, base_url=ORIGIN) as restarted:
+        with connect(restarted, session_id) as ws:
+            snapshot = ws.receive_json()
+            assert snapshot["type"] == "session_snapshot"
+            assert snapshot["messages"] != []
+            ws.send_json({"type": "send_message", "text": "second", "mode": "base"})
+            _, completed = receive_until(ws, "turn_completed")
+            assert completed["final_text"] == "resumed reply"
+
+
 def test_set_session_mode_updates_metadata_and_survives_service_restart(
     tmp_path: Path,
 ):

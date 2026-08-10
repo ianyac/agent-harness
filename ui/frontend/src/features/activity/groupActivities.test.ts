@@ -5,6 +5,8 @@ import type {
   TranscriptState,
   TranscriptAssistantTimelineItem,
   TranscriptBoundaryTimelineItem,
+  TranscriptPermissionTimelineItem,
+  TranscriptPlanReviewTimelineItem,
 } from "../../protocol/types";
 import { event } from "../../protocol/fixtures";
 import { emptyTranscript, transcriptReducer } from "../../protocol/reducer";
@@ -66,8 +68,16 @@ describe("groupActivities", () => {
       text: "I checked this.",
       messageIndex: null,
     };
-    const permission: TranscriptBoundaryTimelineItem = { kind: "boundary", boundary: "permission" };
-    const planReview: TranscriptBoundaryTimelineItem = { kind: "boundary", boundary: "plan_review" };
+    const permission: TranscriptPermissionTimelineItem = {
+      kind: "permission",
+      request: { turnId: "turn-1", requestId: "req-1", action: "bash", scope: "{}", reason: "ask" },
+      resolution: null,
+    };
+    const planReview: TranscriptPlanReviewTimelineItem = {
+      kind: "plan_review",
+      request: { turnId: "turn-1", requestId: "req-2", plan: "Plan text" },
+      resolution: null,
+    };
     const turnCompletion: TranscriptBoundaryTimelineItem = {
       kind: "boundary",
       boundary: "turn_completion",

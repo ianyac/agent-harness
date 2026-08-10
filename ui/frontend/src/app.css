@@ -1,10 +1,11 @@
 #root {
-  min-height: 100dvh;
+  height: 100dvh;
 }
 
 .app-shell {
   display: flex;
-  min-height: 100dvh;
+  height: 100dvh;
+  overflow: hidden;
   background: var(--color-page);
 }
 
@@ -12,7 +13,8 @@
 .native-shell-root {
   --native-titlebar-height: 38px;
   position: relative;
-  min-height: 100dvh;
+  height: 100dvh;
+  overflow: hidden;
   padding-block-start: var(--native-titlebar-height);
   background: var(--color-page);
 }
@@ -20,7 +22,7 @@
 .app-shell--tauri > .session-sidebar,
 .app-shell--tauri > .conversation-shell,
 .native-shell-root > :not(.native-titlebar) {
-  min-height: calc(100dvh - var(--native-titlebar-height));
+  height: calc(100dvh - var(--native-titlebar-height));
 }
 
 .native-titlebar {
@@ -75,6 +77,8 @@
 }
 
 .conversation-main {
+  display: flex;
+  flex-direction: column;
   min-height: 0;
   overflow: hidden;
 }

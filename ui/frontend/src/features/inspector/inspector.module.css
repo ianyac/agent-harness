@@ -408,7 +408,7 @@
   border: 0;
 }
 
-@media (max-width: 799px) {
+@media (max-width: 720px) {
   .inspector[data-narrow] {
     inset-block-start: auto;
     width: 100%;

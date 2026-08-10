@@ -70,7 +70,7 @@ function storedPin(storage: InspectorStorage | undefined, sessionId: string): bo
 }
 
 function useNarrowInspector(): boolean {
-  const query = "(max-width: 799px)";
+  const query = "(max-width: 720px)";
   const [narrow, setNarrow] = useState(() =>
     typeof window !== "undefined" && typeof window.matchMedia === "function"
       ? window.matchMedia(query).matches
@@ -91,9 +91,9 @@ function useNarrowInspector(): boolean {
 
 export function useInspector({ sessionId, storage: providedStorage }: UseInspectorOptions): InspectorModel {
   const storage = providedStorage ?? defaultStorage();
-  const initialPin = sessionId === null ? false : storedPin(storage, sessionId);
-  const [open, setOpen] = useState(initialPin);
-  const [pinned, setPinnedState] = useState(initialPin);
+  const [open, setOpen] = useState(() =>
+    sessionId === null ? false : storedPin(storage, sessionId));
+  const [pinned, setPinnedState] = useState(open);
   const [selectedActivityId, setSelectedActivityId] = useState<string | null>(null);
   const [width, setWidthState] = useState(() => storedWidth(storage));
   const narrow = useNarrowInspector();

@@ -121,7 +121,7 @@ describe("transcriptReducer", () => {
     expect(state.terminal?.submissionId).toBe("submission-exact");
   });
 
-  it("retains real current-turn boundaries and reconciles narration in chronological order", () => {
+  it("retains only decision anchors once completion makes the messages authoritative", () => {
     let state = transcriptReducer(emptyTranscript(), event("turn_started", { sequence: 1 }));
     state = transcriptReducer(
       state,
@@ -174,9 +174,6 @@ describe("transcriptReducer", () => {
     );
 
     expect(timelineOf(state)).toEqual([
-      { kind: "activity", activityId: "read-1" },
-      { kind: "assistant", text: "I found context.", messageIndex: 0 },
-      { kind: "activity", activityId: "read-2" },
       {
         kind: "permission",
         request: {
@@ -188,7 +185,6 @@ describe("transcriptReducer", () => {
         },
         resolution: null,
       },
-      { kind: "activity", activityId: "write-1" },
       {
         kind: "plan_review",
         request: {
@@ -198,11 +194,6 @@ describe("transcriptReducer", () => {
         },
         resolution: null,
       },
-      { kind: "activity", activityId: "agent-1" },
-      { kind: "activity", activityId: "bash-1" },
-      { kind: "boundary", boundary: "activity_error" },
-      { kind: "assistant", text: "Authoritative result", messageIndex: 1 },
-      { kind: "boundary", boundary: "turn_completion" },
     ]);
     expect(state.activities["bash-1"].status).toBe("error");
   });
@@ -228,223 +219,6 @@ describe("transcriptReducer", () => {
 
     state = transcriptReducer(state, event("turn_started", { generation: 2, sequence: 2 }));
     expect(timelineOf(state)).toEqual([]);
-  });
-
-  it("reconciles repeated narration to the current turn rather than a historical match", () => {
-    let state = transcriptReducer(
-      emptyTranscript(),
-      event("session_snapshot", {
-        sequence: 1,
-        messages: [
-          { role: "user", content: "Earlier" },
-          { role: "assistant", content: "Same narration" },
-        ],
-      }),
-    );
-    state = transcriptReducer(state, event("turn_started", { sequence: 2 }));
-    state = transcriptReducer(state, event("assistant_delta", { sequence: 3, text: "Same narration" }));
-    state = transcriptReducer(
-      state,
-      event("activity_started", { sequence: 4, activity_id: "read-current" }),
-    );
-    state = transcriptReducer(state, event("assistant_delta", { sequence: 5, text: "Draft final" }));
-    state = transcriptReducer(
-      state,
-      event("turn_completed", {
-        sequence: 6,
-        final_text: "Final",
-        messages: [
-          { role: "user", content: "Earlier" },
-          { role: "assistant", content: "Same narration" },
-          { role: "user", content: "Current" },
-          { role: "assistant", content: "Same narration", tool_calls: [] },
-          { role: "assistant", content: "Final" },
-        ],
-      }),
-    );
-
-    expect(timelineOf(state)).toEqual([
-      { kind: "assistant", text: "Same narration", messageIndex: 3 },
-      { kind: "activity", activityId: "read-current" },
-      { kind: "assistant", text: "Final", messageIndex: 4 },
-      { kind: "boundary", boundary: "turn_completion" },
-    ]);
-  });
-
-  it("replaces every changed current-turn narration by authoritative position", () => {
-    let state = transcriptReducer(
-      emptyTranscript(),
-      event("session_snapshot", {
-        sequence: 1,
-        messages: [
-          { role: "user", content: "Earlier" },
-          { role: "assistant", content: "Draft before" },
-          { role: "assistant", content: "Historical different" },
-          { role: "user", content: "Current" },
-        ],
-      }),
-    );
-    state = transcriptReducer(state, event("turn_started", { sequence: 2 }));
-    state = transcriptReducer(state, event("assistant_delta", { sequence: 3, text: "Draft before" }));
-    state = transcriptReducer(
-      state,
-      event("activity_started", { sequence: 4, activity_id: "read-current" }),
-    );
-    state = transcriptReducer(state, event("assistant_delta", { sequence: 5, text: "Draft after" }));
-    state = transcriptReducer(
-      state,
-      event("turn_completed", {
-        sequence: 6,
-        final_text: "Authoritative after",
-        messages: [
-          { role: "user", content: "Earlier" },
-          { role: "assistant", content: "Draft before" },
-          { role: "assistant", content: "Historical different" },
-          { role: "user", content: "Current" },
-          { role: "assistant", content: "Authoritative before" },
-          { role: "assistant", content: "Authoritative after" },
-        ],
-      }),
-    );
-
-    expect(timelineOf(state)).toEqual([
-      { kind: "assistant", text: "Authoritative before", messageIndex: 4 },
-      { kind: "activity", activityId: "read-current" },
-      { kind: "assistant", text: "Authoritative after", messageIndex: 5 },
-      { kind: "boundary", boundary: "turn_completion" },
-    ]);
-    expect(state.messages).toEqual([
-      { role: "user", content: "Earlier" },
-      { role: "assistant", content: "Draft before" },
-      { role: "assistant", content: "Historical different" },
-      { role: "user", content: "Current" },
-      { role: "assistant", content: "Authoritative before" },
-      { role: "assistant", content: "Authoritative after" },
-    ]);
-  });
-
-  it("discards surplus draft segments when completion has fewer authoritative messages", () => {
-    let state = transcriptReducer(emptyTranscript(), event("turn_started", { sequence: 1 }));
-    state = transcriptReducer(state, event("assistant_delta", { sequence: 2, text: "Draft one" }));
-    state = transcriptReducer(
-      state,
-      event("activity_started", { sequence: 3, activity_id: "read-one" }),
-    );
-    state = transcriptReducer(state, event("assistant_delta", { sequence: 4, text: "Draft two" }));
-    state = transcriptReducer(
-      state,
-      event("activity_started", { sequence: 5, activity_id: "read-two" }),
-    );
-    state = transcriptReducer(state, event("assistant_delta", { sequence: 6, text: "Draft surplus" }));
-    state = transcriptReducer(
-      state,
-      event("turn_completed", {
-        sequence: 7,
-        final_text: "Authoritative two",
-        messages: [
-          { role: "user", content: "Current" },
-          { role: "assistant", content: "Authoritative one" },
-          { role: "assistant", content: "Authoritative two" },
-        ],
-      }),
-    );
-
-    expect(timelineOf(state)).toEqual([
-      { kind: "assistant", text: "Authoritative one", messageIndex: 1 },
-      { kind: "activity", activityId: "read-one" },
-      { kind: "assistant", text: "Authoritative two", messageIndex: 2 },
-      { kind: "activity", activityId: "read-two" },
-      { kind: "boundary", boundary: "turn_completion" },
-    ]);
-  });
-
-  it("appends surplus authoritative messages after the known current-turn timeline", () => {
-    let state = transcriptReducer(emptyTranscript(), event("turn_started", { sequence: 1 }));
-    state = transcriptReducer(state, event("assistant_delta", { sequence: 2, text: "Only draft" }));
-    state = transcriptReducer(
-      state,
-      event("activity_started", { sequence: 3, activity_id: "read-current" }),
-    );
-    state = transcriptReducer(
-      state,
-      event("turn_completed", {
-        sequence: 4,
-        final_text: "Authoritative two",
-        messages: [
-          { role: "user", content: "Current" },
-          { role: "assistant", content: "Authoritative one" },
-          { role: "assistant", content: "Authoritative two" },
-        ],
-      }),
-    );
-
-    expect(timelineOf(state)).toEqual([
-      { kind: "assistant", text: "Authoritative one", messageIndex: 1 },
-      { kind: "activity", activityId: "read-current" },
-      { kind: "assistant", text: "Authoritative two", messageIndex: 2 },
-      { kind: "boundary", boundary: "turn_completion" },
-    ]);
-  });
-
-  it("does not let an empty draft segment consume an authoritative position", () => {
-    let state = transcriptReducer(emptyTranscript(), event("turn_started", { sequence: 1 }));
-    state = transcriptReducer(state, event("assistant_delta", { sequence: 2, text: "" }));
-    state = transcriptReducer(
-      state,
-      event("activity_started", { sequence: 3, activity_id: "read-current" }),
-    );
-    state = transcriptReducer(state, event("assistant_delta", { sequence: 4, text: "Real draft" }));
-    state = transcriptReducer(
-      state,
-      event("turn_completed", {
-        sequence: 5,
-        final_text: "Authoritative narration",
-        messages: [
-          { role: "user", content: "Current" },
-          { role: "assistant", content: "Authoritative narration" },
-        ],
-      }),
-    );
-
-    expect(timelineOf(state)).toEqual([
-      { kind: "activity", activityId: "read-current" },
-      { kind: "assistant", text: "Authoritative narration", messageIndex: 1 },
-      { kind: "boundary", boundary: "turn_completion" },
-    ]);
-  });
-
-  it("skips visually empty structured messages before positional reconciliation", () => {
-    let state = transcriptReducer(emptyTranscript(), event("turn_started", { sequence: 1 }));
-    state = transcriptReducer(state, event("assistant_delta", { sequence: 2, text: "Draft before" }));
-    state = transcriptReducer(
-      state,
-      event("activity_started", { sequence: 3, activity_id: "read-current" }),
-    );
-    state = transcriptReducer(state, event("assistant_delta", { sequence: 4, text: "Draft after" }));
-    state = transcriptReducer(
-      state,
-      event("turn_completed", {
-        sequence: 5,
-        final_text: "Authoritative after",
-        messages: [
-          { role: "user", content: "Current" },
-          { role: "assistant", content: [{ type: "text", text: "" }] },
-          { role: "assistant", content: [{ type: "text", text: "Authoritative before" }] },
-          {
-            role: "assistant",
-            content: [{ type: "text", text: "" }, { type: "text", text: "" }],
-          },
-          { role: "assistant", content: [{ type: "text", text: "Authoritative after" }] },
-        ],
-      }),
-    );
-
-    expect(timelineOf(state)).toEqual([
-      { kind: "assistant", text: "Authoritative before", messageIndex: 2 },
-      { kind: "activity", activityId: "read-current" },
-      { kind: "assistant", text: "Authoritative after", messageIndex: 4 },
-      { kind: "boundary", boundary: "turn_completion" },
-    ]);
   });
 
   it("rejects stale generations, duplicates, and out-of-order sequences", () => {
@@ -767,6 +541,41 @@ describe("transcriptReducer", () => {
     expect(state.stopping).toBe(true);
     state = transcriptReducer(state, event("turn_cancelled", { sequence: 4 }));
     expect(state).toMatchObject({ running: false, stopping: false, streamingText: "", error: null });
+  });
+
+  it("finalizes still-running activities when a turn ends without their completion", () => {
+    let state = transcriptReducer(emptyTranscript(), event("turn_started", { sequence: 1 }));
+    state = transcriptReducer(
+      state,
+      event("activity_started", { sequence: 2, activity_id: "bash-hung", name: "bash" }),
+    );
+    state = transcriptReducer(
+      state,
+      event("activity_started", { sequence: 3, activity_id: "read-done", name: "read_file" }),
+    );
+    state = transcriptReducer(
+      state,
+      event("activity_completed", { sequence: 4, activity_id: "read-done", name: "read_file" }),
+    );
+    state = transcriptReducer(state, event("turn_cancelled", { sequence: 5 }));
+
+    expect(state.activities["bash-hung"]).toMatchObject({
+      status: "error",
+      isError: true,
+      result: "Interrupted before completion.",
+    });
+    expect(state.activities["read-done"].status).toBe("complete");
+
+    let failed = transcriptReducer(emptyTranscript(), event("turn_started", { sequence: 1 }));
+    failed = transcriptReducer(
+      failed,
+      event("activity_started", { sequence: 2, activity_id: "bash-hung", name: "bash" }),
+    );
+    failed = transcriptReducer(
+      failed,
+      event("turn_failed", { sequence: 3, error_category: "provider", message: "offline" }),
+    );
+    expect(failed.activities["bash-hung"]).toMatchObject({ status: "error", isError: true });
   });
 
   it("surfaces a recoverable failure and clears it at the next turn", () => {

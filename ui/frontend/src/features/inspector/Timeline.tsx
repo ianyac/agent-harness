@@ -10,6 +10,7 @@ import {
 } from "lucide-react";
 import type { CSSProperties } from "react";
 
+import { messageHistory } from "../../protocol/history";
 import type { ActivityItem, TranscriptState, TranscriptTimelineItem } from "../../protocol/types";
 import styles from "./inspector.module.css";
 
@@ -45,9 +46,7 @@ function activityDepth(activity: ActivityItem, activities: TranscriptState["acti
 function boundaryLabel(boundary: Extract<TranscriptTimelineItem, { kind: "boundary" }>["boundary"]): string {
   if (boundary === "turn_completion") return "Turn complete";
   if (boundary === "activity_error" || boundary === "error") return "Error";
-  if (boundary === "subagent_completion") return "Subagent complete";
-  if (boundary === "permission") return "Permission boundary";
-  return "Plan review boundary";
+  return "Subagent complete";
 }
 
 type TimelineProps = {
@@ -57,13 +56,36 @@ type TimelineProps = {
 };
 
 export function Timeline({ state, selectedActivityId, onSelectActivity }: TimelineProps) {
+  const historical = messageHistory(state.messages).groups
+    .flatMap((group) => group.activities);
   return (
     <section className={styles.timelineSection} aria-labelledby="inspector-timeline-title">
       <h3 id="inspector-timeline-title">Timeline</h3>
-      {state.timeline.length === 0 ? (
-        <p className={styles.empty}>No activity recorded for this turn.</p>
+      {state.timeline.length === 0 && historical.length === 0 ? (
+        <p className={styles.empty}>No activity recorded yet.</p>
       ) : (
         <ol className={styles.timeline}>
+          {historical.map((activity) => (
+            <li
+              key={`history-${activity.activityId}`}
+              className={styles.timelineItem}
+              aria-label={`${readable(activity.name)}, ${activity.actor}`}
+              aria-level={1}
+              style={{ "--activity-depth": 1 } as CSSProperties}
+            >
+              <button
+                type="button"
+                className={styles.timelineActivity}
+                aria-current={selectedActivityId === activity.activityId ? "true" : undefined}
+                onClick={() => onSelectActivity(activity.activityId)}
+              >
+                {activity.actor === "subagent"
+                  ? <Bot aria-hidden="true" size={16} />
+                  : <Wrench aria-hidden="true" size={16} />}
+                <span><strong>{readable(activity.name)}</strong><small>{activity.actor} · {activity.status}</small></span>
+              </button>
+            </li>
+          ))}
           {state.timeline.map((item, index) => {
             if (item.kind === "activity") {
               const activity = state.activities[item.activityId];

@@ -10,6 +10,7 @@ import type {
 } from "../activity/groupActivities";
 import { PermissionCard } from "../permissions/PermissionCard";
 import { PlanReviewCard } from "../plan-review/PlanReviewCard";
+import { messageHistory } from "../../protocol/history";
 import type { ActivityItem, ClientEvent, TranscriptState } from "../../protocol/types";
 import type { CopyText } from "./CodeBlock";
 import { ConversationSearch } from "./ConversationSearch";
@@ -50,10 +51,12 @@ export function Conversation({
   onSessionEvent = () => {},
 }: ConversationProps) {
   const instanceId = useId().replaceAll(":", "");
+  const rootRef = useRef<HTMLDivElement>(null);
   const scrollerRef = useRef<HTMLDivElement>(null);
   const wasNearBottom = useRef(true);
   const focusOrigin = useRef<HTMLElement | null>(null);
   const previousRunning = useRef(state.running);
+  const previousOptimisticCount = useRef(optimisticUserMessages.length);
   const [hasNewMessages, setHasNewMessages] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const [announcement, setAnnouncement] = useState("");
@@ -64,16 +67,16 @@ export function Conversation({
     }),
     [state.messages],
   );
+  const history = useMemo(() => messageHistory(state.messages), [state.messages]);
   const reservedMessageIndices = new Set(state.timeline.flatMap((item) =>
     item.kind === "assistant" && item.messageIndex !== null ? [item.messageIndex] : [],
   ));
   const ordinaryMessages = visibleMessages.filter(
     (message) => !reservedMessageIndices.has(message.messageIndex),
   );
-  const orderedActivities = state.activityOrder.flatMap((id) => {
-    const item = state.activities[id];
-    return item === undefined ? [] : [item];
-  });
+  const ordinaryByIndex = new Map(
+    ordinaryMessages.map((message) => [message.messageIndex, message]),
+  );
   const resolvedTimeline: Array<ActivityItem | TimelineMarker> = [];
   for (const item of state.timeline) {
     if (item.kind !== "activity") {
@@ -83,14 +86,13 @@ export function Conversation({
     const activity = state.activities[item.activityId];
     if (activity !== undefined) resolvedTimeline.push(activity);
   }
-  const timelineItems: GroupedTimelineItem[] = state.timeline.length === 0
-    ? groupActivities(orderedActivities)
-    : groupActivities(resolvedTimeline);
+  const timelineItems: GroupedTimelineItem[] = groupActivities(resolvedTimeline);
   const timelineAssistants = timelineItems.flatMap((item, timelineIndex) =>
     isActivityGroup(item) || item.kind !== "assistant"
       ? []
       : [{ ...item, timelineIndex }],
   );
+  const optimisticBeforeTimeline = state.activeTurn !== null;
   const searchMessages: SearchableMessage[] = ordinaryMessages.map((message) => ({
     id: `${instanceId}-message-${message.messageIndex}`,
     text: message.content,
@@ -103,13 +105,18 @@ export function Conversation({
     id: `${instanceId}-timeline-${item.timelineIndex}`,
     text: item.text,
   })));
-  if (state.timeline.length === 0 && state.streamingText !== "") {
-    searchMessages.push({ id: `${instanceId}-streaming`, text: state.streamingText });
-  }
   const optimisticVersion = optimisticUserMessages
     .map((message) => `${message.submissionId}:${message.content.length}`)
     .join("|");
-  const contentVersion = `${state.generation}:${state.lastSequence}:${visibleMessages.length}:${state.streamingText.length}:${state.activityOrder.length}:${optimisticVersion}`;
+  const timelineVersion = state.timeline
+    .map((item) => item.kind === "assistant" ? `a${item.text.length}` : item.kind[0])
+    .join("");
+  const contentVersion = `${state.generation}:${visibleMessages.length}:${history.groups.length}:${timelineVersion}:${optimisticVersion}`;
+  const empty = visibleMessages.length === 0
+    && history.groups.length === 0
+    && state.timeline.length === 0
+    && optimisticUserMessages.length === 0
+    && !state.running;
 
   useEffect(() => {
     if (!ownsSearchShortcut) return;
@@ -117,7 +124,11 @@ export function Conversation({
       if (!event.metaKey || event.ctrlKey || event.altKey || event.shiftKey || event.repeat) return;
       if (event.key.toLocaleLowerCase() !== "f") return;
       event.preventDefault();
-      if (!searchOpen && document.activeElement instanceof HTMLElement) {
+      if (searchOpen) {
+        rootRef.current?.querySelector("input")?.focus();
+        return;
+      }
+      if (document.activeElement instanceof HTMLElement) {
         focusOrigin.current = document.activeElement;
       }
       setSearchOpen(true);
@@ -138,8 +149,11 @@ export function Conversation({
   useLayoutEffect(() => {
     const scroller = scrollerRef.current;
     if (scroller === null) return;
-    if (wasNearBottom.current) {
+    const sentJustNow = optimisticUserMessages.length > previousOptimisticCount.current;
+    previousOptimisticCount.current = optimisticUserMessages.length;
+    if (wasNearBottom.current || sentJustNow) {
       scroller.scrollTop = scroller.scrollHeight;
+      wasNearBottom.current = true;
       setHasNewMessages(false);
     } else {
       setHasNewMessages(true);
@@ -163,8 +177,18 @@ export function Conversation({
     setHasNewMessages(false);
   };
 
+  const optimisticBlock = optimisticUserMessages.map((message) => (
+    <Message
+      key={`optimistic-${message.submissionId}`}
+      id={`${instanceId}-optimistic-${message.submissionId}`}
+      role="user"
+      content={message.content}
+      copyText={copyText}
+    />
+  ));
+
   return (
-    <div className={styles.conversation}>
+    <div ref={rootRef} className={styles.conversation}>
       {searchOpen ? <ConversationSearch messages={searchMessages} onClose={closeSearch} /> : null}
       <div
         ref={scrollerRef}
@@ -179,24 +203,40 @@ export function Conversation({
         }}
       >
         <div className={styles.transcript}>
-          {ordinaryMessages.map((message) => (
-            <Message
-              key={`${message.messageIndex}-${message.role}`}
-              id={`${instanceId}-message-${message.messageIndex}`}
-              role={message.role}
-              content={message.content}
-              copyText={copyText}
-            />
-          ))}
-          {optimisticUserMessages.map((message) => (
-            <Message
-              key={`optimistic-${message.submissionId}`}
-              id={`${instanceId}-optimistic-${message.submissionId}`}
-              role="user"
-              content={message.content}
-              copyText={copyText}
-            />
-          ))}
+          {empty ? (
+            <div className={styles.emptyState}>
+              <p className={styles.emptyTitle}>Start a conversation</p>
+              <p className={styles.emptyHint}>
+                The agent works in your workspace and asks before anything
+                sensitive. Press <kbd>&#8984;K</kbd> for commands and sessions.
+              </p>
+            </div>
+          ) : null}
+          {state.messages.map((message, messageIndex) => {
+            const visible = ordinaryByIndex.get(messageIndex);
+            const group = history.groupsByStartIndex.get(messageIndex);
+            if (visible === undefined && group === undefined) return null;
+            return (
+              <div key={`flow-${messageIndex}`} className={styles.flowItem}>
+                {visible === undefined ? null : (
+                  <Message
+                    id={`${instanceId}-message-${messageIndex}`}
+                    role={visible.role}
+                    content={visible.content}
+                    copyText={copyText}
+                  />
+                )}
+                {group === undefined ? null : groupActivities([...group.activities]).map((sub) => (
+                  <ActivityCard
+                    key={sub[0].activityId}
+                    activities={sub}
+                    openInspector={openInspector}
+                  />
+                ))}
+              </div>
+            );
+          })}
+          {optimisticBeforeTimeline ? optimisticBlock : null}
           {timelineItems.map((item, timelineIndex) => {
             if (isActivityGroup(item)) {
               return (
@@ -245,15 +285,7 @@ export function Conversation({
               />
             );
           })}
-          {state.timeline.length === 0 && state.streamingText !== "" ? (
-            <Message
-              id={`${instanceId}-streaming`}
-              role="assistant"
-              content={state.streamingText}
-              streaming
-              copyText={copyText}
-            />
-          ) : null}
+          {optimisticBeforeTimeline ? null : optimisticBlock}
         </div>
       </div>
       <span className={styles.srOnly} role="status" aria-label="Conversation update">

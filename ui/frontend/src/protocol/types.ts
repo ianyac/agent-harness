@@ -254,8 +254,6 @@ export type TranscriptActiveTurn = {
 };
 
 export type TranscriptBoundary =
-  | "permission"
-  | "plan_review"
   | "activity_error"
   | "subagent_completion"
   | "error"

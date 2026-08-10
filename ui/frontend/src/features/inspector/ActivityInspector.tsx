@@ -3,6 +3,7 @@ import { Copy, PanelRightClose, Pin, PinOff } from "lucide-react";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { CSSProperties, KeyboardEvent, PointerEvent as ReactPointerEvent } from "react";
 
+import { messageHistory } from "../../protocol/history";
 import type { ActivityItem, JsonValue, TranscriptState } from "../../protocol/types";
 import { copyToClipboard } from "../conversation/CodeBlock";
 import type { CopyText } from "../conversation/CodeBlock";
@@ -26,7 +27,7 @@ export function serializeInspectorValue(value: JsonValue): string {
 }
 
 function duration(activity: ActivityItem): string {
-  if (activity.durationMs === undefined) return "Unknown";
+  if (activity.durationMs === undefined) return "Not recorded";
   if (activity.durationMs < 1_000) return `${activity.durationMs}ms`;
   const seconds = activity.durationMs / 1_000;
   return `${Number.isInteger(seconds) ? seconds.toFixed(0) : seconds.toFixed(1)}s`;
@@ -70,7 +71,7 @@ function SelectedActivity({
       </div>
       <dl className={styles.detailMeta}>
         <div><dt>Duration</dt><dd>{duration(activity)}</dd></div>
-        <div><dt>Error</dt><dd>{activity.isError === undefined ? "Unknown" : activity.isError ? "Yes" : "No"}</dd></div>
+        <div><dt>Error</dt><dd>{activity.isError === undefined ? "Not recorded" : activity.isError ? "Yes" : "No"}</dd></div>
       </dl>
       <Payload label="Arguments" value={activity.args} onCopy={onCopy} />
       {activity.result === undefined ? null : (
@@ -124,7 +125,12 @@ export function ActivityInspector({
     readonly id: number;
     readonly status: "copied" | "error";
   } | null>(null);
-  const selected = selectedActivityId === null ? undefined : state.activities[selectedActivityId];
+  const [dragWidth, setDragWidth] = useState<number | null>(null);
+  const dragWidthRef = useRef<number | null>(null);
+  const selected = selectedActivityId === null
+    ? undefined
+    : state.activities[selectedActivityId]
+      ?? messageHistory(state.messages).byId.get(selectedActivityId);
   const clampedWidth = clampInspectorWidth(width);
   currentView.current = { sessionId, selectedActivityId };
 
@@ -174,13 +180,18 @@ export function ActivityInspector({
     const startX = event.clientX;
     const startWidth = clampedWidth;
     const onMove = (move: PointerEvent) => {
-      onWidthChange(clampInspectorWidth(startWidth + startX - move.clientX));
+      const next = clampInspectorWidth(startWidth + startX - move.clientX);
+      dragWidthRef.current = next;
+      setDragWidth(next);
     };
     const stop = () => {
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", stop);
       window.removeEventListener("pointercancel", stop);
       if (stopPointerResize.current === stop) stopPointerResize.current = null;
+      if (dragWidthRef.current !== null) onWidthChange(dragWidthRef.current);
+      dragWidthRef.current = null;
+      setDragWidth(null);
     };
     stopPointerResize.current = stop;
     window.addEventListener("pointermove", onMove);
@@ -196,13 +207,15 @@ export function ActivityInspector({
           className={styles.inspector}
           data-narrow={narrow || undefined}
           data-modal={String(narrow)}
-          style={{ "--inspector-width": `${clampedWidth}px` } as CSSProperties}
+          style={{ "--inspector-width": `${dragWidth ?? clampedWidth}px` } as CSSProperties}
           onOpenAutoFocus={(event) => {
             event.preventDefault();
             closeRef.current?.focus();
           }}
           onCloseAutoFocus={(event) => event.preventDefault()}
-          onInteractOutside={(event) => event.preventDefault()}
+          onInteractOutside={(event) => {
+            if (!narrow) event.preventDefault();
+          }}
         >
           {!narrow ? (
             <div
@@ -212,7 +225,7 @@ export function ActivityInspector({
               aria-orientation="vertical"
               aria-valuemin={INSPECTOR_MIN_WIDTH}
               aria-valuemax={INSPECTOR_MAX_WIDTH}
-              aria-valuenow={clampedWidth}
+              aria-valuenow={dragWidth ?? clampedWidth}
               tabIndex={0}
               onKeyDown={onResizeKey}
               onPointerDown={startPointerResize}

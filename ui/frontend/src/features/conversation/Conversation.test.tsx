@@ -299,11 +299,14 @@ describe("Conversation", () => {
   it("appends streaming text and then replaces it with the authoritative completed message", () => {
     const { rerender } = render(
       <Conversation
-        state={transcript({
-          messages: messages({ role: "user", content: "Question" }),
-          streamingText: "Draft answer",
-          running: true,
-        })}
+        state={{
+          ...transcript({
+            messages: messages({ role: "user", content: "Question" }),
+            streamingText: "Draft answer",
+            running: true,
+          }),
+          timeline: [{ kind: "assistant", text: "Draft answer", messageIndex: null }],
+        } as TranscriptState}
         openInspector={() => {}}
       />,
     );
@@ -412,6 +415,14 @@ describe("Conversation", () => {
           { role: "assistant", content: "Historical different" },
           { role: "user", content: "Current" },
           { role: "assistant", content: "Authoritative before" },
+          {
+            role: "assistant",
+            content: null,
+            tool_calls: [
+              { id: "call_1", type: "function", function: { name: "read_file", arguments: "{}" } },
+            ],
+          },
+          { role: "tool", tool_call_id: "call_1", content: "read complete" },
           { role: "assistant", content: "Authoritative after" },
         ],
       }),
@@ -598,7 +609,11 @@ describe("Conversation", () => {
           {
             role: "assistant",
             content: [{ type: "text", text: "" }, { type: "text", text: "" }],
+            tool_calls: [
+              { id: "call_1", type: "function", function: { name: "read_file", arguments: "{}" } },
+            ],
           },
+          { role: "tool", tool_call_id: "call_1", content: "read complete" },
           { role: "assistant", content: [{ type: "text", text: "Authoritative after" }] },
         ],
       }),
@@ -615,6 +630,92 @@ describe("Conversation", () => {
     expect(screen.queryByText("Draft after")).not.toBeInTheDocument();
     expect((before?.compareDocumentPosition(work) ?? 0) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
     expect(work.compareDocumentPosition(after as Node) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+  });
+
+  it("rebuilds activity cards from an authoritative snapshot after a reload", () => {
+    const state = transcriptReducer(
+      emptyTranscript(),
+      event("session_snapshot", {
+        sequence: 1,
+        messages: [
+          { role: "user", content: "read" },
+          {
+            role: "assistant",
+            content: null,
+            tool_calls: [
+              {
+                id: "call_1",
+                type: "function",
+                function: { name: "read_file", arguments: "{\"path\": \"notes.txt\"}" },
+              },
+            ],
+          },
+          { role: "tool", tool_call_id: "call_1", content: "Meeting notes" },
+          { role: "assistant", content: "Done." },
+          { role: "user", content: "next" },
+          {
+            role: "assistant",
+            content: null,
+            tool_calls: [
+              { id: "call_2", type: "function", function: { name: "bash", arguments: "{}" } },
+            ],
+          },
+          { role: "tool", tool_call_id: "call_2", content: "exit code: 0" },
+          { role: "assistant", content: "Ran it." },
+        ],
+      }),
+    );
+    const openInspector = vi.fn();
+    render(<Conversation state={state} openInspector={openInspector} />);
+
+    const cards = screen.getAllByRole("button", { name: /Open activity/ });
+    expect(cards).toHaveLength(2);
+    const ask = screen.getByText("read");
+    const done = screen.getByText("Done.");
+    expect(ask.compareDocumentPosition(cards[0]) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+    expect(cards[0].compareDocumentPosition(done) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+    fireEvent.click(cards[0]);
+    expect(openInspector).toHaveBeenCalledWith("history:1:call_1");
+  });
+
+  it("keeps a completed turn's activity card once messages become authoritative", () => {
+    let state = transcriptReducer(emptyTranscript(), event("turn_started", { sequence: 1 }));
+    state = transcriptReducer(
+      state,
+      event("activity_started", { sequence: 2, activity_id: "live-read", name: "read_file" }),
+    );
+    state = transcriptReducer(
+      state,
+      event("activity_completed", { sequence: 3, activity_id: "live-read", name: "read_file" }),
+    );
+    state = transcriptReducer(
+      state,
+      event("turn_completed", {
+        sequence: 4,
+        final_text: "Done.",
+        messages: [
+          { role: "user", content: "read" },
+          {
+            role: "assistant",
+            content: null,
+            tool_calls: [
+              { id: "call_1", type: "function", function: { name: "read_file", arguments: "{}" } },
+            ],
+          },
+          { role: "tool", tool_call_id: "call_1", content: "contents" },
+          { role: "assistant", content: "Done." },
+        ],
+      }),
+    );
+    render(<Conversation state={state} openInspector={() => {}} />);
+
+    expect(screen.getAllByRole("button", { name: /Open activity/ })).toHaveLength(1);
+    expect(screen.getByText("Done.")).toBeVisible();
+  });
+
+  it("shows a calm empty state for a fresh conversation", () => {
+    render(<Conversation state={transcript()} openInspector={() => {}} />);
+    expect(screen.getByText("Start a conversation")).toBeVisible();
   });
 
   it("auto-scrolls only from near the bottom and otherwise offers New messages", async () => {
@@ -680,15 +781,19 @@ describe("Conversation", () => {
         state={transcript({
           activities: { [first.activityId]: first, [second.activityId]: second },
           activityOrder: [first.activityId, second.activityId],
+          timeline: [
+            { kind: "activity", activityId: first.activityId },
+            { kind: "activity", activityId: second.activityId },
+          ],
         })}
         openInspector={openInspector}
       />,
     );
 
     const card = screen.getByRole("button", { name: /Open activity/ });
-    expect(card).toHaveAccessibleName(/Complete.*34\.5s.*2 actions.*18 tests passed/);
+    expect(card).toHaveAccessibleName(/Complete.*34s.*2 actions.*18 tests passed/);
     expect(card).toHaveTextContent("Complete");
-    expect(card).toHaveTextContent("34.5s");
+    expect(card).toHaveTextContent("34s");
     expect(card).toHaveTextContent("2 actions");
     expect(card).toHaveTextContent("18 tests passed");
     expect(card).toHaveTextContent("x".repeat(400));
@@ -712,6 +817,7 @@ describe("Conversation", () => {
         state={transcript({
           activities: { [running.activityId]: running },
           activityOrder: [running.activityId],
+          timeline: [{ kind: "activity", activityId: running.activityId }],
         })}
         openInspector={() => {}}
       />,
@@ -732,6 +838,7 @@ describe("Conversation", () => {
         state={transcript({
           activities: { [completed.activityId]: completed },
           activityOrder: [completed.activityId],
+          timeline: [{ kind: "activity", activityId: completed.activityId }],
         })}
         openInspector={() => {}}
       />,

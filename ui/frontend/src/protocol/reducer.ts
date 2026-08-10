@@ -101,51 +101,6 @@ function streamedText(timeline: readonly TranscriptTimelineItem[]): string {
   return timeline.flatMap((item) => item.kind === "assistant" ? [item.text] : []).join("");
 }
 
-function messageText(message: HarnessMessage): string | null {
-  if (message.role !== "assistant") return null;
-  if (typeof message.content === "string") return message.content === "" ? null : message.content;
-  if (!Array.isArray(message.content)) return null;
-  const parts = message.content.flatMap((part) => {
-    if (typeof part === "string") return [part];
-    if (part === null || Array.isArray(part) || typeof part !== "object") return [];
-    return typeof part.text === "string" ? [part.text] : [];
-  });
-  const text = parts.join("\n");
-  return text.trim() === "" ? null : text;
-}
-
-function reconcileAssistantTimeline(
-  timeline: readonly TranscriptTimelineItem[],
-  messages: readonly HarnessMessage[],
-): TranscriptTimelineItem[] {
-  let latestUserIndex = -1;
-  messages.forEach((message, messageIndex) => {
-    if (message.role === "user") latestUserIndex = messageIndex;
-  });
-  const candidates = messages.flatMap((message, messageIndex) => {
-    if (messageIndex <= latestUserIndex) return [];
-    const text = messageText(message);
-    return text === null ? [] : [{ messageIndex, text }];
-  });
-  let candidateCursor = 0;
-  const reconciled = timeline.flatMap((item): TranscriptTimelineItem[] => {
-    if (item.kind !== "assistant") return [item];
-    if (item.text === "") return [];
-    const candidate = candidates[candidateCursor];
-    if (candidate === undefined) return [];
-    candidateCursor += 1;
-    return [{ ...item, text: candidate.text, messageIndex: candidate.messageIndex }];
-  });
-  return [
-    ...reconciled,
-    ...candidates.slice(candidateCursor).map((candidate): TranscriptTimelineItem => ({
-      kind: "assistant",
-      text: candidate.text,
-      messageIndex: candidate.messageIndex,
-    })),
-  ];
-}
-
 function boundary(
   timeline: readonly TranscriptTimelineItem[],
   value: TranscriptBoundary,
@@ -181,6 +136,32 @@ function discardUncommittedAssistants(
   timeline: readonly TranscriptTimelineItem[],
 ): TranscriptTimelineItem[] {
   return timeline.filter((item) => item.kind !== "assistant" || item.messageIndex !== null);
+}
+
+/**
+ * After turn_completed the authoritative messages cover the turn's prose and
+ * tool work, so streamed narration and activity refs are dropped in favor of
+ * message-derived rendering; only decision anchors survive on the timeline.
+ */
+function retainDecisionAnchors(
+  timeline: readonly TranscriptTimelineItem[],
+): TranscriptTimelineItem[] {
+  return timeline.filter((item) =>
+    item.kind === "permission" || item.kind === "plan_review",
+  );
+}
+
+function finalizeRunningActivities(
+  state: Pick<TranscriptState, "activities">,
+): TranscriptState["activities"] {
+  const entries = Object.entries(state.activities);
+  if (!entries.some(([, item]) => item.status === "running")) return state.activities;
+  return Object.fromEntries(entries.map(([id, item]) => [
+    id,
+    item.status === "running"
+      ? { ...item, status: "error" as const, isError: true, result: "Interrupted before completion." }
+      : item,
+  ]));
 }
 
 function terminalState(state: TranscriptState): TranscriptState {
@@ -344,11 +325,10 @@ export function transcriptReducer(state: TranscriptState, event: ServerEvent): T
     case "turn_stopping":
       return { ...accepted, running: true, stopping: true };
     case "turn_completed": {
-      const reconciled = reconcileAssistantTimeline(state.timeline, event.messages);
       return {
         ...terminalState(accepted),
         messages: event.messages,
-        timeline: boundary(reconciled, "turn_completion"),
+        timeline: retainDecisionAnchors(state.timeline),
         error: null,
         terminal: {
           kind: "completed",
@@ -362,6 +342,7 @@ export function transcriptReducer(state: TranscriptState, event: ServerEvent): T
     case "turn_cancelled":
       return {
         ...terminalState(accepted),
+        activities: finalizeRunningActivities(state),
         timeline: boundary(discardUncommittedAssistants(state.timeline), "turn_completion"),
         error: null,
         terminal: {
@@ -375,6 +356,7 @@ export function transcriptReducer(state: TranscriptState, event: ServerEvent): T
     case "turn_failed":
       return {
         ...terminalState(accepted),
+        activities: finalizeRunningActivities(state),
         timeline: boundary(discardUncommittedAssistants(state.timeline), "error"),
         error: { category: event.error_category, message: event.message },
         terminal: {

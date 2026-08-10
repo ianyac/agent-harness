@@ -121,7 +121,6 @@ export function PlanReviewCard({
       role="group"
       aria-label="Plan review"
       tabIndex={actionable ? -1 : undefined}
-      data-state={resolution === null ? actionable ? "active" : terminalUnresolved ? "terminal" : "waiting" : resolution.approved ? "approved" : "revision"}
     >
       <div className={styles.headingRow}>
         <ClipboardCheck aria-hidden="true" size={18} />

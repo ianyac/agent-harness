@@ -6,6 +6,7 @@ import "../../styles/tokens.css";
 import "../../styles/global.css";
 import type { HarnessMessage, TranscriptState } from "../../protocol/types";
 import { Conversation } from "./Conversation";
+import { ConversationSearch } from "./ConversationSearch";
 
 afterEach(cleanup);
 
@@ -175,6 +176,23 @@ describe("Conversation search", () => {
     const search = screen.getByRole("searchbox", { name: "Search conversation" });
     expect(search).toHaveFocus();
     expect(getComputedStyle(search).outlineStyle).toBe("solid");
+  });
+
+  it("closes with Escape from anywhere inside the overlay", async () => {
+    const user = userEvent.setup();
+    const onClose = vi.fn();
+    render(
+      <ConversationSearch
+        messages={[{ id: "message-1", text: "needle" }]}
+        onClose={onClose}
+      />,
+    );
+
+    await user.type(screen.getByRole("searchbox", { name: "Search conversation" }), "needle");
+    screen.getByRole("button", { name: "Next match" }).focus();
+    await user.keyboard("{Escape}");
+
+    expect(onClose).toHaveBeenCalledWith("message-1");
   });
 
   it("does not intercept Command+F when this instance does not own the shortcut", () => {

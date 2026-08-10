@@ -78,6 +78,71 @@ function snapshot(sessionId: string): SessionSnapshot {
   };
 }
 
+it("keeps the queued-message echo visible across a subsequent server event", () => {
+  const sockets: FakeWebSocket[] = [];
+  const createWebSocket: WebSocketFactory = (url) => {
+    const sessionId = url.split("/").at(-1);
+    if (sessionId === undefined) throw new Error("Missing fixture session id");
+    const socket = new FakeWebSocket(sessionId);
+    sockets.push(socket);
+    return socket;
+  };
+  const { result } = renderHook(() =>
+    useSessionSockets(connection, ["echo"], createWebSocket),
+  );
+  const socket = sockets[0]!;
+
+  act(() => socket.receive(snapshot("echo")));
+  act(() => result.current.send("echo", { type: "queue_message", text: "next", mode: "base" }));
+  act(() => socket.receive({
+    type: "assistant_delta",
+    session_id: "echo",
+    generation: 1,
+    sequence: 2,
+    turn_id: "turn-echo",
+    text: "still streaming",
+  }));
+
+  expect(result.current.transcriptBySession.echo?.queued).toEqual({
+    type: "queue_message",
+    text: "next",
+    mode: "base",
+  });
+  expect(result.current.transcriptBySession.echo?.streamingText).toBe("still streaming");
+});
+
+it("delivers a stop requested before turn_started as a cancel for that turn", () => {
+  const sockets: FakeWebSocket[] = [];
+  const createWebSocket: WebSocketFactory = (url) => {
+    const sessionId = url.split("/").at(-1);
+    if (sessionId === undefined) throw new Error("Missing fixture session id");
+    const socket = new FakeWebSocket(sessionId);
+    sockets.push(socket);
+    return socket;
+  };
+  const { result } = renderHook(() =>
+    useSessionSockets(connection, ["pending"], createWebSocket),
+  );
+  const socket = sockets[0]!;
+
+  act(() => socket.receive(snapshot("pending")));
+  act(() => result.current.send("pending", { type: "send_message", text: "go", mode: "base" }));
+  act(() => result.current.stop("pending"));
+  act(() => socket.receive({
+    type: "turn_started",
+    session_id: "pending",
+    generation: 1,
+    sequence: 2,
+    turn_id: "turn-late",
+    mode: "base",
+  }));
+
+  expect(socket.sent.map((value) => JSON.parse(value))).toContainEqual({
+    type: "cancel_turn",
+    turn_id: "turn-late",
+  });
+});
+
 it("retains a streaming session socket while adding another and removes only the archived session state", () => {
   const sockets: FakeWebSocket[] = [];
   const createWebSocket: WebSocketFactory = (url) => {

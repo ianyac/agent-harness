@@ -51,6 +51,7 @@ export function CodeBlock({ code, language = "text", copyText = copyToClipboard 
   const normalizedLanguage = language.toLocaleLowerCase();
   const label = languageLabels[normalizedLanguage] ?? `${language} code`;
   const regionLabel = normalizedLanguage === "diff" ? "Diff" : label.endsWith("code") ? label : `${label} code`;
+  const diffLines = normalizedLanguage === "diff" ? code.split("\n") : null;
 
   const copy = async () => {
     try {
@@ -91,9 +92,9 @@ export function CodeBlock({ code, language = "text", copyText = copyToClipboard 
           <span aria-hidden="true">{copyStatus === "copied" ? "Copied" : copyStatus === "error" ? "Retry" : "Copy"}</span>
         </button>
       </div>
-      {normalizedLanguage === "diff" ? (
+      {diffLines !== null ? (
         <pre className={styles.diff}><code>
-          {code.split("\n").map((line, index) => {
+          {diffLines.map((line, index) => {
             const type = diffLineType(line);
             return (
               <span
@@ -102,7 +103,7 @@ export function CodeBlock({ code, language = "text", copyText = copyToClipboard 
                 data-diff-line={type}
               >
                 {line || " "}
-                {index < code.split("\n").length - 1 ? "\n" : null}
+                {index < diffLines.length - 1 ? "\n" : null}
               </span>
             );
           })}

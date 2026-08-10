@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import type { ServiceConnection } from "../platform/types";
-import { emptyTranscript } from "../protocol/reducer";
 import type { ClientEvent, TranscriptState } from "../protocol/types";
 import type { SessionRuntimeState } from "../features/sessions/useSessions";
 import { SessionSocket, type SessionSocketLifecycle, type WebSocketFactory } from "./sessionSocket";
@@ -102,24 +101,12 @@ export function useSessionSockets(
     if (socket === undefined) throw new Error("The session connection is not ready.");
     socket.send(event);
     if (event.type === "queue_message" || event.type === "clear_queued_message") {
-      setTranscripts((current) => {
-        const state = current[sessionId] ?? emptyTranscript();
-        return {
-          ...current,
-          [sessionId]: {
-            ...state,
-            queued: event.type === "queue_message" ? event : null,
-          },
-        };
-      });
+      socket.applyLocal(event);
     }
   }, []);
 
   const stop = useCallback((sessionId: string) => {
-    const socket = sockets.current.get(sessionId);
-    const turnId = socket?.getState().activeTurn?.turnId;
-    if (socket === undefined || turnId === undefined) return;
-    socket.send({ type: "cancel_turn", turn_id: turnId });
+    sockets.current.get(sessionId)?.requestStop();
   }, []);
 
   const reconnect = useCallback((sessionId: string) => {

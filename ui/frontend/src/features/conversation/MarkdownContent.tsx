@@ -7,6 +7,7 @@ import remarkGfm from "remark-gfm";
 import { CodeBlock, copyToClipboard } from "./CodeBlock";
 import type { CopyText } from "./CodeBlock";
 import styles from "./conversation.module.css";
+import markdownStyles from "./markdown.module.css";
 
 type MarkdownContentProps = {
   readonly content: string;
@@ -89,24 +90,28 @@ function codeText(child: ReactNode): string {
 
 export function MarkdownContent({ content, copyText = copyToClipboard }: MarkdownContentProps) {
   return (
-    <div className={styles.markdown}>
+    <div className={`${styles.markdown} ${markdownStyles.markdown}`}>
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         urlTransform={safeUrlTransform}
         components={{
           a({ href = "", children, node: _node, ...props }) {
             if (href === "") return <span>{children}</span>;
-            if (isLocalPath(href)) return <LocalPath href={href} copyText={copyText} />;
-            return (
-              <a
-                {...props}
-                href={href}
-                target={isExternalLink(href) ? "_blank" : undefined}
-                rel={isExternalLink(href) ? "noreferrer" : undefined}
-              >
-                {children}
-              </a>
-            );
+            if (isExternalLink(href) || href.startsWith("#")) {
+              return (
+                <a
+                  {...props}
+                  href={href}
+                  target={isExternalLink(href) ? "_blank" : undefined}
+                  rel={isExternalLink(href) ? "noreferrer" : undefined}
+                >
+                  {children}
+                </a>
+              );
+            }
+            // Local paths and relative hrefs would hijack SPA navigation;
+            // both render as copyable text instead of live anchors.
+            return <LocalPath href={href} copyText={copyText} />;
           },
           pre({ children }) {
             const child = Children.only(children);
@@ -115,8 +120,12 @@ export function MarkdownContent({ content, copyText = copyToClipboard }: Markdow
             const language = /language-([^\s]+)/.exec(code.props.className ?? "")?.[1];
             return <CodeBlock code={codeText(code.props.children)} language={language} copyText={copyText} />;
           },
-          code({ className, children, ...props }) {
-            return <code {...props} className={className}>{children}</code>;
+          table({ children, node: _node, ...props }) {
+            return (
+              <div className={markdownStyles.tableScroll}>
+                <table {...props}>{children}</table>
+              </div>
+            );
           },
         }}
       >

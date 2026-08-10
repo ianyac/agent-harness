@@ -68,6 +68,18 @@ function hasSameQueuedSlot(current: QueuedMessage | null, captured: QueuedMessag
   return current !== null && current.text === captured.text && current.mode === captured.mode;
 }
 
+function protectsFocus(element: Element | null): boolean {
+  if (!(element instanceof HTMLElement)) return false;
+  if (element.closest('[role="search"]') !== null) return true;
+  if (element.getAttribute("role") === "searchbox") return true;
+  const editable = element.closest("[contenteditable]");
+  if (editable !== null && editable.getAttribute("contenteditable") !== "false") return true;
+  if (element instanceof HTMLTextAreaElement) return true;
+  return element instanceof HTMLInputElement &&
+    !["button", "checkbox", "color", "file", "image", "radio", "range", "reset", "submit"]
+      .includes(element.type);
+}
+
 const commands: ReadonlyArray<{
   readonly command: string;
   readonly label: string;
@@ -121,7 +133,11 @@ export function Composer({
     ReadonlyMap<string, QueueReconciliation>
   >(() => new Map());
   const composing = useRef(false);
-  const postCompositionEnter = useRef(false);
+  // IME commit orders differ: Chrome fires the committing Enter keydown with
+  // isComposing before compositionend; Safari fires compositionend first and
+  // the committing Enter arrives after with isComposing already false.
+  const composedEnter = useRef(false);
+  const pendingCommitEnter = useRef(false);
   const editAuthorities = useRef(new Map<string, EditAuthority>());
   const nextSessionEpoch = useRef(0);
   const nextDeliveryOperationId = useRef(0);
@@ -133,6 +149,7 @@ export function Composer({
   const handledFailedDrafts = useRef(new Set<string>());
   const activeSessionRef = useRef(sessionId);
   activeSessionRef.current = sessionId;
+  const composerRef = useRef<HTMLElement>(null);
   const textboxRef = useRef<HTMLTextAreaElement>(null);
   const stopRef = useRef<HTMLButtonElement>(null);
   const runningBySession = useRef(new Map<string, boolean>([[sessionId, running]]));
@@ -169,7 +186,8 @@ export function Composer({
     setSuggestionsDismissed(false);
     setActiveSuggestion(0);
     composing.current = false;
-    postCompositionEnter.current = false;
+    composedEnter.current = false;
+    pendingCommitEnter.current = false;
   }, [sessionId]);
 
   useEffect(() => {
@@ -178,14 +196,34 @@ export function Composer({
     runningBySession.current.set(sessionId, running);
     previousActiveSession.current = sessionId;
     if (sessionRemainedActive && previousRunning === true && !running) {
-      textboxRef.current?.focus();
+      const active = document.activeElement;
+      const insideComposer = composerRef.current?.contains(active) ?? false;
+      if (insideComposer || !protectsFocus(active)) textboxRef.current?.focus();
     }
   }, [running, sessionId]);
 
+  // Escape-dismissal of suggestions holds until the slash query itself
+  // changes, not on every keystroke after it.
   useEffect(() => {
     setActiveSuggestion(0);
     setSuggestionsDismissed(false);
-  }, [draft]);
+  }, [slashQuery]);
+
+  // Escape focuses Stop from anywhere once transient UI is out of the way.
+  useEffect(() => {
+    const onWindowKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape" || event.defaultPrevented) return;
+      if (!running || suggestionsOpen) return;
+      if (event.isComposing || event.keyCode === 229) return;
+      if (document.querySelector('[role="dialog"], dialog[open], [role="search"]') !== null) return;
+      const stop = stopRef.current;
+      if (stop === null) return;
+      event.preventDefault();
+      stop.focus();
+    };
+    window.addEventListener("keydown", onWindowKeyDown);
+    return () => window.removeEventListener("keydown", onWindowKeyDown);
+  }, [running, suggestionsOpen]);
 
   const setDeliveryError = (
     errorSessionId: string,
@@ -224,9 +262,8 @@ export function Composer({
     } catch {
       if (currentDeliveryOperations.current.get(operation.sessionId) !== operation) return;
       currentDeliveryOperations.current.delete(operation.sessionId);
-      if (hasSameEditAuthority(editAuthorityFor(operation.sessionId), operation)) {
-        setDeliveryError(operation.sessionId, operation);
-      }
+      // Edit authority only decides draft clearing; a failure is always surfaced.
+      setDeliveryError(operation.sessionId, operation);
     }
   };
 
@@ -257,8 +294,8 @@ export function Composer({
     });
   };
 
+  // A pure mode change is not a draft edit and must not bump edit authority.
   const changeMode = (next: TurnMode) => {
-    if (next !== mode) markEdited();
     setSessionMode(sessionId, next);
   };
 
@@ -399,16 +436,13 @@ export function Composer({
 
   return (
     <section
+      ref={composerRef}
       className={styles.composerRegion}
       aria-label="Message composer"
       onKeyDown={(event) => {
-        if (event.key !== "Escape") return;
+        if (event.key !== "Escape" || !suggestionsOpen) return;
         event.preventDefault();
-        if (suggestionsOpen) {
-          setSuggestionsDismissed(true);
-        } else if (running) {
-          stopRef.current?.focus();
-        }
+        setSuggestionsDismissed(true);
       }}
     >
       <div className={styles.composer}>
@@ -459,7 +493,7 @@ export function Composer({
           <textarea
             ref={textboxRef}
             aria-label="Message"
-            aria-keyshortcuts="Meta+Enter"
+            aria-keyshortcuts="Enter Meta+Enter"
             aria-autocomplete="list"
             aria-controls={suggestionsOpen ? listboxId : undefined}
             aria-activedescendant={suggestionsOpen ? `${listboxId}-${activeSuggestion}` : undefined}
@@ -472,18 +506,30 @@ export function Composer({
             }}
             onCompositionStart={() => {
               composing.current = true;
-              postCompositionEnter.current = false;
+              composedEnter.current = false;
+              pendingCommitEnter.current = false;
             }}
             onCompositionEnd={() => {
               composing.current = false;
-              postCompositionEnter.current = true;
+              // Chrome's committing Enter keydown already passed; only Safari
+              // still owes us one, which must be swallowed without submitting.
+              pendingCommitEnter.current = !composedEnter.current;
+              composedEnter.current = false;
             }}
             onKeyDown={(event) => {
-              if (event.key !== "Enter") postCompositionEnter.current = false;
-              if (event.key === "Enter") {
-                if (event.nativeEvent.isComposing || composing.current) return;
-                if (postCompositionEnter.current) {
-                  postCompositionEnter.current = false;
+              if (event.key !== "Enter") {
+                pendingCommitEnter.current = false;
+              } else {
+                if (
+                  event.nativeEvent.isComposing ||
+                  event.nativeEvent.keyCode === 229 ||
+                  composing.current
+                ) {
+                  composedEnter.current = true;
+                  return;
+                }
+                if (pendingCommitEnter.current) {
+                  pendingCommitEnter.current = false;
                   event.preventDefault();
                   return;
                 }
@@ -507,7 +553,6 @@ export function Composer({
               }
               if (
                 event.key === "Enter" &&
-                event.metaKey &&
                 !event.altKey &&
                 !event.ctrlKey &&
                 !event.shiftKey

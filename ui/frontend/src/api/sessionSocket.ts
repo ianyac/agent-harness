@@ -1,7 +1,10 @@
 import { parseServerEvent } from "../protocol/parse";
 import { emptyTranscript, transcriptReducer } from "../protocol/reducer";
 import type {
+  ClearQueuedMessage,
   ClientEvent,
+  QueuedMessage,
+  ServerEvent,
   SessionSnapshot,
   TranscriptState,
 } from "../protocol/types";
@@ -32,10 +35,11 @@ type SessionSocketOptions = {
   readonly onLifecycleChange?: (lifecycle: SessionSocketLifecycle) => void;
 };
 
-export type SessionSocketLifecycle = "connecting" | "connected" | "reconnecting";
+export type SessionSocketLifecycle = "connecting" | "connected" | "reconnecting" | "failed";
 
 const openReadyState = 1;
 const reconnectMaximumMs = 10_000;
+const protocolFailureLimit = 3;
 const protocolError = {
   category: "protocol",
   message: "The local service sent an invalid event. Reconnecting.",
@@ -73,6 +77,8 @@ export class SessionSocket {
   #socketEpoch = 0;
   #snapshotReady = false;
   #reconnectAttempt = 0;
+  #protocolFailures = 0;
+  #stopRequested = false;
   #reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   #disposed = false;
   #lifecycle: SessionSocketLifecycle = "connecting";
@@ -103,8 +109,28 @@ export class SessionSocket {
 
   connect(): void {
     if (this.#disposed) throw new Error("The session socket is disposed.");
+    this.#protocolFailures = 0;
+    if (this.#lifecycle === "failed") this.#publishLifecycle("connecting");
     this.#clearReconnect();
     this.#openSocket();
+  }
+
+  applyLocal(event: QueuedMessage | ClearQueuedMessage): void {
+    if (this.#disposed) return;
+    this.#publish({
+      ...this.#state,
+      queued: event.type === "queue_message" ? event : null,
+    });
+  }
+
+  requestStop(): void {
+    if (this.#disposed) return;
+    const turnId = this.#state.activeTurn?.turnId;
+    if (turnId === undefined) {
+      this.#stopRequested = true;
+      return;
+    }
+    this.send({ type: "cancel_turn", turn_id: turnId });
   }
 
   send(event: ClientEvent): void {
@@ -151,6 +177,9 @@ export class SessionSocket {
     const epoch = this.#socketEpoch + 1;
     this.#socketEpoch = epoch;
     this.#snapshotReady = false;
+    // Each connection's snapshot must apply to a fresh baseline; a service
+    // restart may legitimately reissue lower generations.
+    this.#state = emptyTranscript();
 
     const previous = this.#socket;
     this.#socket = undefined;
@@ -217,6 +246,7 @@ export class SessionSocket {
       }
       this.#snapshotReady = true;
       this.#reconnectAttempt = 0;
+      this.#protocolFailures = 0;
       this.#publishLifecycle("connected");
       this.#flush(socket);
       this.#publish(next);
@@ -224,6 +254,23 @@ export class SessionSocket {
     }
 
     this.#publish(transcriptReducer(this.#state, parsed.value));
+    this.#applyStopIntent(parsed.value);
+  }
+
+  #applyStopIntent(event: ServerEvent): void {
+    if (!this.#stopRequested) return;
+    if (event.type === "turn_started" && this.#state.activeTurn?.turnId === event.turn_id) {
+      this.#stopRequested = false;
+      this.send({ type: "cancel_turn", turn_id: event.turn_id });
+      return;
+    }
+    if (
+      event.type === "turn_completed" ||
+      event.type === "turn_cancelled" ||
+      event.type === "turn_failed"
+    ) {
+      this.#stopRequested = false;
+    }
   }
 
   #acceptedSnapshot(event: SessionSnapshot): TranscriptState | undefined {
@@ -257,7 +304,13 @@ export class SessionSocket {
   }
 
   #reportProtocolError(socket: SessionSocketWebSocket): void {
-    this.#retireAndReconnect(socket, "Protocol error");
+    this.#protocolFailures += 1;
+    if (this.#protocolFailures >= protocolFailureLimit) {
+      this.#retire(socket, "Protocol error");
+      this.#publishLifecycle("failed");
+    } else {
+      this.#retireAndReconnect(socket, "Protocol error");
+    }
     this.#publish({ ...this.#state, error: protocolError });
   }
 
@@ -273,7 +326,7 @@ export class SessionSocket {
     }
   }
 
-  #retireAndReconnect(socket: SessionSocketWebSocket, reason: string): void {
+  #retire(socket: SessionSocketWebSocket, reason: string): void {
     if (this.#socket !== socket) return;
     this.#socketEpoch += 1;
     this.#socket = undefined;
@@ -284,6 +337,11 @@ export class SessionSocket {
     } catch {
       // Reconnect still proceeds if the native socket is already gone.
     }
+  }
+
+  #retireAndReconnect(socket: SessionSocketWebSocket, reason: string): void {
+    if (this.#socket !== socket) return;
+    this.#retire(socket, reason);
     this.#scheduleReconnect();
   }
 

@@ -65,7 +65,16 @@ export function ConversationSearch({ messages, onClose }: ConversationSearchProp
   const close = () => onClose(activeMatch?.messageId ?? null);
 
   return (
-    <div className={styles.search} role="search" aria-label="Conversation search">
+    <div
+      className={styles.search}
+      role="search"
+      aria-label="Conversation search"
+      onKeyDown={(event) => {
+        if (event.key !== "Escape") return;
+        event.preventDefault();
+        close();
+      }}
+    >
       <Search aria-hidden="true" size={17} />
       <input
         ref={inputRef}
@@ -83,9 +92,6 @@ export function ConversationSearch({ messages, onClose }: ConversationSearchProp
           if (event.key === "Enter") {
             event.preventDefault();
             move(event.shiftKey ? -1 : 1);
-          } else if (event.key === "Escape") {
-            event.preventDefault();
-            close();
           } else if (event.metaKey && event.key.toLocaleLowerCase() === "f") {
             event.preventDefault();
             event.currentTarget.select();

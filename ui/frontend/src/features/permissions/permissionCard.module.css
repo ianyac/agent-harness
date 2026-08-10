@@ -96,6 +96,22 @@
   background: transparent;
 }
 
+.collapse summary {
+  color: var(--color-ink-small);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.collapse summary:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.collapse[open] summary {
+  margin-block-end: 10px;
+}
+
 .network {
   display: flex;
   align-items: flex-start;

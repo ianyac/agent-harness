@@ -38,7 +38,7 @@ const safety: SafetySnapshot = {
 afterEach(cleanup);
 
 describe("PermissionCard", () => {
-  it("shows the action, deterministic arguments, scope, reason, and authoritative network egress", () => {
+  it("shows the action, one requested-action representation, reason, and authoritative network egress", () => {
     render(
       <PermissionCard
         request={request}
@@ -51,15 +51,16 @@ describe("PermissionCard", () => {
 
     expect(screen.getByRole("heading", { name: "Permission required" })).toBeVisible();
     expect(screen.getByText("web_fetch")).toBeVisible();
-    expect(screen.getByLabelText("Permission arguments")).toHaveTextContent(
+    expect(screen.getByLabelText("Requested action")).toHaveTextContent(
       '"url": "https://example.com"',
     );
-    expect(screen.getByText(request.scope)).toBeVisible();
+    expect(screen.queryByText("Scope")).not.toBeInTheDocument();
+    expect(screen.queryByText(request.scope)).not.toBeInTheDocument();
     expect(screen.getByText("Current documentation is required")).toBeVisible();
     expect(screen.getByText(/Network access.*sends data outside the workspace/i)).toBeVisible();
   });
 
-  it("falls back to the unmodified raw scope when arguments are not JSON", () => {
+  it("shows only the raw scope row when the scope is not JSON", () => {
     render(
       <PermissionCard
         request={{ ...request, action: "write_file", scope: "/work/project/README.md" }}
@@ -70,9 +71,9 @@ describe("PermissionCard", () => {
       />,
     );
 
-    expect(screen.getByLabelText("Permission arguments")).toHaveTextContent(
-      "/work/project/README.md",
-    );
+    expect(screen.getByText("Scope")).toBeVisible();
+    expect(screen.getByText("/work/project/README.md")).toBeVisible();
+    expect(screen.queryByLabelText("Requested action")).not.toBeInTheDocument();
     expect(screen.queryByText(/Network access/i)).not.toBeInTheDocument();
   });
 
@@ -237,6 +238,44 @@ describe("PermissionCard", () => {
 
     expect(screen.getByRole("status", { name: "Permission resolved" })).toHaveTextContent(copy);
     expect(screen.queryByRole("group", { name: "Permission decision" })).not.toBeInTheDocument();
+  });
+
+  it("collapses request detail behind a Details disclosure once resolved", () => {
+    render(
+      <PermissionCard
+        request={request}
+        resolution={{ answer: "yes" }}
+        active={false}
+        safety={safety}
+        onAnswer={() => {}}
+      />,
+    );
+
+    expect(screen.getByRole("heading", { name: "Permission required" })).toBeVisible();
+    expect(screen.getByText("web_fetch")).toBeVisible();
+    expect(screen.getByRole("status", { name: "Permission resolved" })).toBeVisible();
+    expect(screen.getByText("Details")).toBeVisible();
+    expect(screen.getByText("Current documentation is required")).not.toBeVisible();
+    expect(screen.getByLabelText("Requested action")).not.toBeVisible();
+
+    fireEvent.click(screen.getByText("Details"));
+
+    expect(screen.getByText("Current documentation is required")).toBeVisible();
+  });
+
+  it("keeps request detail expanded while the request is active", () => {
+    render(
+      <PermissionCard
+        request={request}
+        resolution={null}
+        active
+        safety={safety}
+        onAnswer={() => {}}
+      />,
+    );
+
+    expect(screen.queryByText("Details")).not.toBeInTheDocument();
+    expect(screen.getByText("Current documentation is required")).toBeVisible();
   });
 
   it("focuses a newly active request, announces its reason, and restores connected focus after authority resolves", async () => {

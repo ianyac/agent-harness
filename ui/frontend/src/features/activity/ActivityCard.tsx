@@ -11,9 +11,49 @@ type ActivityCardProps = {
 
 function formatDuration(durationMs: number): string {
   if (durationMs < 1_000) return `${durationMs}ms`;
-  const seconds = durationMs / 1_000;
-  return `${Number.isInteger(seconds) ? seconds.toFixed(0) : seconds.toFixed(1)}s`;
+  if (durationMs < 60_000) {
+    const seconds = durationMs / 1_000;
+    return `${Number.isInteger(seconds) ? seconds.toFixed(0) : seconds.toFixed(1)}s`;
+  }
+  const totalSeconds = Math.round(durationMs / 1_000);
+  return `${Math.floor(totalSeconds / 60)}m ${totalSeconds % 60}s`;
 }
+
+// Wall-clock duration when every timed member has a parseable start; the
+// summed fallback covers members whose start was never recorded. Historical
+// activities may carry startedAt === "" and no durationMs — they contribute
+// nothing, and a group with no timing data at all reports null.
+function groupDurationMs(activities: readonly ActivityItem[], now: number): number | null {
+  let sum = 0;
+  let hasTiming = false;
+  let spansComplete = true;
+  let earliestStart = Number.POSITIVE_INFINITY;
+  let latestEnd = Number.NEGATIVE_INFINITY;
+  for (const activity of activities) {
+    const started = Date.parse(activity.startedAt);
+    let duration: number;
+    if (activity.durationMs !== undefined) {
+      duration = activity.durationMs;
+    } else if (activity.status === "running" && Number.isFinite(started)) {
+      duration = Math.max(0, now - started);
+    } else {
+      continue;
+    }
+    hasTiming = true;
+    sum += duration;
+    if (Number.isFinite(started)) {
+      earliestStart = Math.min(earliestStart, started);
+      latestEnd = Math.max(latestEnd, started + duration);
+    } else {
+      spansComplete = false;
+    }
+  }
+  if (!hasTiming) return null;
+  if (spansComplete) return latestEnd - earliestStart;
+  return sum;
+}
+
+const previewLimit = 500;
 
 function serializeResult(result: JsonValue): string {
   if (typeof result === "string") return result;
@@ -53,25 +93,18 @@ export function ActivityCard({ activities, openInspector }: ActivityCardProps) {
   const status = hasError ? "error" : isRunning ? "running" : "complete";
   const statusLabel = status === "error" ? "Failed" : status === "running" ? "Working" : "Complete";
   const Icon = status === "error" ? CircleAlert : status === "running" ? Clock3 : CheckCircle2;
-  const showsDuration = activities.some(
-    (activity) => activity.durationMs !== undefined || activity.status === "running",
-  );
-  const durationMs = activities.reduce((total, activity) => {
-    if (activity.durationMs !== undefined) return total + activity.durationMs;
-    if (activity.status !== "running") return total;
-    const started = Date.parse(activity.startedAt);
-    return total + (Number.isFinite(started) ? Math.max(0, now - started) : 0);
-  }, 0);
+  const durationMs = groupDurationMs(activities, now);
   const tests = testSummary(activities);
   const previewActivity = [...activities].reverse().find((activity) => activity.result !== undefined);
-  const preview = previewActivity?.result === undefined ? "" : serializeResult(previewActivity.result);
+  const previewSource = previewActivity?.result === undefined ? "" : serializeResult(previewActivity.result);
+  const preview = previewSource.length > previewLimit ? previewSource.slice(0, previewLimit) : previewSource;
   const actionLabel = `${activities.length} ${activities.length === 1 ? "action" : "actions"}`;
   const title = activities.length === 1
     ? readableName(first.name)
     : `${readableName(first.name)} and ${activities.length - 1} more`;
   const accessibleSummary = [
     statusLabel,
-    showsDuration ? formatDuration(durationMs) : null,
+    durationMs === null ? null : formatDuration(durationMs),
     actionLabel,
     tests,
   ].filter((part) => part !== null).join(", ");
@@ -90,7 +123,7 @@ export function ActivityCard({ activities, openInspector }: ActivityCardProps) {
       </span>
       <span className={styles.activityMeta}>
         <span>{statusLabel}</span>
-        {showsDuration ? <span>{formatDuration(durationMs)}</span> : null}
+        {durationMs === null ? null : <span>{formatDuration(durationMs)}</span>}
         <span>{actionLabel}</span>
         {tests === null ? null : <span>{tests}</span>}
       </span>

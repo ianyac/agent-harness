@@ -330,6 +330,174 @@ describe("SessionSocket", () => {
     });
     session.dispose();
   });
+
+  it("keeps a locally applied queued message across a subsequent server delta", () => {
+    const { session, sockets } = openSession();
+    const active = sockets.latest();
+    active.receive(snapshot());
+    const queued = { type: "queue_message", text: "next", mode: "base" } as const;
+
+    session.applyLocal(queued);
+    active.receive(delta());
+
+    expect(session.getState().queued).toEqual(queued);
+    expect(session.getState().streamingText).toBe("delta");
+    session.dispose();
+  });
+
+  it("keeps a locally cleared queue across a subsequent server delta", () => {
+    const { session, sockets } = openSession();
+    const active = sockets.latest();
+    active.receive(snapshot({
+      queued_message: { type: "queue_message", text: "held", mode: "base" },
+    }));
+
+    session.applyLocal({ type: "clear_queued_message" });
+    active.receive(delta());
+
+    expect(session.getState().queued).toBeNull();
+    expect(session.getState().streamingText).toBe("delta");
+    session.dispose();
+  });
+
+  it("lets an authoritative snapshot supersede the local queued echo", () => {
+    const { session, sockets } = openSession();
+    const active = sockets.latest();
+    active.receive(snapshot());
+
+    session.applyLocal({ type: "queue_message", text: "local", mode: "base" });
+    active.receive(snapshot({ generation: 2, queued_message: null }));
+
+    expect(session.getState().generation).toBe(2);
+    expect(session.getState().queued).toBeNull();
+    session.dispose();
+  });
+
+  it("applies a lower-generation snapshot from a restarted service after reconnect", () => {
+    const { session, sockets } = openSession();
+    const first = sockets.latest();
+    first.receive(snapshot({ generation: 5, sequence: 9 }));
+    first.receive(delta({ generation: 5, sequence: 10 }));
+
+    first.serverClose();
+    vi.advanceTimersByTime(1_000);
+    const replacement = sockets.latest();
+    replacement.open();
+    replacement.receive(snapshot({
+      generation: 1,
+      sequence: 1,
+      messages: [{ role: "user", content: "restored" }],
+    }));
+
+    expect(session.getState().generation).toBe(1);
+    expect(session.getState().lastSequence).toBe(1);
+    expect(session.getState().messages).toEqual([{ role: "user", content: "restored" }]);
+    expect(session.getState().error).toBeNull();
+    session.dispose();
+  });
+
+  it("stops reconnecting after three consecutive protocol failures and resumes on explicit connect", () => {
+    const lifecycles: string[] = [];
+    const sockets = new FakeWebSockets();
+    const session = new SessionSocket({
+      connection,
+      sessionId: "s1",
+      createWebSocket: sockets.create,
+      onLifecycleChange: (lifecycle) => lifecycles.push(lifecycle),
+    });
+    session.connect();
+    sockets.latest().open();
+
+    sockets.latest().receiveBinary();
+    vi.advanceTimersByTime(1_000);
+    sockets.latest().open();
+    sockets.latest().receiveBinary();
+    vi.advanceTimersByTime(2_000);
+    sockets.latest().open();
+    sockets.latest().receiveBinary();
+
+    expect(lifecycles.at(-1)).toBe("failed");
+    expect(sockets.instances).toHaveLength(3);
+    vi.advanceTimersByTime(60_000);
+    expect(sockets.instances).toHaveLength(3);
+
+    session.connect();
+    expect(lifecycles.at(-1)).toBe("connecting");
+    expect(sockets.instances).toHaveLength(4);
+    sockets.latest().open();
+    sockets.latest().receive(snapshot());
+    expect(lifecycles.at(-1)).toBe("connected");
+    expect(session.getState().error).toBeNull();
+    session.dispose();
+  });
+
+  it("resets the protocol failure budget after a successfully applied snapshot", () => {
+    const { session, sockets } = openSession();
+
+    sockets.latest().receiveBinary();
+    vi.advanceTimersByTime(1_000);
+    sockets.latest().open();
+    sockets.latest().receiveBinary();
+    vi.advanceTimersByTime(2_000);
+    sockets.latest().open();
+    sockets.latest().receive(snapshot());
+
+    sockets.latest().receiveBinary();
+    vi.advanceTimersByTime(1_000);
+
+    expect(sockets.instances).toHaveLength(4);
+    session.dispose();
+  });
+
+  it("delivers a stop requested before turn_started as a cancel for that turn", () => {
+    const { session, sockets } = openSession();
+    const active = sockets.latest();
+    active.receive(snapshot());
+
+    session.requestStop();
+    expect(active.sent).toEqual([]);
+    active.receive({
+      type: "turn_started",
+      session_id: "s1",
+      generation: 1,
+      sequence: 2,
+      turn_id: "t1",
+      mode: "base",
+    });
+
+    expect(active.sent.map((value) => JSON.parse(value))).toEqual([
+      { type: "cancel_turn", turn_id: "t1" },
+    ]);
+    session.dispose();
+  });
+
+  it("drops a pending stop intent once the turn reaches a terminal event", () => {
+    const { session, sockets } = openSession();
+    const active = sockets.latest();
+    active.receive(snapshot());
+
+    session.requestStop();
+    active.receive({
+      type: "turn_completed",
+      session_id: "s1",
+      generation: 1,
+      sequence: 2,
+      turn_id: "t1",
+      messages: [],
+      final_text: "",
+    });
+    active.receive({
+      type: "turn_started",
+      session_id: "s1",
+      generation: 1,
+      sequence: 3,
+      turn_id: "t2",
+      mode: "base",
+    });
+
+    expect(active.sent).toEqual([]);
+    session.dispose();
+  });
 });
 
 describe("ApiClient", () => {

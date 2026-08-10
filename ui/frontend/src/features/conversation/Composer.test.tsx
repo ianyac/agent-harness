@@ -518,66 +518,142 @@ describe("Composer", () => {
     await user.type(textbox, "   ");
     expect(screen.getByRole("button", { name: "Send message" })).toBeDisabled();
     await user.keyboard("{Meta>}{Enter}{/Meta}");
+    await user.keyboard("{Enter}");
     expect(onEvent).not.toHaveBeenCalled();
     expect(textbox).toHaveValue("   ");
   });
 
-  it("uses Command+Enter but leaves an ordinary Enter for multiline input", async () => {
+  it("sends on a plain Enter and keeps Command+Enter working", async () => {
     const user = userEvent.setup();
     const onEvent = vi.fn();
     renderComposer({ onEvent });
 
     const textbox = screen.getByRole("textbox", { name: "Message" });
-    await user.type(textbox, "line one{Enter}line two");
-    expect(onEvent).not.toHaveBeenCalled();
-    expect(textbox).toHaveValue("line one\nline two");
+    await user.type(textbox, "quick reply");
+    await user.keyboard("{Enter}");
+    expect(onEvent).toHaveBeenNthCalledWith(1, {
+      type: "send_message",
+      text: "quick reply",
+      mode: "base",
+    });
+    await waitFor(() => expect(textbox).toHaveValue(""));
+
+    await user.type(textbox, "second reply");
     await user.keyboard("{Meta>}{Enter}{/Meta}");
-    expect(onEvent).toHaveBeenCalledTimes(1);
+    expect(onEvent).toHaveBeenNthCalledWith(2, {
+      type: "send_message",
+      text: "second reply",
+      mode: "base",
+    });
   });
 
-  it("does not submit during IME composition", () => {
+  it("queues on a plain Enter while a turn is running", async () => {
+    const user = userEvent.setup();
+    const onEvent = vi.fn();
+    renderComposer({ running: true, onEvent });
+
+    await user.type(screen.getByRole("textbox", { name: "Message" }), "follow-up");
+    await user.keyboard("{Enter}");
+    expect(onEvent).toHaveBeenCalledWith({
+      type: "queue_message",
+      text: "follow-up",
+      mode: "base",
+    });
+  });
+
+  it("inserts a newline with Shift+Enter instead of sending", async () => {
+    const user = userEvent.setup();
+    const onEvent = vi.fn();
+    renderComposer({ onEvent });
+
+    const textbox = screen.getByRole("textbox", { name: "Message" });
+    await user.type(textbox, "line one");
+    await user.keyboard("{Shift>}{Enter}{/Shift}");
+    await user.type(textbox, "line two");
+    expect(onEvent).not.toHaveBeenCalled();
+    expect(textbox).toHaveValue("line one\nline two");
+    await user.keyboard("{Enter}");
+    expect(onEvent).toHaveBeenCalledWith({
+      type: "send_message",
+      text: "line one\nline two",
+      mode: "base",
+    });
+  });
+
+  it("never submits a composition-committing Enter in Safari's event order", () => {
     const onEvent = vi.fn();
     renderComposer({ onEvent });
     const textbox = screen.getByRole("textbox", { name: "Message" });
 
     fireEvent.compositionStart(textbox);
     fireEvent.change(textbox, { target: { value: "計画" } });
-    fireEvent.keyDown(textbox, { key: "Enter", metaKey: true, isComposing: true });
-    expect(onEvent).not.toHaveBeenCalled();
-    expect(textbox).toHaveValue("計画");
-
     fireEvent.compositionEnd(textbox);
-    fireEvent.keyDown(textbox, { key: "Enter", metaKey: true });
+    // Safari commits with a keydown after compositionend, isComposing already false.
+    fireEvent.keyDown(textbox, { key: "Enter" });
     expect(onEvent).not.toHaveBeenCalled();
     expect(textbox).toHaveValue("計画");
 
-    fireEvent.keyDown(textbox, { key: "Enter", metaKey: true });
+    fireEvent.keyDown(textbox, { key: "Enter" });
+    expect(onEvent).toHaveBeenCalledTimes(1);
     expect(onEvent).toHaveBeenCalledWith({ type: "send_message", text: "計画", mode: "base" });
   });
 
-  it("does not select a slash suggestion with composition or post-composition Enter", () => {
+  it("never submits nor swallows the next Enter in Chrome's composition order", () => {
+    const onEvent = vi.fn();
+    renderComposer({ onEvent });
+    const textbox = screen.getByRole("textbox", { name: "Message" });
+
+    fireEvent.compositionStart(textbox);
+    fireEvent.change(textbox, { target: { value: "計画" } });
+    // Chrome commits with an isComposing keydown before compositionend.
+    fireEvent.keyDown(textbox, { key: "Enter", isComposing: true });
+    fireEvent.compositionEnd(textbox);
+    expect(onEvent).not.toHaveBeenCalled();
+    expect(textbox).toHaveValue("計画");
+
+    fireEvent.keyDown(textbox, { key: "Enter" });
+    expect(onEvent).toHaveBeenCalledTimes(1);
+    expect(onEvent).toHaveBeenCalledWith({ type: "send_message", text: "計画", mode: "base" });
+  });
+
+  it("does not select a slash suggestion with Safari's post-composition Enter", () => {
     renderComposer();
     const textbox = screen.getByRole("textbox", { name: "Message" });
     fireEvent.change(textbox, { target: { value: "/pl" } });
     expect(screen.getByRole("listbox", { name: "Composer commands" })).toBeVisible();
 
     fireEvent.compositionStart(textbox);
-    fireEvent.keyDown(textbox, { key: "Enter", isComposing: true });
-    expect(textbox).toHaveValue("/pl");
-    expect(screen.getByRole("button", { name: "Base mode" })).toHaveAttribute(
-      "aria-pressed",
-      "true",
-    );
-
     fireEvent.compositionEnd(textbox);
-    fireEvent.keyDown(textbox, { key: "Enter", isComposing: false });
+    fireEvent.keyDown(textbox, { key: "Enter" });
     expect(textbox).toHaveValue("/pl");
     expect(screen.getByRole("button", { name: "Base mode" })).toHaveAttribute(
       "aria-pressed",
       "true",
     );
 
-    fireEvent.keyDown(textbox, { key: "Enter", isComposing: false });
+    fireEvent.keyDown(textbox, { key: "Enter" });
+    expect(textbox).toHaveValue("");
+    expect(screen.getByRole("button", { name: "Plan mode" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+  });
+
+  it("selects a slash suggestion with the first genuine Enter after Chrome's commit", () => {
+    renderComposer();
+    const textbox = screen.getByRole("textbox", { name: "Message" });
+    fireEvent.change(textbox, { target: { value: "/pl" } });
+
+    fireEvent.compositionStart(textbox);
+    fireEvent.keyDown(textbox, { key: "Enter", isComposing: true });
+    fireEvent.compositionEnd(textbox);
+    expect(textbox).toHaveValue("/pl");
+    expect(screen.getByRole("button", { name: "Base mode" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+
+    fireEvent.keyDown(textbox, { key: "Enter" });
     expect(textbox).toHaveValue("");
     expect(screen.getByRole("button", { name: "Plan mode" })).toHaveAttribute(
       "aria-pressed",
@@ -614,6 +690,50 @@ describe("Composer", () => {
       text: "do not lose this",
       mode: "base",
     });
+  });
+
+  it("still surfaces a delivery failure after the draft was edited in flight", async () => {
+    const user = userEvent.setup();
+    const first = deferred();
+    renderComposer({ onEvent: () => first.promise });
+    const textbox = screen.getByRole("textbox", { name: "Message" });
+    fireEvent.change(textbox, { target: { value: "original send" } });
+    fireEvent.keyDown(textbox, { key: "Enter", metaKey: true });
+    fireEvent.change(textbox, { target: { value: "edited while sending" } });
+
+    await act(async () => {
+      first.reject(new Error("offline"));
+      await first.promise.catch(() => {});
+    });
+
+    const messageStatus = screen.getByRole("status", { name: "Message status" });
+    expect(messageStatus).toHaveTextContent("Message not sent");
+    expect(textbox).toHaveValue("edited while sending");
+    expect(screen.getByRole("button", { name: "Retry message" })).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Retry message" }));
+  });
+
+  it("clears the draft when a send succeeds after only a mode flip in flight", async () => {
+    const user = userEvent.setup();
+    const first = deferred();
+    const onEvent = vi.fn(() => first.promise);
+    renderComposer({ onEvent });
+    const textbox = screen.getByRole("textbox", { name: "Message" });
+    fireEvent.change(textbox, { target: { value: "mode flip in flight" } });
+    fireEvent.keyDown(textbox, { key: "Enter", metaKey: true });
+    await user.click(screen.getByRole("button", { name: "Plan mode" }));
+
+    await act(async () => {
+      first.resolve();
+      await first.promise;
+    });
+
+    expect(textbox).toHaveValue("");
+    expect(onEvent).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("button", { name: "Plan mode" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
   });
 
   it("uses theme-aware error feedback tokens with normal-text contrast", () => {
@@ -908,6 +1028,23 @@ describe("Composer", () => {
     expect(textbox).toHaveFocus();
   });
 
+  it("keeps dismissed suggestions closed until the slash query itself changes", async () => {
+    const user = userEvent.setup();
+    renderComposer();
+    const textbox = screen.getByRole("textbox", { name: "Message" });
+
+    await user.type(textbox, "/plan x");
+    expect(screen.getByRole("listbox", { name: "Composer commands" })).toBeVisible();
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("listbox", { name: "Composer commands" })).not.toBeInTheDocument();
+
+    await user.type(textbox, " more detail");
+    expect(screen.queryByRole("listbox", { name: "Composer commands" })).not.toBeInTheDocument();
+
+    fireEvent.change(textbox, { target: { value: "/pla" } });
+    expect(screen.getByRole("listbox", { name: "Composer commands" })).toBeVisible();
+  });
+
   it("closes suggestions on the first Escape and focuses Stop on the second", async () => {
     const user = userEvent.setup();
     renderComposer({ running: true });
@@ -921,6 +1058,77 @@ describe("Composer", () => {
     await user.click(screen.getByRole("button", { name: "Plan mode" }));
     await user.keyboard("{Escape}");
     expect(screen.getByRole("button", { name: "Stop turn" })).toHaveFocus();
+  });
+
+  it("focuses Stop on Escape from outside the composer while a turn runs", () => {
+    render(
+      <>
+        <button type="button">Elsewhere</button>
+        <Composer
+          sessionId="escape-session"
+          running
+          stopping={false}
+          queued={null}
+          onEvent={() => {}}
+          onStop={() => {}}
+          draftStorage={storage().target}
+        />
+      </>,
+    );
+    const outside = screen.getByRole("button", { name: "Elsewhere" });
+    outside.focus();
+
+    fireEvent.keyDown(outside, { key: "Escape" });
+
+    expect(screen.getByRole("button", { name: "Stop turn" })).toHaveFocus();
+  });
+
+  it("leaves Escape untouched when no turn is running", () => {
+    renderComposer({ running: false });
+    const escape = new KeyboardEvent("keydown", {
+      key: "Escape",
+      bubbles: true,
+      cancelable: true,
+    });
+
+    window.dispatchEvent(escape);
+
+    expect(escape.defaultPrevented).toBe(false);
+  });
+
+  it("yields Escape to open transient UI and IME composition", () => {
+    renderComposer({ running: true });
+    const stop = screen.getByRole("button", { name: "Stop turn" });
+    const escapeEvent = (init: KeyboardEventInit = {}) =>
+      new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true, ...init });
+
+    const dialog = document.createElement("div");
+    dialog.setAttribute("role", "dialog");
+    document.body.append(dialog);
+    const withDialog = escapeEvent();
+    window.dispatchEvent(withDialog);
+    expect(withDialog.defaultPrevented).toBe(false);
+    expect(stop).not.toHaveFocus();
+    dialog.remove();
+
+    const search = document.createElement("div");
+    search.setAttribute("role", "search");
+    document.body.append(search);
+    const withSearch = escapeEvent();
+    window.dispatchEvent(withSearch);
+    expect(withSearch.defaultPrevented).toBe(false);
+    expect(stop).not.toHaveFocus();
+    search.remove();
+
+    const whileComposing = escapeEvent({ isComposing: true });
+    window.dispatchEvent(whileComposing);
+    expect(whileComposing.defaultPrevented).toBe(false);
+    expect(stop).not.toHaveFocus();
+
+    const unobstructed = escapeEvent();
+    window.dispatchEvent(unobstructed);
+    expect(unobstructed.defaultPrevented).toBe(true);
+    expect(stop).toHaveFocus();
   });
 
   it("renders a square Stop control and announces the stopping state", async () => {
@@ -1082,6 +1290,58 @@ describe("Composer", () => {
       />,
     );
     expect(textbox).toHaveFocus();
+  });
+
+  it("does not steal completion focus from a text field outside the composer", () => {
+    const draftBackup = storage().target;
+    const composerAt = (running: boolean) => (
+      <>
+        <textarea aria-label="Scratch notes" />
+        <Composer
+          sessionId="completion-session"
+          running={running}
+          stopping={false}
+          queued={null}
+          onEvent={() => {}}
+          onStop={() => {}}
+          draftStorage={draftBackup}
+        />
+      </>
+    );
+    const { rerender } = render(composerAt(true));
+    const outside = screen.getByRole("textbox", { name: "Scratch notes" });
+    outside.focus();
+
+    rerender(composerAt(false));
+
+    expect(outside).toHaveFocus();
+  });
+
+  it("does not steal completion focus from the conversation search overlay", () => {
+    const draftBackup = storage().target;
+    const composerAt = (running: boolean) => (
+      <>
+        <div role="search" aria-label="Conversation search">
+          <button type="button">Next match</button>
+        </div>
+        <Composer
+          sessionId="completion-session"
+          running={running}
+          stopping={false}
+          queued={null}
+          onEvent={() => {}}
+          onStop={() => {}}
+          draftStorage={draftBackup}
+        />
+      </>
+    );
+    const { rerender } = render(composerAt(true));
+    const overlayButton = screen.getByRole("button", { name: "Next match" });
+    overlayButton.focus();
+
+    rerender(composerAt(false));
+
+    expect(overlayButton).toHaveFocus();
   });
 
   it("keeps the unavailable attachment action visibly honest", () => {

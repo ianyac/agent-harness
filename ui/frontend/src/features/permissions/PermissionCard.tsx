@@ -26,11 +26,11 @@ type SubmissionOperation = {
   readonly requestId: string;
 };
 
-function formattedArguments(scope: string): string {
+function formattedScope(scope: string): string | null {
   try {
     return JSON.stringify(JSON.parse(scope), null, 2);
   } catch {
-    return scope;
+    return null;
   }
 }
 
@@ -150,6 +150,29 @@ export function PermissionCard({
     void submit(answer);
   };
 
+  const formatted = formattedScope(request.scope);
+  const detailRows = (
+    <dl className={styles.details}>
+      {formatted !== null ? (
+        <div>
+          <dt>Requested action</dt>
+          <dd>
+            <pre aria-label="Requested action">{formatted}</pre>
+          </dd>
+        </div>
+      ) : (
+        <div>
+          <dt>Scope</dt>
+          <dd><code className={styles.scope}>{request.scope}</code></dd>
+        </div>
+      )}
+      <div>
+        <dt>Reason</dt>
+        <dd>{request.reason}</dd>
+      </div>
+    </dl>
+  );
+
   return (
     <section
       ref={cardRef}
@@ -157,7 +180,6 @@ export function PermissionCard({
       role="group"
       aria-label={actionable ? "Permission decision" : "Permission review"}
       tabIndex={actionable ? -1 : undefined}
-      data-state={resolution === null ? actionable ? "active" : terminalUnresolved ? "terminal" : "waiting" : resolution.answer}
       onKeyDown={onKeyDown}
     >
       <div className={styles.headingRow}>
@@ -168,22 +190,14 @@ export function PermissionCard({
         </div>
       </div>
 
-      <dl className={styles.details}>
-        <div>
-          <dt>Arguments</dt>
-          <dd>
-            <pre aria-label="Permission arguments">{formattedArguments(request.scope)}</pre>
-          </dd>
-        </div>
-        <div>
-          <dt>Scope</dt>
-          <dd><code className={styles.scope}>{request.scope}</code></dd>
-        </div>
-        <div>
-          <dt>Reason</dt>
-          <dd>{request.reason}</dd>
-        </div>
-      </dl>
+      {resolution !== null ? (
+        <details className={styles.collapse}>
+          <summary>Details</summary>
+          {detailRows}
+        </details>
+      ) : (
+        detailRows
+      )}
 
       {hasNetworkEgress(safety, request.action) ? (
         <p className={styles.network}>

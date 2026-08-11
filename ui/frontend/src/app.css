@@ -25,6 +25,10 @@
   height: calc(100dvh - var(--native-titlebar-height));
 }
 
+.app-shell--tauri > .conversation-shell {
+  min-height: 0;
+}
+
 .native-titlebar {
   position: absolute;
   z-index: 20;

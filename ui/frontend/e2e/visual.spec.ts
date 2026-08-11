@@ -112,6 +112,23 @@ for (const width of [1440, 1100, 900, 720]) {
   });
 }
 
+test("native shell keeps the complete message composer inside the viewport", async ({ page, authority }) => {
+  await page.setViewportSize({ width: 1100, height: 900 });
+  await page.goto(authority.entryPath);
+  await expect.poll(authority.socketConnections).toBe(1);
+
+  await page.locator(".app-shell").evaluate((shell) => {
+    shell.classList.add("app-shell--tauri");
+    const titlebar = document.createElement("div");
+    titlebar.className = "native-titlebar";
+    shell.prepend(titlebar);
+  });
+
+  const composer = await page.getByRole("region", { name: "Message composer" }).boundingBox();
+  expect(composer).not.toBeNull();
+  expect(composer!.y + composer!.height).toBeLessThanOrEqual(900);
+});
+
 test("wide light and narrow dark states have no axe violations", async ({ page, authority }) => {
   await page.setViewportSize({ width: 1440, height: 900 });
   await page.goto(authority.entryPath);

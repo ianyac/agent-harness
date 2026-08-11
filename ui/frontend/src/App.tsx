@@ -812,19 +812,26 @@ export function App({
       ) : null}
       <SessionSidebar
         sessions={sessionsModel.sessions}
-        activeSessionId={sessionsModel.activeSessionId}
+        activeSessionId={settingsOpen ? null : sessionsModel.activeSessionId}
         runtimeBySession={runtimeBySession}
         connectionStatus={connection.client !== null && sessionReadiness !== "connected"
           ? "connecting"
           : connection.status}
         collapsed={preferenceModel.preferences.sidebarCollapsed}
         onCollapsedChange={(sidebarCollapsed) => preferenceModel.update({ sidebarCollapsed })}
-        onCreate={createFutureSession}
-        onSelect={sessionsModel.selectSession}
+        onCreate={() => {
+          setSettingsOpen(false);
+          return createFutureSession();
+        }}
+        onSelect={(sessionId) => {
+          setSettingsOpen(false);
+          sessionsModel.selectSession(sessionId);
+        }}
         onRename={sessionsModel.renameSession}
         onArchive={sessionsModel.archiveSession}
         onSearch={() => setPaletteOpen(true)}
         onOpenSettings={openSettings}
+        settingsActive={settingsOpen}
       />
       <div className="conversation-shell">
         {connection.client === null && bootstrapLifecycle !== null ? (
@@ -854,7 +861,11 @@ export function App({
             />
           </div>
         )}
-        {activeSession === null ? (
+        {settingsOpen ? (
+          <header className="conversation-header">
+            <h1>Settings</h1>
+          </header>
+        ) : activeSession === null ? (
           <header className="conversation-header">
             <h1>Agent Harness</h1>
           </header>
@@ -870,8 +881,17 @@ export function App({
             onToggleActivity={openInspectorOverview}
           />
         )}
-        <main aria-label="Conversation" className="conversation-main">
-          {nativeNewChatFailure !== null ? (
+        <main aria-label={settingsOpen ? "Settings" : "Conversation"} className="conversation-main">
+          {settingsOpen ? (
+            <Settings
+              open={settingsOpen}
+              onOpenChange={setSettingsOpen}
+              preferences={preferenceModel.preferences}
+              onChange={preferenceModel.update}
+              workspace={activeSession?.workspace ?? sessionsModel.config?.base_workspace ?? null}
+              logsSupported={selectedPlatform?.openLogs !== undefined}
+            />
+          ) : nativeNewChatFailure !== null ? (
             <SessionOperationRecovery
               failure={nativeNewChatFailure}
               onRetry={createFutureSession}
@@ -890,7 +910,7 @@ export function App({
               onDismiss={sessionsModel.dismissOperationError}
             />
           ) : null}
-          {activeError !== null && sessionLevelError && activeSession !== null && selectedPlatform !== null && selectedPlatform !== undefined ? (
+          {settingsOpen ? null : activeError !== null && sessionLevelError && activeSession !== null && selectedPlatform !== null && selectedPlatform !== undefined ? (
             <RecoveryView
               key={activeTranscript?.terminal == null
                 ? `${activeSession.session_id}:recovery`
@@ -922,7 +942,7 @@ export function App({
             </>
           )}
         </main>
-        {activeSession !== null && activeTranscript !== null ? (
+        {!settingsOpen && activeSession !== null && activeTranscript !== null ? (
           <Composer
             sessionId={activeSession.session_id}
             running={activeTranscript.running}
@@ -961,14 +981,6 @@ export function App({
         onOpenSettings={openSettings}
         onToggleActivity={toggleInspector}
         onSelectSession={sessionsModel.selectSession}
-      />
-      <Settings
-        open={settingsOpen}
-        onOpenChange={setSettingsOpen}
-        preferences={preferenceModel.preferences}
-        onChange={preferenceModel.update}
-        workspace={activeSession?.workspace ?? sessionsModel.config?.base_workspace ?? null}
-        logsSupported={selectedPlatform?.openLogs !== undefined}
       />
       {selectedPlatform === null || selectedPlatform === undefined ? null : (
         <NotificationObserver

@@ -238,7 +238,7 @@ describe("App", () => {
     act(() => native.emit("harness.settings"));
 
     expect(onOpenSettings).toHaveBeenCalledTimes(1);
-    expect(await screen.findByRole("dialog", { name: "Settings" })).toBeVisible();
+    expect(await screen.findByRole("region", { name: "Settings" })).toBeVisible();
   });
 
   it("subscribes once, ignores unknown native menu payloads, and unsubscribes on cleanup", async () => {
@@ -815,7 +815,7 @@ describe("App", () => {
 
     await user.keyboard("{Meta>}k{/Meta}");
     await user.click(screen.getByRole("option", { name: "Open settings" }));
-    expect(screen.getByRole("dialog", { name: "Settings" })).toBeVisible();
+    expect(screen.getByRole("region", { name: "Settings" })).toBeVisible();
     await user.keyboard("{Escape}");
     await user.click(screen.getByRole("button", { name: "New chat" }));
     await waitFor(() => expect(createBodies).toHaveLength(1));

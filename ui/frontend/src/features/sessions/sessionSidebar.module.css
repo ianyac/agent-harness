@@ -1,13 +1,28 @@
 .sidebar {
+  position: relative;
+  isolation: isolate;
   display: flex;
   flex: 0 0 var(--sidebar-width);
   flex-direction: column;
   width: var(--sidebar-width);
   min-height: 100dvh;
-  padding: 14px 10px 10px;
+  padding: 14px 0 10px 10px;
   overflow: hidden;
   transition: width var(--motion-standard) var(--motion-easing),
     flex-basis var(--motion-standard) var(--motion-easing);
+}
+
+/* The sidebar/main boundary: a heavy rule the active tab opens through.
+   It sits behind sidebar content, so any tab with the page background
+   painted over it becomes a mouth into the main panel. */
+.sidebar::after {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  inset-block: 0;
+  inset-inline-end: 0;
+  width: 2px;
+  background: var(--color-ink);
 }
 
 .identity,
@@ -35,6 +50,7 @@
   align-items: center;
   column-gap: 9px;
   row-gap: 1px;
+  margin-inline-end: 10px;
   padding: 4px 8px 14px;
   font-weight: 700;
   white-space: nowrap;
@@ -102,7 +118,9 @@
 .utilityAction {
   display: flex;
   align-items: center;
-  width: 100%;
+  width: auto;
+  align-self: stretch;
+  margin-inline-end: 10px;
   gap: 9px;
   padding: 6px 10px;
   text-align: start;
@@ -163,6 +181,11 @@
   min-height: 0;
   margin-top: 14px;
   overflow: auto;
+  scrollbar-width: none;
+}
+
+.sessionGroups::-webkit-scrollbar {
+  display: none;
 }
 
 .groupHeading,
@@ -192,7 +215,13 @@
 }
 
 .row[data-active] {
-  background: var(--color-accent-tint);
+  background: var(--color-page);
+  border: 2px solid var(--color-ink);
+  border-inline-end: 0;
+}
+
+.row[data-active] .sessionButton {
+  padding: 4px 24px 4px 8px;
 }
 
 
@@ -372,11 +401,29 @@
 }
 
 .footer {
-  display: flex;
-  align-items: center;
+  display: grid;
   gap: 3px;
+  margin-inline-end: 0;
   padding-top: 8px;
   border-top: 1px solid var(--color-border);
+}
+
+.footer .utilityAction {
+  margin-inline-end: 0;
+}
+
+.footer .utilityAction[data-active] {
+  background: var(--color-page);
+  border: 2px solid var(--color-ink);
+  border-inline-end: 0;
+  padding: 4px 8px;
+  font-weight: 650;
+}
+
+.footer .collapseButton {
+  justify-self: start;
+  width: 32px;
+  margin-inline-end: 10px;
 }
 
 .collapseButton {
@@ -391,7 +438,7 @@
 .sidebar[data-collapsed="true"] {
   flex-basis: var(--sidebar-rail-width);
   width: var(--sidebar-rail-width);
-  padding-inline: 8px;
+  padding-inline: 8px 0;
 }
 
 .sidebar[data-collapsed="true"] .collapseCopy,
@@ -424,7 +471,12 @@
 }
 
 .sidebar[data-collapsed="true"] .sessionButton {
+  width: 100%;
   grid-template-columns: 12px;
+}
+
+.sidebar[data-collapsed="true"] .footer .utilityAction {
+  width: 100%;
 }
 
 .sidebar[data-collapsed="true"] .row {
@@ -671,7 +723,7 @@
   .sidebar[data-collapsed="true"] {
     flex-basis: var(--sidebar-rail-width);
     width: var(--sidebar-rail-width);
-    padding-inline: 6px;
+    padding-inline: 6px 0;
   }
 
   .sidebar .collapseCopy,
@@ -714,8 +766,15 @@
     min-height: 44px;
   }
 
-  .sidebar .sessionButton {
+  .sidebar .sessionButton,
+  .sidebar[data-collapsed="true"] .sessionButton {
+    width: 100%;
     grid-template-columns: 12px;
+  }
+
+  .sidebar .footer .utilityAction,
+  .sidebar[data-collapsed="true"] .footer .utilityAction {
+    width: 100%;
   }
 
   .sidebar .row {

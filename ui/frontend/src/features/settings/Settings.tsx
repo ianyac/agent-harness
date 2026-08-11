@@ -1,4 +1,3 @@
-import * as Dialog from "@radix-ui/react-dialog";
 import { useLayoutEffect, useRef } from "react";
 
 import type { PreferenceChanges, Preferences } from "./preferences";
@@ -31,39 +30,47 @@ export function Settings({
   logsSupported,
 }: SettingsProps) {
   const focusOrigin = useRef<HTMLElement | null>(null);
+  const panelRef = useRef<HTMLElement | null>(null);
 
   useLayoutEffect(() => {
-    if (open && document.activeElement instanceof HTMLElement && document.activeElement !== document.body) {
+    if (!open) return undefined;
+    if (document.activeElement instanceof HTMLElement && document.activeElement !== document.body) {
       focusOrigin.current = document.activeElement;
     }
+    panelRef.current?.focus({ preventScroll: true });
+    return () => {
+      const origin = focusOrigin.current;
+      focusOrigin.current = null;
+      const active = document.activeElement;
+      const panel = panelRef.current;
+      // Only pull focus back when closing removed it (Escape, tab teardown);
+      // a click that moved focus elsewhere keeps its target.
+      if (origin?.isConnected && (active === document.body || (panel !== null && panel.contains(active)))) {
+        origin.focus();
+      }
+    };
   }, [open]);
 
-  return (
-    <Dialog.Root open={open} onOpenChange={onOpenChange}>
-      <Dialog.Portal>
-        <Dialog.Overlay className={styles.overlay} />
-        <Dialog.Content
-          className={styles.dialog}
-          onCloseAutoFocus={(event) => {
-            event.preventDefault();
-            const origin = focusOrigin.current;
-            focusOrigin.current = null;
-            if (origin?.isConnected) origin.focus();
-          }}
-        >
-          <header className={styles.header}>
-            <div>
-              <Dialog.Title className={styles.title}>Settings</Dialog.Title>
-              <Dialog.Description className={styles.description}>
-                Local preferences for the daily driver.
-              </Dialog.Description>
-            </div>
-            <Dialog.Close className={styles.iconButton} aria-label="Close settings">
-              <span aria-hidden="true">&#215;</span>
-</Dialog.Close>
-          </header>
+  if (!open) return null;
 
-          <div className={styles.scrollArea}>
+  return (
+    <section
+      ref={panelRef}
+      className={styles.panel}
+      role="region"
+      aria-label="Settings"
+      tabIndex={-1}
+      onKeyDown={(event) => {
+        if (event.key !== "Escape") return;
+        event.stopPropagation();
+        onOpenChange(false);
+      }}
+    >
+      <p className={styles.description}>
+        Local preferences for the daily driver. Press Escape to return.
+      </p>
+
+      <div className={styles.scrollArea}>
             <fieldset className={styles.section}>
               <legend>Appearance</legend>
               <div className={styles.inlineChoices}>
@@ -169,9 +176,7 @@ export function Settings({
               </dl>
               <p className={styles.help}>The UI never reads or stores credential contents.</p>
             </section>
-          </div>
-        </Dialog.Content>
-      </Dialog.Portal>
-    </Dialog.Root>
+      </div>
+    </section>
   );
 }

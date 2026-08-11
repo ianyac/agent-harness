@@ -22,6 +22,7 @@ type SessionSidebarProps = {
   readonly onArchive: (sessionId: string) => void | Promise<void>;
   readonly onSearch: () => void;
   readonly onOpenSettings: () => void;
+  readonly settingsActive?: boolean;
 };
 
 function localDayOrdinal(value: Date): number {
@@ -50,6 +51,7 @@ export function SessionSidebar({
   onArchive,
   onSearch,
   onOpenSettings,
+  settingsActive = false,
 }: SessionSidebarProps) {
   const groups: Record<GroupName, SessionRecord[]> = {
     Today: [],
@@ -149,6 +151,8 @@ export function SessionSidebar({
           className={styles.utilityAction}
           aria-label="Settings"
           title="Settings"
+          aria-current={settingsActive ? "page" : undefined}
+          data-active={settingsActive || undefined}
           onClick={onOpenSettings}
         >
           <span className={styles.glyph} aria-hidden="true">&#8801;</span>

@@ -49,16 +49,16 @@ describe("Settings", () => {
       />,
     );
 
-    const dialog = screen.getByRole("dialog", { name: "Settings" });
-    expect(dialog).toHaveTextContent("⌘N");
-    expect(dialog).toHaveTextContent("⌘K");
-    expect(dialog).toHaveTextContent("⌘F");
-    expect(dialog).toHaveTextContent("⌘⇧I");
-    expect(dialog).toHaveTextContent("⌘Enter");
-    expect(dialog).toHaveTextContent("Escape");
-    expect(dialog).toHaveTextContent("~/.codex/auth.json");
-    expect(dialog).toHaveTextContent("/work/acme/.agent/sessions");
-    expect(dialog).not.toHaveTextContent(/bearer|api token/i);
+    const panel = screen.getByRole("region", { name: "Settings" });
+    expect(panel).toHaveTextContent("⌘N");
+    expect(panel).toHaveTextContent("⌘K");
+    expect(panel).toHaveTextContent("⌘F");
+    expect(panel).toHaveTextContent("⌘⇧I");
+    expect(panel).toHaveTextContent("⌘Enter");
+    expect(panel).toHaveTextContent("Escape");
+    expect(panel).toHaveTextContent("~/.codex/auth.json");
+    expect(panel).toHaveTextContent("/work/acme/.agent/sessions");
+    expect(panel).not.toHaveTextContent(/bearer|api token/i);
     expect(screen.queryByText(/logs/i)).not.toBeInTheDocument();
   });
 
@@ -83,7 +83,7 @@ describe("Settings", () => {
     const { container } = render(<Harness />);
     const trigger = screen.getByRole("button", { name: "Open settings" });
     await user.click(trigger);
-    expect(screen.getByRole("dialog", { name: "Settings" })).toBeVisible();
+    expect(screen.getByRole("region", { name: "Settings" })).toBeVisible();
     expect((await axe.run(container)).violations).toEqual([]);
     await user.keyboard("{Escape}");
     expect(trigger).toHaveFocus();

@@ -8,9 +8,13 @@
 .dialog {
   position: fixed;
   z-index: 81;
-  inset-block: 20px;
-  inset-inline-end: 20px;
-  width: min(520px, calc(100vw - 40px));
+  inset-block-start: 50%;
+  inset-inline-start: 50%;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  width: min(80vw, 1040px);
+  max-height: min(85dvh, 900px);
+  transform: translate(-50%, -50%);
   border: 1px solid var(--color-border);
   border-radius: 0;
   color: var(--color-ink);
@@ -66,8 +70,8 @@
 }
 
 .scrollArea {
-  max-height: calc(100dvh - 130px);
-  padding: 4px 20px 24px;
+  min-height: 0;
+  padding: 4px 24px 24px;
   overflow: auto;
 }
 
@@ -187,5 +191,7 @@
   .dialog {
     inset: 8px;
     width: auto;
+    max-height: none;
+    transform: none;
   }
 }

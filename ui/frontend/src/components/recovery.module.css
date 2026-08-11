@@ -53,6 +53,28 @@
   color: var(--color-danger-text);
 }
 
+.statusSquare {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border: 1px solid currentColor;
+  color: var(--color-ink-muted);
+  background: transparent;
+}
+
+.statusSquare[data-state="connected"] {
+  border: 0;
+  color: var(--color-success);
+  background: currentColor;
+}
+
+.statusSquare[data-state="reconnecting"] {
+  border: 0;
+  color: var(--color-attention);
+  background: currentColor;
+  transform: rotate(45deg);
+}
+
 .connection {
   display: inline-flex;
   align-items: center;

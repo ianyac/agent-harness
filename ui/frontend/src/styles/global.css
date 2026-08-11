@@ -33,8 +33,8 @@ input[type="checkbox"] {
 }
 
 ::selection {
-  color: var(--color-on-accent);
-  background: color-mix(in srgb, var(--color-accent-solid) 85%, transparent);
+  color: var(--color-selection-fg);
+  background: var(--color-selection-bg);
 }
 
 :focus-visible {
@@ -49,7 +49,6 @@ input[type="checkbox"] {
 
 ::-webkit-scrollbar-thumb {
   border: 3px solid transparent;
-  border-radius: 999px;
   background-color: color-mix(in srgb, var(--color-ink) 22%, transparent);
   background-clip: padding-box;
 }

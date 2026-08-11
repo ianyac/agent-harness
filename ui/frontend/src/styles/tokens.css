@@ -1,51 +1,54 @@
 /*
- * Design language: bold, minimal, cool.
- * Neutral graphite surfaces, hairline borders, one confident iris accent.
- * Every color pairing here is chosen to clear WCAG AA (axe runs in CI):
- * ink-muted/ink-small stay >= 4.5:1 on page, sidebar, and surface;
- * on-accent stays >= 4.5:1 on accent-solid in both schemes.
+ * Design language: flat, geometric, typographic.
+ * Palettes are derived from the Ghostty "Otty Paper" (light) and "Otty Night"
+ * (dark) terminal themes; darker/lighter derivatives keep every text pairing
+ * at WCAG AA (axe runs in CI): ink-muted/ink-small clear 4.5:1 on page,
+ * sidebar, and surface; on-accent and on-danger clear 4.5:1 on their fills.
+ * No rounded corners, no drop shadows: borders and flat fills do the work.
  */
 :root {
   color-scheme: light dark;
 
-  --color-page: #fbfbfc;
-  --color-sidebar: #f4f4f6;
+  --color-page: #fcfbf9;
+  --color-sidebar: #f3f2ec;
   --color-surface: #ffffff;
   --color-elevated: #ffffff;
-  --color-ink: #16171b;
-  --color-ink-muted: #5e626b;
-  --color-ink-small: #545861;
-  --color-border: #e2e3e8;
-  --color-border-strong: #c9cbd3;
+  --color-ink: #1a1a1a;
+  --color-ink-muted: #66645b;
+  --color-ink-small: #66645b;
+  --color-border: #e0dfd5;
+  --color-border-strong: #c1beb5;
 
-  --color-accent: #5b5bd6;
-  --color-accent-solid: #5b5bd6;
-  --color-accent-hover: #5151c4;
+  --color-accent: #4a7a8a;
+  --color-accent-solid: #4a7a8a;
+  --color-accent-hover: #3d6875;
   --color-on-accent: #ffffff;
   --color-accent-tint: color-mix(in srgb, var(--color-accent) 10%, transparent);
-  --color-focus-ring: #5b5bd6;
+  --color-focus-ring: #4a7a8a;
 
-  --color-success: #1d9161;
-  --color-attention: #b8770a;
-  --color-danger: #dc2f34;
-  --color-danger-strong: #c22227;
-  --color-danger-text: #c0272c;
+  --color-success: #2b5a38;
+  --color-attention: #a85a20;
+  --color-danger: #a33a3a;
+  --color-danger-strong: #8f3131;
+  --color-danger-text: #a33a3a;
+  --color-on-danger: #ffffff;
 
-  --radius-control: 8px;
-  --radius-menu: 10px;
-  --radius-card: 12px;
-  --radius-conversation: 16px;
-  --radius-round: 999px;
+  --color-selection-bg: #e0dfd5;
+  --color-selection-fg: #1a1a1a;
+
+  --radius-control: 0;
+  --radius-menu: 0;
+  --radius-card: 0;
+  --radius-conversation: 0;
+  --radius-round: 0;
 
   --sidebar-width: 232px;
   --sidebar-rail-width: 56px;
   --transcript-measure: 820px;
 
-  --shadow-sm: 0 1px 2px color-mix(in srgb, #101116 6%, transparent);
-  --shadow-md: 0 2px 6px color-mix(in srgb, #101116 5%, transparent),
-    0 8px 24px color-mix(in srgb, #101116 8%, transparent);
-  --shadow-lg: 0 4px 12px color-mix(in srgb, #101116 8%, transparent),
-    0 24px 64px color-mix(in srgb, #101116 18%, transparent);
+  --shadow-sm: none;
+  --shadow-md: none;
+  --shadow-lg: none;
 
   --motion-fast: 100ms;
   --motion-standard: 160ms;
@@ -53,106 +56,102 @@
   --motion-easing: cubic-bezier(0.2, 0, 0, 1);
   --motion-easing-out: cubic-bezier(0.16, 1, 0.3, 1);
 
-  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  --font-size-body: 14px;
+  --font-sans: "MesloLGM Nerd Font", "MesloLGS Nerd Font", "MesloLGS NF",
+    ui-monospace, SFMono-Regular, Menlo, monospace;
+  --font-mono: "MesloLGM Nerd Font", "MesloLGS Nerd Font", "MesloLGS NF",
+    ui-monospace, SFMono-Regular, Menlo, monospace;
+  --font-size-body: 13px;
   --line-height-body: 1.55;
-  --tracking-display: -0.02em;
+  --tracking-display: 0;
   --focus-ring: 0 0 0 2px var(--color-page), 0 0 0 4px var(--color-focus-ring);
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --color-page: #0f1014;
-    --color-sidebar: #131418;
-    --color-surface: #17181d;
-    --color-elevated: #1d1e24;
-    --color-ink: #edeef1;
-    --color-ink-muted: #9598a1;
-    --color-ink-small: #9598a1;
-    --color-border: #272830;
-    --color-border-strong: #383a44;
+    --color-page: #363b40;
+    --color-sidebar: #2f3338;
+    --color-surface: #3d4247;
+    --color-elevated: #434950;
+    --color-ink: #ffffff;
+    --color-ink-muted: #bfc7d5;
+    --color-ink-small: #bfc7d5;
+    --color-border: #4b5158;
+    --color-border-strong: #5d646d;
 
-    --color-accent: #9b9ef0;
-    --color-accent-solid: #5b5ed8;
-    --color-accent-hover: #6a6de2;
-    --color-on-accent: #ffffff;
-    --color-focus-ring: #9b9ef0;
+    --color-accent: #82aaff;
+    --color-accent-solid: #82aaff;
+    --color-accent-hover: #9cbeff;
+    --color-on-accent: #1f2226;
+    --color-focus-ring: #82aaff;
 
-    --color-success: #4cc38a;
-    --color-attention: #f0b13d;
-    --color-danger: #e5484d;
-    --color-danger-strong: #dc2f34;
-    --color-danger-text: #f2726f;
+    --color-success: #c3e88d;
+    --color-attention: #ffcb6b;
+    --color-danger: #f07178;
+    --color-danger-strong: #f07178;
+    --color-danger-text: #ff8b92;
+    --color-on-danger: #1f2226;
 
-    --shadow-sm: 0 1px 2px color-mix(in srgb, #000 32%, transparent);
-    --shadow-md: 0 2px 6px color-mix(in srgb, #000 28%, transparent),
-      0 8px 24px color-mix(in srgb, #000 36%, transparent);
-    --shadow-lg: 0 4px 12px color-mix(in srgb, #000 36%, transparent),
-      0 24px 64px color-mix(in srgb, #000 52%, transparent);
+    --color-selection-bg: #676e95;
+    --color-selection-fg: #ffffff;
   }
 }
 
 :root[data-theme="light"] {
   color-scheme: light;
-  --color-page: #fbfbfc;
-  --color-sidebar: #f4f4f6;
+  --color-page: #fcfbf9;
+  --color-sidebar: #f3f2ec;
   --color-surface: #ffffff;
   --color-elevated: #ffffff;
-  --color-ink: #16171b;
-  --color-ink-muted: #5e626b;
-  --color-ink-small: #545861;
-  --color-border: #e2e3e8;
-  --color-border-strong: #c9cbd3;
+  --color-ink: #1a1a1a;
+  --color-ink-muted: #66645b;
+  --color-ink-small: #66645b;
+  --color-border: #e0dfd5;
+  --color-border-strong: #c1beb5;
 
-  --color-accent: #5b5bd6;
-  --color-accent-solid: #5b5bd6;
-  --color-accent-hover: #5151c4;
+  --color-accent: #4a7a8a;
+  --color-accent-solid: #4a7a8a;
+  --color-accent-hover: #3d6875;
   --color-on-accent: #ffffff;
-  --color-focus-ring: #5b5bd6;
+  --color-focus-ring: #4a7a8a;
 
-  --color-success: #1d9161;
-  --color-attention: #b8770a;
-  --color-danger: #dc2f34;
-  --color-danger-strong: #c22227;
-  --color-danger-text: #c0272c;
+  --color-success: #2b5a38;
+  --color-attention: #a85a20;
+  --color-danger: #a33a3a;
+  --color-danger-strong: #8f3131;
+  --color-danger-text: #a33a3a;
+  --color-on-danger: #ffffff;
 
-  --shadow-sm: 0 1px 2px color-mix(in srgb, #101116 6%, transparent);
-  --shadow-md: 0 2px 6px color-mix(in srgb, #101116 5%, transparent),
-    0 8px 24px color-mix(in srgb, #101116 8%, transparent);
-  --shadow-lg: 0 4px 12px color-mix(in srgb, #101116 8%, transparent),
-    0 24px 64px color-mix(in srgb, #101116 18%, transparent);
+  --color-selection-bg: #e0dfd5;
+  --color-selection-fg: #1a1a1a;
 }
 
 :root[data-theme="dark"] {
   color-scheme: dark;
-  --color-page: #0f1014;
-  --color-sidebar: #131418;
-  --color-surface: #17181d;
-  --color-elevated: #1d1e24;
-  --color-ink: #edeef1;
-  --color-ink-muted: #9598a1;
-  --color-ink-small: #9598a1;
-  --color-border: #272830;
-  --color-border-strong: #383a44;
+  --color-page: #363b40;
+  --color-sidebar: #2f3338;
+  --color-surface: #3d4247;
+  --color-elevated: #434950;
+  --color-ink: #ffffff;
+  --color-ink-muted: #bfc7d5;
+  --color-ink-small: #bfc7d5;
+  --color-border: #4b5158;
+  --color-border-strong: #5d646d;
 
-  --color-accent: #9b9ef0;
-  --color-accent-solid: #5b5ed8;
-  --color-accent-hover: #6a6de2;
-  --color-on-accent: #ffffff;
-  --color-focus-ring: #9b9ef0;
+  --color-accent: #82aaff;
+  --color-accent-solid: #82aaff;
+  --color-accent-hover: #9cbeff;
+  --color-on-accent: #1f2226;
+  --color-focus-ring: #82aaff;
 
-  --color-success: #4cc38a;
-  --color-attention: #f0b13d;
-  --color-danger: #e5484d;
-  --color-danger-strong: #dc2f34;
-  --color-danger-text: #f2726f;
+  --color-success: #c3e88d;
+  --color-attention: #ffcb6b;
+  --color-danger: #f07178;
+  --color-danger-strong: #f07178;
+  --color-danger-text: #ff8b92;
+  --color-on-danger: #1f2226;
 
-  --shadow-sm: 0 1px 2px color-mix(in srgb, #000 32%, transparent);
-  --shadow-md: 0 2px 6px color-mix(in srgb, #000 28%, transparent),
-    0 8px 24px color-mix(in srgb, #000 36%, transparent);
-  --shadow-lg: 0 4px 12px color-mix(in srgb, #000 36%, transparent),
-    0 24px 64px color-mix(in srgb, #000 52%, transparent);
+  --color-selection-bg: #676e95;
+  --color-selection-fg: #ffffff;
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -170,9 +169,6 @@
     --color-danger-text: var(--color-ink);
     --color-border: var(--color-ink);
     --color-border-strong: var(--color-ink);
-    --shadow-sm: none;
-    --shadow-md: none;
-    --shadow-lg: none;
     --focus-ring: 0 0 0 2px var(--color-page), 0 0 0 5px var(--color-focus-ring);
   }
 }

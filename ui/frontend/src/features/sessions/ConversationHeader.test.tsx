@@ -36,6 +36,39 @@ describe("ConversationHeader", () => {
     });
   });
 
+  it("shows a live context stat when context management events exist", () => {
+    render(
+      <ConversationHeader
+        {...{ sessionId: "session-1" }}
+        workspace="/work/agent-harness"
+        branch={null}
+        latestContext={{ mode: "folding", summarized_messages: 12, used_tokens: 8412 }}
+        mode="default"
+        onSetSessionMode={() => {}}
+        onToggleActivity={() => {}}
+      />,
+    );
+    expect(
+      screen.getByRole("status", { name: "Context management status" }),
+    ).toHaveTextContent("ctx 8,412 tok · 12 folded");
+  });
+
+  it("omits the context stat until a context event arrives", () => {
+    render(
+      <ConversationHeader
+        {...{ sessionId: "session-1" }}
+        workspace="/work/agent-harness"
+        branch={null}
+        mode="default"
+        onSetSessionMode={() => {}}
+        onToggleActivity={() => {}}
+      />,
+    );
+    expect(
+      screen.queryByRole("status", { name: "Context management status" }),
+    ).not.toBeInTheDocument();
+  });
+
   it("requires explicit confirmation before accept-all mode", async () => {
     const user = userEvent.setup();
     const onSetSessionMode = vi.fn();

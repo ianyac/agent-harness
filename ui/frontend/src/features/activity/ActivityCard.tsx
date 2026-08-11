@@ -1,4 +1,3 @@
-import { CheckCircle2, CircleAlert, Clock3 } from "lucide-react";
 import { useEffect, useState } from "react";
 
 import type { ActivityItem, JsonValue } from "../../protocol/types";
@@ -92,7 +91,6 @@ export function ActivityCard({ activities, openInspector }: ActivityCardProps) {
   const isRunning = !hasError && activities.some((activity) => activity.status === "running");
   const status = hasError ? "error" : isRunning ? "running" : "complete";
   const statusLabel = status === "error" ? "Failed" : status === "running" ? "Working" : "Complete";
-  const Icon = status === "error" ? CircleAlert : status === "running" ? Clock3 : CheckCircle2;
   const durationMs = groupDurationMs(activities, now);
   const tests = testSummary(activities);
   const previewActivity = [...activities].reverse().find((activity) => activity.result !== undefined);
@@ -118,7 +116,7 @@ export function ActivityCard({ activities, openInspector }: ActivityCardProps) {
       onClick={() => openInspector(first.activityId)}
     >
       <span className={styles.activityHeading}>
-        <Icon aria-hidden="true" size={17} />
+        <span className={styles.statusMark} aria-hidden="true" />
         <span className={styles.activityTitle}>{title}</span>
       </span>
       <span className={styles.activityMeta}>

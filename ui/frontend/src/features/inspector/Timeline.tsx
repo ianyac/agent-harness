@@ -1,13 +1,3 @@
-import {
-  Bot,
-  CheckCircle2,
-  CircleAlert,
-  GitMerge,
-  ListChecks,
-  MessageSquareText,
-  ShieldAlert,
-  Wrench,
-} from "lucide-react";
 import type { CSSProperties } from "react";
 
 import { messageHistory } from "../../protocol/history";
@@ -79,9 +69,7 @@ export function Timeline({ state, selectedActivityId, onSelectActivity }: Timeli
                 aria-current={selectedActivityId === activity.activityId ? "true" : undefined}
                 onClick={() => onSelectActivity(activity.activityId)}
               >
-                {activity.actor === "subagent"
-                  ? <Bot aria-hidden="true" size={16} />
-                  : <Wrench aria-hidden="true" size={16} />}
+                <span className={styles.timelineMark} aria-hidden="true" />
                 <span><strong>{readable(activity.name)}</strong><small>{activity.actor} · {activity.status}</small></span>
               </button>
             </li>
@@ -91,7 +79,6 @@ export function Timeline({ state, selectedActivityId, onSelectActivity }: Timeli
               const activity = state.activities[item.activityId];
               if (activity === undefined) return null;
               const depth = activityDepth(activity, state.activities);
-              const Icon = activity.actor === "subagent" ? Bot : Wrench;
               return (
                 <li
                   key={`activity-${item.activityId}`}
@@ -106,7 +93,7 @@ export function Timeline({ state, selectedActivityId, onSelectActivity }: Timeli
                     aria-current={selectedActivityId === activity.activityId ? "true" : undefined}
                     onClick={() => onSelectActivity(activity.activityId)}
                   >
-                    <Icon aria-hidden="true" size={16} />
+                    <span className={styles.timelineMark} aria-hidden="true" />
                     <span><strong>{readable(activity.name)}</strong><small>{activity.actor} · {activity.status}</small></span>
                   </button>
                 </li>
@@ -115,7 +102,7 @@ export function Timeline({ state, selectedActivityId, onSelectActivity }: Timeli
             if (item.kind === "assistant") {
               return (
                 <li key={`assistant-${index}`} className={styles.timelineItem}>
-                  <MessageSquareText aria-hidden="true" size={16} />
+                  <span className={styles.timelineMark} aria-hidden="true" />
                   <span><strong>Model</strong><small>{item.text}</small></span>
                 </li>
               );
@@ -124,7 +111,7 @@ export function Timeline({ state, selectedActivityId, onSelectActivity }: Timeli
               const decision = item.resolution?.answer ?? "Pending";
               return (
                 <li key={`permission-${item.request.requestId}`} className={styles.timelineItem}>
-                  <ShieldAlert aria-hidden="true" size={16} />
+                  <span className={styles.timelineMark} aria-hidden="true" />
                   <span>
                     <strong>Permission · {readable(item.request.action)}</strong>
                     <small>{compactEvidence(item.request.reason)} · {decision}</small>
@@ -147,7 +134,7 @@ export function Timeline({ state, selectedActivityId, onSelectActivity }: Timeli
                 .join(" · ");
               return (
                 <li key={`plan-${item.request.requestId}`} className={styles.timelineItem}>
-                  <ListChecks aria-hidden="true" size={16} />
+                  <span className={styles.timelineMark} aria-hidden="true" />
                   <span>
                     <strong>Plan review · {decision}</strong>
                     <small>{detail}</small>
@@ -167,16 +154,15 @@ export function Timeline({ state, selectedActivityId, onSelectActivity }: Timeli
               const mode = typeof item.context.mode === "string" ? sentenceCase(item.context.mode) : "Unknown";
               return (
                 <li key={`context-${item.turnId ?? "none"}-${item.sequence}`} className={styles.timelineItem}>
-                  <GitMerge aria-hidden="true" size={16} />
+                  <span className={styles.timelineMark} aria-hidden="true" />
                   <span><strong>Context management · {mode}</strong><small>Sequence {item.sequence}</small></span>
                 </li>
               );
             }
             const isError = item.boundary === "error" || item.boundary === "activity_error";
-            const Icon = isError ? CircleAlert : CheckCircle2;
             return (
               <li key={`boundary-${index}-${item.boundary}`} className={styles.timelineItem} data-error={isError || undefined}>
-                <Icon aria-hidden="true" size={16} />
+                <span className={styles.timelineMark} aria-hidden="true" />
                 <span><strong>{boundaryLabel(item.boundary)}</strong></span>
               </li>
             );

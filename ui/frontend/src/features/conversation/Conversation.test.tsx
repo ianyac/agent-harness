@@ -339,6 +339,35 @@ describe("Conversation", () => {
     expect(screen.getByRole("status", { name: "Conversation update" })).toHaveTextContent("Response complete");
   });
 
+  it("renders context management events as fold markers in the transcript", () => {
+    const state = {
+      ...transcript({
+        messages: messages({ role: "user", content: "Question" }),
+        running: true,
+      }),
+      timeline: [
+        {
+          kind: "context",
+          turnId: "turn-1",
+          sequence: 4,
+          context: { mode: "folding", summarized_messages: 12, used_tokens: 8412 },
+        },
+        {
+          kind: "context",
+          turnId: "turn-1",
+          sequence: 6,
+          context: { mode: "compaction", summarized_messages: 1 },
+        },
+      ],
+    } as TranscriptState;
+    render(<Conversation state={state} openInspector={() => {}} />);
+
+    expect(
+      screen.getByText("Context folded · 12 messages · 8,412 tokens in context"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Context compacted · 1 message")).toBeInTheDocument();
+  });
+
   it("keeps an authoritative replacement after the activity where its stream appeared", () => {
     const work = activity({ activityId: "activity-order", result: "read complete" });
     const running = {

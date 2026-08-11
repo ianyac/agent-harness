@@ -171,7 +171,7 @@ describe("SessionSidebar", () => {
     expect(screen.getByRole("button", { name: /More actions for Ship navigation/i })).toHaveFocus();
   });
 
-  it("uses distinct Lucide SVG icons for every accessible connection state in the rail", () => {
+  it("keys a distinct geometric connection mark to every accessible connection state in the rail", () => {
     const props = {
       sessions: [session()],
       activeSessionId: "session-1",
@@ -190,23 +190,22 @@ describe("SessionSidebar", () => {
       <SessionSidebar {...props} connectionStatus="connecting" />,
     );
 
-    const iconFor = (accessibleName: string, state: string) => {
+    const markFor = (accessibleName: string, state: string) => {
       const status = screen.getByRole("status", { name: accessibleName });
-      const icon = status.querySelector<SVGElement>(
-        `svg.lucide[data-connection-icon="${state}"]`,
+      const mark = status.querySelector<HTMLElement>(
+        `span[data-connection-icon="${state}"]`,
       );
-      expect(icon).toBeVisible();
-      expect(icon).toHaveAttribute("aria-hidden", "true");
-      expect(icon).toHaveAttribute("stroke", "currentColor");
-      if (icon === null) throw new Error(`Missing Lucide connection icon for ${state}.`);
-      return Array.from(icon.children, (child) => child.outerHTML).join("");
+      expect(mark).toBeVisible();
+      expect(mark).toHaveAttribute("aria-hidden", "true");
+      if (mark === null) throw new Error(`Missing connection mark for ${state}.`);
+      return mark.getAttribute("data-connection-icon") ?? "";
     };
 
-    const signatures = [iconFor("Local service connecting", "connecting")];
+    const signatures = [markFor("Local service connecting", "connecting")];
     rerender(<SessionSidebar {...props} connectionStatus="connected" />);
-    signatures.push(iconFor("Local service connected", "connected"));
+    signatures.push(markFor("Local service connected", "connected"));
     rerender(<SessionSidebar {...props} connectionStatus="disconnected" />);
-    signatures.push(iconFor("Local service disconnected", "disconnected"));
+    signatures.push(markFor("Local service disconnected", "disconnected"));
 
     expect(new Set(signatures)).toHaveLength(3);
   });

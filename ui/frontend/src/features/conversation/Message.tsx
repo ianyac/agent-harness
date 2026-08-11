@@ -1,4 +1,3 @@
-import { Bot } from "lucide-react";
 
 import type { HarnessMessage, JsonValue } from "../../protocol/types";
 import type { CopyText } from "./CodeBlock";
@@ -47,7 +46,7 @@ export function Message({ id, role, content, streaming = false, copyText }: Mess
       tabIndex={-1}
     >
       {role === "assistant" ? (
-        <span className={styles.avatar} aria-hidden="true"><Bot size={17} /></span>
+        <span className={styles.avatar} aria-hidden="true" />
       ) : null}
       <div className={styles.messageBody}>
         {role === "user" ? <p>{content}</p> : <MarkdownContent content={content} copyText={copyText} />}

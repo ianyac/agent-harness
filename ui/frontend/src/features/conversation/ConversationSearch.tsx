@@ -1,4 +1,3 @@
-import { ChevronDown, ChevronUp, Search, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import styles from "./conversation.module.css";
@@ -75,7 +74,6 @@ export function ConversationSearch({ messages, onClose }: ConversationSearchProp
         close();
       }}
     >
-      <Search aria-hidden="true" size={17} />
       <input
         ref={inputRef}
         type="search"
@@ -108,7 +106,7 @@ export function ConversationSearch({ messages, onClose }: ConversationSearchProp
         onMouseDown={(event) => event.preventDefault()}
         onClick={() => move(-1)}
       >
-        <ChevronUp aria-hidden="true" size={16} />
+        <span aria-hidden="true">&#8593;</span>
       </button>
       <button
         type="button"
@@ -117,10 +115,10 @@ export function ConversationSearch({ messages, onClose }: ConversationSearchProp
         onMouseDown={(event) => event.preventDefault()}
         onClick={() => move(1)}
       >
-        <ChevronDown aria-hidden="true" size={16} />
+        <span aria-hidden="true">&#8595;</span>
       </button>
       <button type="button" aria-label="Close conversation search" onClick={close}>
-        <X aria-hidden="true" size={16} />
+        <span aria-hidden="true">&#215;</span>
       </button>
     </div>
   );

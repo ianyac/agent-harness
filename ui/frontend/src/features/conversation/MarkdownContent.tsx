@@ -1,4 +1,3 @@
-import { Check, Copy } from "lucide-react";
 import { Children, isValidElement, useState } from "react";
 import type { ReactElement, ReactNode } from "react";
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
@@ -68,7 +67,7 @@ function LocalPath({ href, copyText }: { readonly href: string; readonly copyTex
         }
         onClick={() => void copy()}
       >
-        {copyStatus === "copied" ? <Check aria-hidden="true" size={14} /> : <Copy aria-hidden="true" size={14} />}
+        <span aria-hidden="true">{copyStatus === "copied" ? "\u2713" : "\u29c9"}</span>
       </button>
       <span
         className={styles.copyFeedback}

@@ -1,4 +1,3 @@
-import { CircleCheck, LoaderCircle, RefreshCw } from "lucide-react";
 import { useEffect, useState } from "react";
 
 import styles from "./recovery.module.css";
@@ -53,9 +52,6 @@ export function ConnectionStatus({
     );
   }
 
-  const Icon = status === "checking"
-    ? LoaderCircle
-    : status === "reconnecting" ? RefreshCw : CircleCheck;
   const copy = status === "checking"
     ? "Checking"
     : status === "reconnecting" ? "Reconnecting" : "Connected";
@@ -63,7 +59,7 @@ export function ConnectionStatus({
   return (
     <>
       <span className={styles.connection} role="status" aria-label={labels[status]}>
-        <Icon aria-hidden="true" size={16} /> {copy}
+        <span className={styles.statusSquare} data-state={status} aria-hidden="true" /> {copy}
       </span>
       {status === "reconnecting" && prolonged ? (
         <div className={styles.reconnectBanner} role="alert">

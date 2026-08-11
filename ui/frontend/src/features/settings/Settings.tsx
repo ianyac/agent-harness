@@ -1,5 +1,4 @@
 import * as Dialog from "@radix-ui/react-dialog";
-import { X } from "lucide-react";
 import { useLayoutEffect, useRef } from "react";
 
 import type { PreferenceChanges, Preferences } from "./preferences";
@@ -60,8 +59,8 @@ export function Settings({
               </Dialog.Description>
             </div>
             <Dialog.Close className={styles.iconButton} aria-label="Close settings">
-              <X aria-hidden="true" size={18} />
-            </Dialog.Close>
+              <span aria-hidden="true">&#215;</span>
+</Dialog.Close>
           </header>
 
           <div className={styles.scrollArea}>

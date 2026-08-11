@@ -864,6 +864,7 @@ export function App({
             sessionId={activeSession.session_id}
             workspace={activeSession.workspace}
             branch={activeSession.branch ?? branchBySession[activeSession.session_id] ?? null}
+            latestContext={activeTranscript?.latestContext ?? null}
             mode={activeSession.mode}
             onSetSessionMode={(event) => routeSessionEvent(activeSession.session_id, event)}
             onToggleActivity={openInspectorOverview}

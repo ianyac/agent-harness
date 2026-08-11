@@ -210,7 +210,13 @@ test("approved deterministic visual states", async ({ page, authority }) => {
   await expect.soft(page).toHaveScreenshot("primary-1440-light.png", { animations: "disabled", caret: "hide" });
 
   authority.emit({ type: "turn_started", turn_id: "visual-turn", mode: "base", submission_id: null });
+  authority.emit({
+    type: "context_updated", turn_id: "visual-turn",
+    context: { mode: "folding", summarized_messages: 12, used_tokens: 8412 },
+  });
   authority.emit({ type: "assistant_delta", turn_id: "visual-turn", text: "Streaming fixture response…" });
+  await expect(page.getByText("Context folded · 12 messages · 8,412 tokens in context")).toBeVisible();
+  await expect(page.getByRole("status", { name: "Context management status" })).toHaveText("ctx 8,412 tok · 12 folded");
   await page.setViewportSize({ width: 1100, height: 900 });
   await expect.soft(page).toHaveScreenshot("streaming-1100.png", { animations: "disabled", caret: "hide" });
 

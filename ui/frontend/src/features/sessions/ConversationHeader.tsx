@@ -1,9 +1,8 @@
 import * as Dialog from "@radix-ui/react-dialog";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
-import { Activity, ChevronDown, GitBranch, ShieldCheck } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
-import type { BaseMode, SetSessionMode } from "../../protocol/types";
+import type { BaseMode, JsonObject, SetSessionMode } from "../../protocol/types";
 import { workspaceName } from "./SessionRow";
 import styles from "./sessionSidebar.module.css";
 
@@ -11,10 +10,22 @@ type ConversationHeaderProps = {
   readonly sessionId: string;
   readonly workspace: string;
   readonly branch: string | null;
+  readonly latestContext?: JsonObject | null;
   readonly mode: BaseMode;
   readonly onSetSessionMode: (event: SetSessionMode) => void;
   readonly onToggleActivity: () => void;
 };
+
+function contextStat(context: JsonObject): string | null {
+  const parts: string[] = [];
+  if (typeof context.used_tokens === "number" && Number.isSafeInteger(context.used_tokens) && context.used_tokens >= 0) {
+    parts.push(`${context.used_tokens.toLocaleString("en-US")} tok`);
+  }
+  if (typeof context.summarized_messages === "number" && Number.isSafeInteger(context.summarized_messages) && context.summarized_messages > 0) {
+    parts.push(`${context.summarized_messages} ${context.mode === "folding" ? "folded" : "compacted"}`);
+  }
+  return parts.length === 0 ? null : parts.join(" · ");
+}
 
 const modeLabels: Record<BaseMode, string> = {
   default: "Default",
@@ -26,6 +37,7 @@ export function ConversationHeader({
   sessionId,
   workspace,
   branch,
+  latestContext = null,
   mode,
   onSetSessionMode,
   onToggleActivity,
@@ -59,8 +71,17 @@ export function ConversationHeader({
         <h1 title={workspace}>{workspaceName(workspace)}</h1>
         {branch === null ? null : (
           <span className={styles.branch}>
-            <GitBranch aria-hidden="true" size={15} />
             {branch}
+          </span>
+        )}
+        {latestContext === null || contextStat(latestContext) === null ? null : (
+          <span
+            className={styles.contextStat}
+            role="status"
+            aria-label="Context management status"
+            title="Live context management state for this session"
+          >
+            ctx {contextStat(latestContext)}
           </span>
         )}
       </div>
@@ -73,10 +94,9 @@ export function ConversationHeader({
               className={styles.headerButton}
               aria-label={`Permission mode: ${modeLabels[mode]}`}
             >
-              <ShieldCheck aria-hidden="true" size={17} />
               {modeLabels[mode]}
-              <ChevronDown aria-hidden="true" size={14} />
-            </button>
+              <span aria-hidden="true">&#9662;</span>
+</button>
           </DropdownMenu.Trigger>
           <DropdownMenu.Portal>
             <DropdownMenu.Content className={styles.menu} align="end" sideOffset={6}>
@@ -98,7 +118,6 @@ export function ConversationHeader({
           </DropdownMenu.Portal>
         </DropdownMenu.Root>
         <button type="button" className={styles.headerButton} onClick={onToggleActivity}>
-          <Activity aria-hidden="true" size={17} />
           Activity
         </button>
       </div>

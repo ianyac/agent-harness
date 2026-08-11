@@ -1,4 +1,3 @@
-import { RefreshCw, X } from "lucide-react";
 import { useRef, useState } from "react";
 
 import { ApiError } from "../../api/http";
@@ -73,11 +72,11 @@ export function SessionOperationRecovery({
       </p>
       <div className={styles.operationActions}>
         <button type="button" disabled={pending} onClick={() => void retry()}>
-          <RefreshCw aria-hidden="true" size={15} /> Retry {label}
+          Retry {label}
         </button>
         {onDismiss === undefined ? null : (
           <button type="button" onClick={onDismiss}>
-            <X aria-hidden="true" size={15} /> Dismiss
+            Dismiss
           </button>
         )}
       </div>

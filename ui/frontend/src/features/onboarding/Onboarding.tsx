@@ -1,4 +1,3 @@
-import { FolderOpen, LoaderCircle, ShieldCheck } from "lucide-react";
 import { useLayoutEffect, useRef, useState } from "react";
 
 import { ApiError } from "../../api/http";
@@ -115,7 +114,6 @@ export function Onboarding({
   if (serviceStatus === "checking") {
     return (
       <section className={styles.checking} aria-label="First run">
-        <LoaderCircle aria-hidden="true" size={22} />
         <p role="status" aria-label="Checking local service">Checking local service</p>
       </section>
     );
@@ -160,7 +158,6 @@ export function Onboarding({
   return (
     <main className={styles.onboarding} aria-labelledby="first-run-title">
       <section className={styles.card}>
-        <ShieldCheck aria-hidden="true" size={26} />
         <h1 id="first-run-title">Start locally</h1>
         <p>Processing and session files stay local to this computer.</p>
         <p className={styles.trust}>
@@ -177,7 +174,6 @@ export function Onboarding({
               disabled={pending || pickerPending}
               onClick={() => void chooseNativeWorkspace()}
             >
-              <FolderOpen aria-hidden="true" size={18} />
               {pickerPending
                 ? "Choosing folder…"
                 : error === nativePickerError ? "Retry folder picker" : "Choose folder"}

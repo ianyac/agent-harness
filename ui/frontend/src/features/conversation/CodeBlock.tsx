@@ -1,4 +1,3 @@
-import { Check, Copy } from "lucide-react";
 import { useState } from "react";
 
 import styles from "./conversation.module.css";
@@ -88,7 +87,6 @@ export function CodeBlock({ code, language = "text", copyText = copyToClipboard 
           }
           onClick={() => void copy()}
         >
-          {copyStatus === "copied" ? <Check aria-hidden="true" size={15} /> : <Copy aria-hidden="true" size={15} />}
           <span aria-hidden="true">{copyStatus === "copied" ? "Copied" : copyStatus === "error" ? "Retry" : "Copy"}</span>
         </button>
       </div>

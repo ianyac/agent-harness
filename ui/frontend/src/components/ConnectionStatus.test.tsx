@@ -29,9 +29,9 @@ describe("ConnectionStatus", () => {
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
-  it("uses text and a distinct non-color icon for checking, reconnecting, and connected states", () => {
+  it("uses distinct text and a state-keyed geometric mark for checking, reconnecting, and connected states", () => {
     const { rerender } = render(<ConnectionStatus status="checking" attemptKey="a" />);
-    const signatures: string[] = [];
+    const copies: string[] = [];
     for (const [status, name] of [
       ["checking", "Local service checking"],
       ["reconnecting", "Local service reconnecting"],
@@ -39,9 +39,12 @@ describe("ConnectionStatus", () => {
     ] as const) {
       rerender(<ConnectionStatus status={status} attemptKey={status} />);
       const region = screen.getByRole("status", { name });
-      signatures.push(region.querySelector("svg")?.innerHTML ?? "");
+      const mark = region.querySelector(`span[data-state="${status}"]`);
+      expect(mark).toBeVisible();
+      expect(mark).toHaveAttribute("aria-hidden", "true");
+      copies.push(region.textContent?.trim() ?? "");
     }
-    expect(new Set(signatures)).toHaveLength(3);
+    expect(new Set(copies)).toHaveLength(3);
   });
 
   it("renders honest terminal copy for an unrecoverable tab with no reconnecting affordance", () => {

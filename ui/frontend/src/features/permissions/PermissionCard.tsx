@@ -1,4 +1,3 @@
-import { Globe2, ShieldAlert } from "lucide-react";
 import { useLayoutEffect, useRef, useState } from "react";
 import type { KeyboardEvent } from "react";
 
@@ -183,7 +182,6 @@ export function PermissionCard({
       onKeyDown={onKeyDown}
     >
       <div className={styles.headingRow}>
-        <ShieldAlert aria-hidden="true" size={18} />
         <div>
           <h2>Permission required</h2>
           <p className={styles.action}>{request.action}</p>
@@ -201,7 +199,6 @@ export function PermissionCard({
 
       {hasNetworkEgress(safety, request.action) ? (
         <p className={styles.network}>
-          <Globe2 aria-hidden="true" size={16} />
           <strong>Network access sends data outside the workspace.</strong>
         </p>
       ) : null}

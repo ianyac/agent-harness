@@ -1,5 +1,4 @@
 import * as Dialog from "@radix-ui/react-dialog";
-import { Activity, MessageSquarePlus, Search, Settings } from "lucide-react";
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 
 import type { SessionRecord } from "../features/sessions/useSessions";
@@ -20,7 +19,6 @@ type ActionCommand = {
   readonly id: string;
   readonly label: string;
   readonly shortcut?: string;
-  readonly icon: typeof Search;
   readonly run: () => void;
 };
 
@@ -73,20 +71,17 @@ export function CommandPalette({
       id: "action:new-chat",
       label: "New chat",
       shortcut: "⌘N",
-      icon: MessageSquarePlus,
       run: () => void onNewChat(),
     },
     {
       id: "action:open-settings",
       label: "Open settings",
-      icon: Settings,
       run: onOpenSettings,
     },
     {
       id: "action:toggle-activity",
       label: "Toggle activity",
       shortcut: "⌘⇧I",
-      icon: Activity,
       run: onToggleActivity,
     },
   ];
@@ -141,7 +136,7 @@ export function CommandPalette({
         >
           <Dialog.Title className={styles.srOnly}>Command palette</Dialog.Title>
           <div className={styles.searchField}>
-            <Search aria-hidden="true" size={18} />
+            <span className={styles.glyph} aria-hidden="true">/</span>
             <input
               ref={searchInput}
               type="search"
@@ -183,7 +178,6 @@ export function CommandPalette({
               <div role="group" aria-labelledby="command-actions-heading">
                 <div id="command-actions-heading" className={styles.commandHeading}>Actions</div>
                 {matchingActions.map((action, index) => {
-                  const Icon = action.icon;
                   return (
                     <button
                       key={action.id}
@@ -202,7 +196,6 @@ export function CommandPalette({
                       }
                       onClick={() => runAndClose(action.run)}
                     >
-                      <Icon aria-hidden="true" size={17} />
                       <span>{action.label}</span>
                       {action.shortcut === undefined ? null : <kbd>{action.shortcut}</kbd>}
                     </button>
@@ -224,7 +217,6 @@ export function CommandPalette({
                     data-command-id={`session:${session.session_id}`}
                     onClick={() => runAndClose(() => onSelectSession(session.session_id))}
                   >
-                    <Search aria-hidden="true" size={17} />
                     <span>
                       {session.title}
                       <small>{workspaceName(session.workspace)}</small>

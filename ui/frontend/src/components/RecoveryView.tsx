@@ -1,4 +1,3 @@
-import { Archive, Logs, Power, RefreshCw } from "lucide-react";
 import { useRef, useState } from "react";
 
 import type { PlatformAdapter } from "../platform/types";
@@ -88,7 +87,7 @@ export function TurnFailureNotice({ onRetry }: TurnFailureNoticeProps) {
       <div className={styles.operationActions}>
         {onRetry === undefined ? null : (
           <button type="button" disabled={pending} onClick={() => void retry(onRetry)}>
-            <RefreshCw aria-hidden="true" size={18} /> Retry
+            Retry
           </button>
         )}
         {failed ? (
@@ -147,7 +146,7 @@ export function RecoveryView({
       <div className={styles.actions}>
         {workspaceError ? (
           <button type="button" disabled={pending} onClick={() => void run(() => onArchive(sessionId))}>
-            <Archive aria-hidden="true" size={18} /> Archive session
+            Archive session
           </button>
         ) : null}
         {onRetry === undefined || ![
@@ -156,22 +155,22 @@ export function RecoveryView({
           "session_resume_error",
         ].includes(category) ? null : (
           <button type="button" disabled={pending} onClick={() => void run(onRetry)}>
-            <RefreshCw aria-hidden="true" size={18} /> Retry
+            Retry
           </button>
         )}
         {crashed && platform.restartService !== undefined ? (
           <button type="button" disabled={pending} onClick={() => void run(platform.restartService!)}>
-            <RefreshCw aria-hidden="true" size={18} /> Restart service
+            Restart service
           </button>
         ) : null}
         {crashed && platform.openLogs !== undefined ? (
           <button type="button" disabled={pending} onClick={() => void run(platform.openLogs!)}>
-            <Logs aria-hidden="true" size={18} /> Open logs
+            Open logs
           </button>
         ) : null}
         {crashed && platform.quit !== undefined ? (
           <button type="button" disabled={pending} onClick={() => void run(platform.quit!)}>
-            <Power aria-hidden="true" size={18} /> Quit
+            Quit
           </button>
         ) : null}
       </div>

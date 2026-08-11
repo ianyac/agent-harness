@@ -1,4 +1,3 @@
-import { ArrowDown } from "lucide-react";
 import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import { ActivityCard } from "../activity/ActivityCard";
@@ -11,7 +10,7 @@ import type {
 import { PermissionCard } from "../permissions/PermissionCard";
 import { PlanReviewCard } from "../plan-review/PlanReviewCard";
 import { messageHistory } from "../../protocol/history";
-import type { ActivityItem, ClientEvent, TranscriptState } from "../../protocol/types";
+import type { ActivityItem, ClientEvent, JsonObject, TranscriptState } from "../../protocol/types";
 import type { CopyText } from "./CodeBlock";
 import { ConversationSearch } from "./ConversationSearch";
 import type { SearchableMessage } from "./ConversationSearch";
@@ -40,6 +39,20 @@ function isNearBottom(element: HTMLElement): boolean {
 
 function isActivityGroup(item: GroupedTimelineItem): item is ActivityGroup {
   return Array.isArray(item);
+}
+
+function contextFoldLabel(context: JsonObject): string {
+  const head = context.mode === "folding"
+    ? "Context folded"
+    : context.mode === "compaction" ? "Context compacted" : "Context updated";
+  const parts = [head];
+  if (typeof context.summarized_messages === "number" && Number.isSafeInteger(context.summarized_messages) && context.summarized_messages > 0) {
+    parts.push(`${context.summarized_messages} ${context.summarized_messages === 1 ? "message" : "messages"}`);
+  }
+  if (typeof context.used_tokens === "number" && Number.isSafeInteger(context.used_tokens) && context.used_tokens >= 0) {
+    parts.push(`${context.used_tokens.toLocaleString("en-US")} tokens in context`);
+  }
+  return parts.join(" · ");
 }
 
 export function Conversation({
@@ -248,7 +261,13 @@ export function Conversation({
               );
             }
             if (item.kind === "boundary") return null;
-            if (item.kind === "context") return null;
+            if (item.kind === "context") {
+              return (
+                <div key={`context-${timelineIndex}`} className={styles.contextFold} role="status">
+                  <span className={styles.contextFoldLabel}>{contextFoldLabel(item.context)}</span>
+                </div>
+              );
+            }
             if (item.kind === "permission") {
               return (
                 <PermissionCard
@@ -293,7 +312,7 @@ export function Conversation({
       </span>
       {hasNewMessages ? (
         <button type="button" className={styles.newMessages} onClick={scrollToLatest}>
-          <ArrowDown aria-hidden="true" size={16} />
+          <span aria-hidden="true">&#8595;</span>
           New messages
         </button>
       ) : null}

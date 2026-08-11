@@ -37,12 +37,14 @@
   row-gap: 1px;
   padding: 4px 8px 14px;
   font-weight: 700;
-  letter-spacing: -0.01em;
   white-space: nowrap;
 }
 
-.identity > svg {
+.brandMark {
   grid-area: brand;
+  width: 14px;
+  height: 14px;
+  background: var(--color-ink);
 }
 
 .identity > .collapseCopy {
@@ -67,9 +69,33 @@
 
 .connectionMark {
   display: block;
-  flex: 0 0 16px;
-  width: 16px;
-  height: 16px;
+  flex: 0 0 8px;
+  width: 8px;
+  height: 8px;
+  border: 1px solid currentColor;
+  color: var(--color-ink-muted);
+  background: transparent;
+}
+
+.connectionMark[data-connection-icon="connected"] {
+  border: 0;
+  color: var(--color-success);
+  background: currentColor;
+}
+
+.connectionMark[data-connection-icon="disconnected"] {
+  border: 0;
+  color: var(--color-danger);
+  background: currentColor;
+  transform: rotate(45deg);
+}
+
+.glyph {
+  display: inline-grid;
+  width: 18px;
+  place-items: center;
+  font-size: 15px;
+  line-height: 1;
 }
 
 .primaryAction,
@@ -169,15 +195,6 @@
   background: var(--color-accent-tint);
 }
 
-.row[data-active]::before {
-  content: "";
-  position: absolute;
-  inset-block: 7px;
-  inset-inline-start: 0;
-  width: 3px;
-  border-radius: var(--radius-round);
-  background: var(--color-accent-solid);
-}
 
 .sessionButton {
   display: grid;
@@ -247,6 +264,10 @@
 }
 
 .statusIcon {
+  width: 10px;
+  height: 10px;
+  justify-self: center;
+  background: currentColor;
   color: var(--color-border-strong);
 }
 
@@ -291,7 +312,7 @@
   position: relative;
   min-height: 32px;
   padding: 6px 10px 6px 28px;
-  border-radius: 6px;
+  border-radius: 0;
   outline: 0;
   cursor: default;
   transition: background-color var(--motion-fast) var(--motion-easing);
@@ -335,7 +356,7 @@
 .searchField input {
   min-width: 0;
   border: 1px solid var(--color-border);
-  border-radius: 6px;
+  border-radius: 0;
   color: var(--color-ink);
   background: var(--color-surface);
 }
@@ -343,7 +364,7 @@
 .renameForm button {
   display: grid;
   border: 0;
-  border-radius: 6px;
+  border-radius: 0;
   color: inherit;
   background: transparent;
   min-height: 32px;
@@ -410,9 +431,6 @@
   display: grid;
 }
 
-.sidebar[data-collapsed="true"] .row[data-active]::before {
-  inset-block: 9px;
-}
 
 .sidebar[data-collapsed="true"] .moreButton {
   position: static;
@@ -466,6 +484,16 @@
   font-size: 12px;
 }
 
+.contextStat {
+  flex: 0 0 auto;
+  padding: 2px 8px;
+  border: 1px solid var(--color-border);
+  color: var(--color-ink-small);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
 .headerActions {
   gap: 6px;
 }
@@ -495,7 +523,7 @@
   padding: 20px;
   transform: translate(-50%, -50%);
   border: 1px solid var(--color-border);
-  border-radius: 14px;
+  border-radius: 0;
   background: var(--color-elevated);
   box-shadow: var(--shadow-lg);
 }
@@ -538,7 +566,7 @@
 
 .dangerButton {
   border-color: var(--color-danger-strong);
-  color: #fff;
+  color: var(--color-on-danger);
   background: var(--color-danger-strong);
 }
 
@@ -589,7 +617,7 @@
 
 .command {
   display: grid;
-  grid-template-columns: 20px minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
   width: 100%;
   min-height: 40px;
@@ -602,10 +630,6 @@
   text-align: start;
   cursor: pointer;
   transition: background-color var(--motion-fast) var(--motion-easing);
-}
-
-.command > svg {
-  color: var(--color-ink-muted);
 }
 
 .command:hover,
@@ -698,9 +722,6 @@
     display: grid;
   }
 
-  .sidebar .row[data-active]::before {
-    inset-block: 9px;
-  }
 
   .sidebar .moreButton,
   .sidebar[data-collapsed="true"] .moreButton {

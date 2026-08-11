@@ -1,7 +1,6 @@
 import * as Dialog from "@radix-ui/react-dialog";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import * as Tooltip from "@radix-ui/react-tooltip";
-import { Circle, MoreHorizontal, Save, X } from "lucide-react";
 import { useRef, useState } from "react";
 
 import type { SessionRecord, SessionRuntimeState } from "./useSessions";
@@ -80,12 +79,10 @@ export function SessionRow({
       aria-current={active ? "page" : undefined}
       onClick={() => onSelect(session.session_id)}
     >
-      <Circle
+      <span
         className={styles.statusIcon}
         data-status={runtime?.status ?? "idle"}
         aria-hidden="true"
-        size={12}
-        fill="currentColor"
       />
       <span className={styles.sessionCopy} aria-hidden="true">
         <span className={styles.sessionTitle}>{session.title}</span>
@@ -120,7 +117,7 @@ export function SessionRow({
               className={styles.moreButton}
               aria-label={`More actions for ${session.title}`}
             >
-              <MoreHorizontal aria-hidden="true" size={17} />
+              <span className={styles.glyph} aria-hidden="true">&#8943;</span>
             </button>
           </DropdownMenu.Trigger>
           <DropdownMenu.Portal>
@@ -174,11 +171,11 @@ export function SessionRow({
                 onChange={(event) => setDraft(event.target.value)}
               />
               <button type="submit" aria-label="Save name">
-                <Save aria-hidden="true" size={15} />
+                <span className={styles.glyph} aria-hidden="true">&#10003;</span>
               </button>
               <Dialog.Close asChild>
                 <button type="button" aria-label="Cancel rename">
-                  <X aria-hidden="true" size={15} />
+                  <span className={styles.glyph} aria-hidden="true">&#215;</span>
                 </button>
               </Dialog.Close>
             </form>

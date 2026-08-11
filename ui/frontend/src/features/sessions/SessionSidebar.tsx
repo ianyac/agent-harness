@@ -1,15 +1,4 @@
 import * as Tooltip from "@radix-ui/react-tooltip";
-import {
-  Bot,
-  ChevronLeft,
-  ChevronRight,
-  CircleAlert,
-  CircleCheck,
-  LoaderCircle,
-  MessageSquarePlus,
-  Search,
-  Settings,
-} from "lucide-react";
 
 import { SessionRow } from "./SessionRow";
 import type { SessionRecord, SessionRuntimeState } from "./useSessions";
@@ -79,11 +68,6 @@ export function SessionSidebar({
     connected: "Connected",
     disconnected: "Disconnected",
   }[connectionStatus];
-  const ConnectionIcon = {
-    connecting: LoaderCircle,
-    connected: CircleCheck,
-    disconnected: CircleAlert,
-  }[connectionStatus];
 
   return (
     <Tooltip.Provider delayDuration={0} skipDelayDuration={0}>
@@ -93,7 +77,7 @@ export function SessionSidebar({
         data-collapsed={collapsed}
       >
       <div className={styles.identity}>
-        <Bot aria-hidden="true" size={20} />
+        <span className={styles.brandMark} aria-hidden="true" />
         <span className={styles.collapseCopy}>Agent Harness</span>
         <span
           className={styles.connectionStatus}
@@ -102,11 +86,10 @@ export function SessionSidebar({
           aria-label={connectionLabel}
           title={connectionLabel}
         >
-          <ConnectionIcon
+          <span
             className={styles.connectionMark}
             data-connection-icon={connectionStatus}
             aria-hidden="true"
-            size={16}
           />
           <span className={styles.connectionCopy}>{connectionCopy}</span>
         </span>
@@ -118,7 +101,7 @@ export function SessionSidebar({
         aria-keyshortcuts="Meta+N"
         onClick={() => void onCreate()}
       >
-        <MessageSquarePlus aria-hidden="true" size={18} />
+        <span className={styles.glyph} aria-hidden="true">+</span>
         <span className={styles.collapseCopy}>New chat</span>
         <kbd className={styles.shortcut}>⌘N</kbd>
       </button>
@@ -129,7 +112,7 @@ export function SessionSidebar({
         aria-keyshortcuts="Meta+K"
         onClick={onSearch}
       >
-        <Search aria-hidden="true" size={18} />
+        <span className={styles.glyph} aria-hidden="true">/</span>
         <span className={styles.collapseCopy}>Search sessions</span>
         <kbd className={styles.shortcut}>⌘K</kbd>
       </button>
@@ -168,7 +151,7 @@ export function SessionSidebar({
           title="Settings"
           onClick={onOpenSettings}
         >
-          <Settings aria-hidden="true" size={18} />
+          <span className={styles.glyph} aria-hidden="true">&#8801;</span>
           <span className={styles.collapseCopy}>Settings</span>
         </button>
         <button
@@ -177,11 +160,7 @@ export function SessionSidebar({
           aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
           onClick={() => onCollapsedChange(!collapsed)}
         >
-          {collapsed ? (
-            <ChevronRight aria-hidden="true" size={18} />
-          ) : (
-            <ChevronLeft aria-hidden="true" size={18} />
-          )}
+          <span className={styles.glyph} aria-hidden="true">{collapsed ? "\u203a" : "\u2039"}</span>
         </button>
       </div>
       </nav>

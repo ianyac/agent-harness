@@ -1,4 +1,3 @@
-import { ClipboardCheck } from "lucide-react";
 import { useLayoutEffect, useRef, useState } from "react";
 
 import type {
@@ -123,7 +122,6 @@ export function PlanReviewCard({
       tabIndex={actionable ? -1 : undefined}
     >
       <div className={styles.headingRow}>
-        <ClipboardCheck aria-hidden="true" size={18} />
         <div>
           <h2>Plan review</h2>
           <p>Review the proposed approach before work continues.</p>

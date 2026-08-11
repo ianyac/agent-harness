@@ -51,7 +51,7 @@
 
 .resizeHandle:focus-visible {
   outline: none;
-  box-shadow: inset 3px 0 var(--color-focus-ring);
+  box-shadow: var(--focus-ring);
 }
 
 .header {
@@ -75,7 +75,6 @@
 .header h2 {
   font-size: 15px;
   font-weight: 700;
-  letter-spacing: -0.01em;
   line-height: 1.35;
 }
 
@@ -108,9 +107,11 @@
 .iconButton {
   display: grid;
   min-width: 32px;
-  padding: 0;
+  padding: 0 8px;
   place-items: center;
   color: var(--color-ink-muted);
+  font-size: 12px;
+  font-weight: 550;
 }
 
 .iconButton:hover,
@@ -159,7 +160,6 @@
 .detail h3 {
   font-size: 14px;
   font-weight: 700;
-  letter-spacing: -0.01em;
   line-height: 1.4;
 }
 
@@ -303,9 +303,12 @@
   color: var(--color-danger-text);
 }
 
-.timelineItem > svg {
+.timelineMark {
   flex: 0 0 auto;
-  margin-block-start: 2px;
+  width: 8px;
+  height: 8px;
+  margin-block-start: 6px;
+  background: currentColor;
 }
 
 .timelineItem > span,
@@ -342,7 +345,6 @@
 
 .timelineActivity[aria-current="true"] {
   background: var(--color-accent-tint);
-  box-shadow: inset 2px 0 var(--color-accent-solid);
 }
 
 .timelineDetails {

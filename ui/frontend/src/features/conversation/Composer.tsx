@@ -1,4 +1,3 @@
-import { ArrowUp, Paperclip, Pencil, RotateCcw, Square, X } from "lucide-react";
 import {
   useEffect,
   useId,
@@ -458,7 +457,7 @@ export function Composer({
               disabled={clearPending}
               onClick={() => void clearQueue(true)}
             >
-              <Pencil aria-hidden="true" size={15} />
+              Edit
             </button>
             <button
               type="button"
@@ -466,7 +465,7 @@ export function Composer({
               disabled={clearPending}
               onClick={() => void clearQueue(false)}
             >
-              <X aria-hidden="true" size={16} />
+              <span className={styles.glyph} aria-hidden="true">&#215;</span>
             </button>
           </div>
         ) : null}
@@ -571,7 +570,7 @@ export function Composer({
             aria-label="Attach context (coming later)"
             disabled
           >
-            <Paperclip aria-hidden="true" size={17} />
+            <span className={styles.glyph} aria-hidden="true">+</span>
           </button>
           <div className={styles.modes} role="group" aria-label="Turn mode">
             <button
@@ -612,7 +611,7 @@ export function Composer({
               disabled={stopping}
               onClick={() => void requestStop()}
             >
-              <Square aria-hidden="true" size={15} fill="currentColor" />
+              <span className={styles.stopMark} aria-hidden="true" />
             </button>
           ) : (
             <button
@@ -622,7 +621,7 @@ export function Composer({
               disabled={blank}
               onClick={submit}
             >
-              <ArrowUp aria-hidden="true" size={18} />
+              <span className={styles.glyph} aria-hidden="true">&#8593;</span>
             </button>
           )}
         </div>
@@ -640,7 +639,6 @@ export function Composer({
               aria-label="Retry message"
               onClick={() => void deliver(deliveryError.submission, deliveryError)}
             >
-              <RotateCcw aria-hidden="true" size={15} />
               Retry
             </button>
           </div>
@@ -663,7 +661,6 @@ export function Composer({
                     queueReconciliation.operation,
                   )}
                 >
-                  <RotateCcw aria-hidden="true" size={15} />
                   Retry
                 </button>
               </>

@@ -1,5 +1,4 @@
 import * as Dialog from "@radix-ui/react-dialog";
-import { Copy, PanelRightClose, Pin, PinOff } from "lucide-react";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { CSSProperties, KeyboardEvent, PointerEvent as ReactPointerEvent } from "react";
 
@@ -49,7 +48,7 @@ function Payload({ label, value, onCopy }: PayloadProps) {
     <details open className={styles.payloadDetails}>
       <summary>{label}</summary>
       <button type="button" className={styles.copyButton} aria-label={`Copy ${label.toLocaleLowerCase()}`} onClick={() => onCopy(serialized)}>
-        <Copy aria-hidden="true" size={14} /> Copy
+        Copy
       </button>
       <pre>{serialized}</pre>
     </details>
@@ -248,12 +247,12 @@ export function ActivityInspector({
                 aria-pressed={pinned}
                 onClick={() => onPinnedChange(!pinned)}
               >
-                {pinned ? <PinOff aria-hidden="true" size={17} /> : <Pin aria-hidden="true" size={17} />}
+                {pinned ? "Unpin" : "Pin"}
               </button>
               <Dialog.Close asChild>
                 <button ref={closeRef} type="button" className={styles.iconButton} aria-label="Close activity inspector">
-                  <PanelRightClose aria-hidden="true" size={18} />
-                </button>
+                  <span aria-hidden="true">&#215;</span>
+</button>
               </Dialog.Close>
             </div>
           </div>

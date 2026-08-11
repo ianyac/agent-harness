@@ -33,18 +33,18 @@
   margin-inline: auto;
   padding: 28px 24px 80px;
   align-content: start;
-  gap: 20px;
+  gap: 22px;
 }
 
 .flowItem {
   display: grid;
-  gap: 20px;
+  gap: 22px;
   min-width: 0;
 }
 
 .emptyState {
   display: grid;
-  gap: 8px;
+  gap: 10px;
   place-content: center;
   min-height: 55dvh;
   text-align: center;
@@ -52,22 +52,25 @@
 
 .emptyTitle {
   margin: 0;
-  font-size: 17px;
-  font-weight: 600;
+  font-size: 24px;
+  font-weight: 700;
+  letter-spacing: var(--tracking-display);
 }
 
 .emptyHint {
-  max-width: 380px;
+  max-width: 400px;
   margin: 0;
-  color: var(--color-ink-secondary);
+  color: var(--color-ink-muted);
 }
 
 .emptyHint kbd {
-  padding: 1px 5px;
+  padding: 1px 6px;
   font-family: var(--font-mono);
   font-size: 12px;
   border: 1px solid var(--color-border);
-  border-radius: 5px;
+  border-block-end-width: 2px;
+  border-radius: 6px;
+  background: var(--color-surface);
 }
 
 .message {
@@ -92,9 +95,9 @@
   width: 24px;
   height: 24px;
   margin-block-start: 1px;
-  border: 1px solid var(--color-border);
   border-radius: 50%;
-  color: var(--color-ink-muted);
+  color: var(--color-accent);
+  background: var(--color-accent-tint);
   place-items: center;
 }
 
@@ -103,10 +106,10 @@
 }
 
 .message[data-message-role="user"] .messageBody {
-  padding: 9px 13px;
+  padding: 9px 14px;
   border-radius: var(--radius-conversation);
-  color: var(--color-page);
-  background: var(--color-ink);
+  color: var(--color-on-accent);
+  background: var(--color-accent-solid);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
@@ -135,13 +138,19 @@
 
 .markdown a {
   color: var(--color-accent);
-  text-underline-offset: 2px;
+  font-weight: 500;
+  text-underline-offset: 3px;
+  text-decoration-color: color-mix(in srgb, var(--color-accent) 40%, transparent);
+}
+
+.markdown a:hover {
+  text-decoration-color: var(--color-accent);
 }
 
 .markdown :not(pre) > code,
 .localPath code {
   border-radius: 5px;
-  background: color-mix(in srgb, var(--color-ink) 8%, transparent);
+  background: color-mix(in srgb, var(--color-ink) 7%, transparent);
   font-family: var(--font-mono);
   font-size: 0.92em;
 }
@@ -173,6 +182,8 @@
   color: inherit;
   background: transparent;
   cursor: pointer;
+  transition: background-color var(--motion-fast) var(--motion-easing),
+    color var(--motion-fast) var(--motion-easing);
 }
 
 .inlineCopyButton {
@@ -182,12 +193,14 @@
   height: 32px;
   padding: 0;
   place-items: center;
+  color: var(--color-ink-muted);
 }
 
 .inlineCopyButton:hover,
 .copyButton:hover,
 .search button:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--color-ink) 9%, transparent);
+  color: var(--color-ink);
+  background: color-mix(in srgb, var(--color-ink) 8%, transparent);
 }
 
 .codeBlock {
@@ -206,7 +219,9 @@
   justify-content: space-between;
   padding-inline: 12px 6px;
   border-block-end: 1px solid var(--color-border);
+  background: color-mix(in srgb, var(--color-ink) 3%, transparent);
   color: var(--color-ink-small);
+  font-family: var(--font-mono);
   font-size: 11px;
 }
 
@@ -217,7 +232,7 @@
 }
 
 .copyFeedback[data-status="error"] {
-  color: var(--color-danger);
+  color: var(--color-danger-text);
 }
 
 .copyButton {
@@ -226,7 +241,9 @@
   align-items: center;
   gap: 5px;
   padding-inline: 8px;
+  font-family: var(--font-sans);
   font-size: 11px;
+  font-weight: 550;
 }
 
 .codeBlock pre {
@@ -251,16 +268,16 @@
 }
 
 .diffAddition {
-  background: color-mix(in srgb, var(--color-success) 15%, transparent);
+  background: color-mix(in srgb, var(--color-success) 14%, transparent);
 }
 
 .diffRemoval {
-  background: color-mix(in srgb, var(--color-danger) 13%, transparent);
+  background: color-mix(in srgb, var(--color-danger) 12%, transparent);
 }
 
 .diffHunk {
   color: var(--color-accent);
-  background: color-mix(in srgb, var(--color-accent) 9%, transparent);
+  background: var(--color-accent-tint);
   font-weight: 600;
 }
 
@@ -275,17 +292,26 @@
   min-height: 52px;
   grid-template-columns: minmax(0, 1fr);
   gap: 5px;
-  padding: 10px 12px;
+  padding: 10px 14px;
   border: 1px solid var(--color-border);
   border-radius: var(--radius-card);
   color: inherit;
-  background: color-mix(in srgb, var(--color-surface) 82%, transparent);
+  background: var(--color-surface);
   text-align: start;
   cursor: pointer;
+  transition: border-color var(--motion-fast) var(--motion-easing),
+    box-shadow var(--motion-fast) var(--motion-easing),
+    transform var(--motion-fast) var(--motion-easing);
 }
 
 .activityCard:hover {
-  border-color: var(--color-ink-muted);
+  border-color: var(--color-border-strong);
+  box-shadow: var(--shadow-sm);
+  transform: translateY(-1px);
+}
+
+.activityCard:active {
+  transform: translateY(0);
 }
 
 .activityCard[data-status="complete"] .activityHeading > svg {
@@ -308,7 +334,7 @@
 }
 
 .activityHeading {
-  gap: 7px;
+  gap: 8px;
 }
 
 .activityTitle {
@@ -352,11 +378,11 @@
   min-height: 40px;
   align-items: center;
   gap: 5px;
-  padding: 4px 5px 4px 10px;
+  padding: 4px 5px 4px 12px;
   border: 1px solid var(--color-border);
-  border-radius: var(--radius-menu);
-  background: var(--color-surface);
-  box-shadow: 0 8px 24px color-mix(in srgb, #000 16%, transparent);
+  border-radius: var(--radius-card);
+  background: var(--color-elevated);
+  box-shadow: var(--shadow-md);
 }
 
 .search input {
@@ -366,6 +392,10 @@
   outline: 0;
   color: var(--color-ink);
   background: transparent;
+}
+
+.search input::placeholder {
+  color: var(--color-ink-muted);
 }
 
 .search input:focus-visible {
@@ -378,6 +408,7 @@
   min-width: 58px;
   color: var(--color-ink-small);
   font-size: 11px;
+  font-variant-numeric: tabular-nums;
   text-align: end;
   white-space: nowrap;
 }
@@ -404,12 +435,36 @@
   min-height: 36px;
   align-items: center;
   gap: 6px;
-  padding-inline: 12px;
+  padding-inline: 14px;
   transform: translateX(-50%);
-  border: 1px solid var(--color-border);
-  background: var(--color-surface);
-  box-shadow: 0 6px 20px color-mix(in srgb, #000 14%, transparent);
+  border-radius: var(--radius-round);
+  color: var(--color-on-accent);
+  background: var(--color-accent-solid);
+  box-shadow: var(--shadow-md);
   font-weight: 600;
+}
+
+.newMessages:hover {
+  background: var(--color-accent-hover);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .message,
+  .activityCard {
+    animation: message-rise var(--motion-slow) var(--motion-easing-out) backwards;
+  }
+
+  @keyframes message-rise {
+    from {
+      opacity: 0;
+      transform: translateY(6px);
+    }
+
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
 }
 
 @media (max-width: 999px) {
@@ -446,22 +501,12 @@
   }
 }
 
-@media (prefers-reduced-motion: no-preference) {
-  .activityCard,
-  .inlineCopyButton,
-  .copyButton,
-  .newMessages {
-    transition: border-color var(--motion-fast) var(--motion-easing),
-      background-color var(--motion-fast) var(--motion-easing);
-  }
-}
-
 @media (prefers-contrast: more) {
   .activityCard,
   .codeBlock,
   .search,
   .newMessages {
-    border-width: 2px;
+    border: 2px solid var(--color-ink);
   }
 
   .search input:focus-visible {

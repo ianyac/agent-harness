@@ -744,10 +744,10 @@ describe("Composer", () => {
     const mutedInk = cssTokenValues("--color-ink-muted");
 
     expect(dangerText).toEqual([
-      "#9f463f",
-      "#d87970",
-      "#9f463f",
-      "#d87970",
+      "#c0272c",
+      "#f2726f",
+      "#c0272c",
+      "#f2726f",
       "var(--color-ink)",
     ]);
     expect(surfaces).toHaveLength(4);

@@ -4,16 +4,23 @@
   max-height: 100%;
   gap: 12px;
   margin: auto;
-  padding: 24px;
+  padding: 28px;
   overflow-y: auto;
   border: 1px solid var(--color-border);
   border-radius: var(--radius-card);
   background: var(--color-surface);
+  box-shadow: var(--shadow-md);
 }
 
 .recovery h1,
 .recovery p {
   margin: 0;
+}
+
+.recovery h1 {
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: var(--tracking-display);
 }
 
 .actions {
@@ -27,12 +34,19 @@
   align-items: center;
   min-height: 44px;
   gap: 7px;
-  padding: 8px 13px;
+  padding: 8px 14px;
   border: 1px solid var(--color-border);
   border-radius: var(--radius-control);
   color: inherit;
-  background: var(--color-page);
+  background: var(--color-surface);
+  font-weight: 550;
   cursor: pointer;
+  transition: border-color var(--motion-fast) var(--motion-easing),
+    background-color var(--motion-fast) var(--motion-easing);
+}
+
+.actions button:hover {
+  border-color: var(--color-border-strong);
 }
 
 .actionError {
@@ -43,8 +57,14 @@
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  padding: 4px 10px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-round);
   color: var(--color-ink-muted);
+  background: var(--color-surface);
+  box-shadow: var(--shadow-sm);
   font-size: 12px;
+  font-weight: 550;
 }
 
 .reconnectBanner {
@@ -53,18 +73,24 @@
   justify-content: space-between;
   gap: 12px;
   padding: 10px 14px;
-  border-block-end: 1px solid var(--color-attention);
-  background: color-mix(in srgb, var(--color-attention) 12%, var(--color-surface));
+  border-block-end: 1px solid color-mix(in srgb, var(--color-attention) 55%, transparent);
+  background: color-mix(in srgb, var(--color-attention) 10%, var(--color-surface));
 }
 
 .reconnectBanner button {
   min-height: 44px;
   padding: 7px 12px;
-  border: 1px solid var(--color-border);
+  border: 1px solid var(--color-border-strong);
   border-radius: var(--radius-control);
   color: inherit;
   background: var(--color-surface);
+  font-weight: 550;
   cursor: pointer;
+  transition: border-color var(--motion-fast) var(--motion-easing);
+}
+
+.reconnectBanner button:hover {
+  border-color: var(--color-ink-muted);
 }
 
 .unrecoverableBanner {
@@ -73,8 +99,8 @@
   justify-content: space-between;
   gap: 12px;
   padding: 12px 14px;
-  border-block-end: 1px solid var(--color-danger);
-  background: color-mix(in srgb, var(--color-danger) 10%, var(--color-surface));
+  border-block-end: 1px solid color-mix(in srgb, var(--color-danger) 55%, transparent);
+  background: color-mix(in srgb, var(--color-danger) 8%, var(--color-surface));
 }
 
 .unrecoverableBanner p {
@@ -88,11 +114,18 @@
   min-height: 44px;
   gap: 6px;
   padding: 7px 12px;
-  border: 1px solid var(--color-border);
+  border: 1px solid var(--color-border-strong);
   border-radius: var(--radius-control);
   color: inherit;
   background: var(--color-surface);
+  font-weight: 550;
   cursor: pointer;
+  transition: border-color var(--motion-fast) var(--motion-easing);
+}
+
+.unrecoverableBanner button:hover,
+.operationActions button:hover {
+  border-color: var(--color-ink-muted);
 }
 
 .operationBanner {
@@ -102,8 +135,8 @@
   justify-content: space-between;
   gap: 8px 12px;
   padding: 10px 14px;
-  border-block-end: 1px solid var(--color-danger);
-  background: color-mix(in srgb, var(--color-danger) 10%, var(--color-surface));
+  border-block-end: 1px solid color-mix(in srgb, var(--color-danger) 55%, transparent);
+  background: color-mix(in srgb, var(--color-danger) 8%, var(--color-surface));
 }
 
 .operationCopy {

@@ -2,7 +2,7 @@
   position: fixed;
   z-index: 79;
   inset: 0;
-  background: color-mix(in srgb, #000 36%, transparent);
+  background: color-mix(in srgb, #08080b 36%, transparent);
 }
 
 .inspector {
@@ -17,7 +17,7 @@
   color: var(--color-ink);
   background: var(--color-surface);
   border-inline-start: 1px solid var(--color-border);
-  box-shadow: -12px 0 36px color-mix(in srgb, #000 16%, transparent);
+  box-shadow: var(--shadow-lg);
 }
 
 .inspector:focus {
@@ -40,12 +40,13 @@
   inset-inline-start: 15px;
   width: 1px;
   background: var(--color-border);
+  transition: background-color var(--motion-fast) var(--motion-easing);
   pointer-events: none;
 }
 
 .resizeHandle:hover .resizeRule,
 .resizeHandle:focus-visible .resizeRule {
-  background: var(--color-accent);
+  background: var(--color-accent-solid);
 }
 
 .resizeHandle:focus-visible {
@@ -73,6 +74,8 @@
 
 .header h2 {
   font-size: 15px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
   line-height: 1.35;
 }
 
@@ -98,6 +101,8 @@
   color: inherit;
   background: transparent;
   cursor: pointer;
+  transition: background-color var(--motion-fast) var(--motion-easing),
+    color var(--motion-fast) var(--motion-easing);
 }
 
 .iconButton {
@@ -105,11 +110,13 @@
   min-width: 32px;
   padding: 0;
   place-items: center;
+  color: var(--color-ink-muted);
 }
 
 .iconButton:hover,
 .copyButton:hover,
 .timelineActivity:hover {
+  color: var(--color-ink);
   background: color-mix(in srgb, var(--color-ink) 7%, transparent);
 }
 
@@ -140,9 +147,19 @@
 }
 
 .summary h3,
-.timelineSection h3,
+.timelineSection h3 {
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.07em;
+  line-height: 1.4;
+  color: var(--color-ink-small);
+  text-transform: uppercase;
+}
+
 .detail h3 {
-  font-size: 13px;
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
   line-height: 1.4;
 }
 
@@ -204,6 +221,10 @@
   text-align: start;
 }
 
+.toolTable th {
+  color: var(--color-ink-small);
+}
+
 .payloadDetails {
   position: relative;
   min-width: 0;
@@ -219,6 +240,11 @@
   font-size: 11px;
   font-weight: 650;
   cursor: pointer;
+  transition: background-color var(--motion-fast) var(--motion-easing);
+}
+
+.payloadDetails summary:hover {
+  background: color-mix(in srgb, var(--color-ink) 4%, transparent);
 }
 
 .payloadDetails pre {
@@ -228,7 +254,7 @@
   overflow: auto;
   overscroll-behavior: contain;
   border-block-start: 1px solid var(--color-border);
-  background: color-mix(in srgb, var(--color-ink) 4%, transparent);
+  background: color-mix(in srgb, var(--color-ink) 3%, transparent);
   font-family: var(--font-mono);
   font-size: 11px;
   line-height: 1.5;
@@ -247,6 +273,7 @@
   padding: 4px 7px;
   color: var(--color-ink-small);
   font-size: 11px;
+  font-weight: 550;
 }
 
 .timelineSection {
@@ -314,7 +341,8 @@
 }
 
 .timelineActivity[aria-current="true"] {
-  background: color-mix(in srgb, var(--color-accent) 12%, transparent);
+  background: var(--color-accent-tint);
+  box-shadow: inset 2px 0 var(--color-accent-solid);
 }
 
 .timelineDetails {
@@ -375,13 +403,15 @@
 .eyebrow {
   display: block;
   margin-block-end: 2px;
+  letter-spacing: 0.07em;
   text-transform: uppercase;
 }
 
 .status {
-  padding: 3px 7px;
+  padding: 3px 9px;
   border: 1px solid var(--color-border);
-  border-radius: 999px;
+  border-radius: var(--radius-round);
+  background: color-mix(in srgb, var(--color-ink) 4%, transparent);
   font-size: 11px;
   font-weight: 650;
   text-transform: capitalize;
@@ -389,7 +419,8 @@
 
 .status[data-error] {
   color: var(--color-danger-text);
-  border-color: var(--color-danger-text);
+  border-color: color-mix(in srgb, var(--color-danger) 50%, transparent);
+  background: color-mix(in srgb, var(--color-danger) 9%, transparent);
 }
 
 .empty {
@@ -417,7 +448,7 @@
     border-block-start: 1px solid var(--color-border);
     border-inline-start: 0;
     border-radius: var(--radius-conversation) var(--radius-conversation) 0 0;
-    box-shadow: 0 -16px 42px color-mix(in srgb, #000 22%, transparent);
+    box-shadow: var(--shadow-lg);
   }
 
   .header {

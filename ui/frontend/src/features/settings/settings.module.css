@@ -2,7 +2,7 @@
   position: fixed;
   z-index: 80;
   inset: 0;
-  background: color-mix(in srgb, #000 30%, transparent);
+  background: color-mix(in srgb, #08080b 32%, transparent);
 }
 
 .dialog {
@@ -12,10 +12,10 @@
   inset-inline-end: 20px;
   width: min(520px, calc(100vw - 40px));
   border: 1px solid var(--color-border);
-  border-radius: var(--radius-card);
+  border-radius: 14px;
   color: var(--color-ink);
-  background: var(--color-surface);
-  box-shadow: 0 18px 50px color-mix(in srgb, #000 25%, transparent);
+  background: var(--color-elevated);
+  box-shadow: var(--shadow-lg);
   overflow: hidden;
 }
 
@@ -32,6 +32,8 @@
 .section h2 {
   margin: 0;
   font-size: 16px;
+  font-weight: 700;
+  letter-spacing: var(--tracking-display);
 }
 
 .description,
@@ -50,10 +52,17 @@
   min-height: 44px;
   border: 0;
   border-radius: var(--radius-control);
-  color: inherit;
+  color: var(--color-ink-muted);
   background: transparent;
   place-items: center;
   cursor: pointer;
+  transition: background-color var(--motion-fast) var(--motion-easing),
+    color var(--motion-fast) var(--motion-easing);
+}
+
+.iconButton:hover {
+  color: var(--color-ink);
+  background: color-mix(in srgb, var(--color-ink) 7%, transparent);
 }
 
 .scrollArea {
@@ -74,7 +83,9 @@
 .section > legend,
 .section > h2 {
   padding: 0;
+  font-size: 13px;
   font-weight: 650;
+  letter-spacing: 0.02em;
 }
 
 .inlineChoices {
@@ -92,9 +103,22 @@
 }
 
 .inlineChoices .choice {
-  padding-inline: 10px;
+  padding-inline: 12px;
   border: 1px solid var(--color-border);
   border-radius: var(--radius-control);
+  background: var(--color-surface);
+  cursor: pointer;
+  transition: border-color var(--motion-fast) var(--motion-easing),
+    background-color var(--motion-fast) var(--motion-easing);
+}
+
+.inlineChoices .choice:hover {
+  border-color: var(--color-border-strong);
+}
+
+.inlineChoices .choice:has(input:checked) {
+  border-color: var(--color-accent-solid);
+  background: var(--color-accent-tint);
 }
 
 .field {
@@ -108,7 +132,7 @@
   border: 1px solid var(--color-border);
   border-radius: var(--radius-control);
   color: inherit;
-  background: var(--color-page);
+  background: var(--color-surface);
 }
 
 .nestedFieldset {
@@ -142,6 +166,16 @@
 .shortcutList dd,
 .pathList dd {
   margin: 0;
+}
+
+.shortcutList kbd {
+  padding: 1px 6px;
+  border: 1px solid var(--color-border);
+  border-block-end-width: 2px;
+  border-radius: 6px;
+  background: var(--color-surface);
+  font-family: var(--font-mono);
+  font-size: 12px;
 }
 
 .pathList code {

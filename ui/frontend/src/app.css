@@ -34,7 +34,9 @@
   z-index: 20;
   inset: 0 0 auto;
   height: var(--native-titlebar-height);
-  background: color-mix(in srgb, var(--color-page) 92%, transparent);
+  background: color-mix(in srgb, var(--color-page) 88%, transparent);
+  -webkit-backdrop-filter: blur(12px);
+  backdrop-filter: blur(12px);
   border-block-end: 1px solid color-mix(in srgb, var(--color-border) 72%, transparent);
 }
 
@@ -69,15 +71,17 @@
 }
 
 .conversation-header {
-  min-height: 56px;
-  padding: 16px 24px;
+  min-height: 52px;
+  padding: 10px 20px;
   border-block-end: 1px solid var(--color-border);
+  background: var(--color-page);
 }
 
 .conversation-header h1 {
   margin: 0;
   font-size: inherit;
-  font-weight: 600;
+  font-weight: 650;
+  letter-spacing: -0.01em;
 }
 
 .conversation-main {

@@ -17,16 +17,26 @@
   display: grid;
   width: min(100%, 520px);
   gap: 14px;
-  padding: 28px;
+  padding: 32px;
   border: 1px solid var(--color-border);
   border-radius: var(--radius-conversation);
   background: var(--color-surface);
-  box-shadow: 0 18px 50px color-mix(in srgb, #000 10%, transparent);
+  box-shadow: var(--shadow-lg);
 }
 
 .card h1,
 .card p {
   margin: 0;
+}
+
+.card h1 {
+  font-size: 28px;
+  font-weight: 800;
+  letter-spacing: var(--tracking-display);
+}
+
+.card > svg {
+  color: var(--color-accent);
 }
 
 .trust {
@@ -42,11 +52,17 @@
 .field input,
 .field select {
   min-height: 44px;
-  padding: 8px 10px;
+  padding: 8px 12px;
   border: 1px solid var(--color-border);
   border-radius: var(--radius-control);
   color: inherit;
   background: var(--color-page);
+  transition: border-color var(--motion-fast) var(--motion-easing);
+}
+
+.field input:hover,
+.field select:hover {
+  border-color: var(--color-border-strong);
 }
 
 .contextChoices {
@@ -68,16 +84,28 @@
 .secondaryButton,
 .card section button {
   min-height: 44px;
-  padding: 8px 14px;
+  padding: 8px 16px;
   border-radius: var(--radius-control);
   font-weight: 600;
   cursor: pointer;
+  transition: background-color var(--motion-fast) var(--motion-easing),
+    border-color var(--motion-fast) var(--motion-easing);
 }
 
 .primaryButton {
-  border: 1px solid var(--color-ink);
-  color: var(--color-surface);
-  background: var(--color-ink);
+  border: 1px solid var(--color-accent-solid);
+  color: var(--color-on-accent);
+  background: var(--color-accent-solid);
+  box-shadow: var(--shadow-sm);
+}
+
+.primaryButton:hover {
+  border-color: var(--color-accent-hover);
+  background: var(--color-accent-hover);
+}
+
+.primaryButton:active {
+  transform: translateY(0.5px);
 }
 
 .secondaryButton,
@@ -88,7 +116,12 @@
   gap: 8px;
   border: 1px solid var(--color-border);
   color: inherit;
-  background: var(--color-page);
+  background: var(--color-surface);
+}
+
+.secondaryButton:hover,
+.card section button:hover {
+  border-color: var(--color-border-strong);
 }
 
 .workspace {

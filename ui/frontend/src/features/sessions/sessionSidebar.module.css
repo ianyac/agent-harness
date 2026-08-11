@@ -4,7 +4,7 @@
   flex-direction: column;
   width: var(--sidebar-width);
   min-height: 100dvh;
-  padding: 12px 10px;
+  padding: 14px 10px 10px;
   overflow: hidden;
   transition: width var(--motion-standard) var(--motion-easing),
     flex-basis var(--motion-standard) var(--motion-easing);
@@ -35,8 +35,9 @@
   align-items: center;
   column-gap: 9px;
   row-gap: 1px;
-  padding: 4px 8px 12px;
-  font-weight: 650;
+  padding: 4px 8px 14px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
   white-space: nowrap;
 }
 
@@ -60,6 +61,7 @@
   color: var(--color-ink-small);
   font-size: 11px;
   font-weight: 500;
+  letter-spacing: 0;
   line-height: 1.2;
 }
 
@@ -76,24 +78,43 @@
   align-items: center;
   width: 100%;
   gap: 9px;
-  padding: 6px 8px;
+  padding: 6px 10px;
   text-align: start;
   white-space: nowrap;
   cursor: pointer;
+  transition: background-color var(--motion-fast) var(--motion-easing),
+    color var(--motion-fast) var(--motion-easing),
+    box-shadow var(--motion-fast) var(--motion-easing);
 }
 
 .primaryAction {
   min-height: 40px;
-  color: var(--color-surface);
-  background: var(--color-ink);
-  font-weight: 600;
+  color: var(--color-on-accent);
+  background: var(--color-accent-solid);
+  box-shadow: var(--shadow-sm);
+  font-weight: 650;
+}
+
+.primaryAction:hover {
+  background: var(--color-accent-hover);
+}
+
+.primaryAction:active {
+  transform: translateY(0.5px);
 }
 
 .utilityAction:hover,
 .collapseButton:hover,
 .moreButton:hover,
 .headerButton:hover {
-  background: color-mix(in srgb, var(--color-ink) 8%, transparent);
+  background: color-mix(in srgb, var(--color-ink) 7%, transparent);
+}
+
+.utilityAction:active,
+.collapseButton:active,
+.moreButton:active,
+.headerButton:active {
+  background: color-mix(in srgb, var(--color-ink) 11%, transparent);
 }
 
 .shortcut {
@@ -103,32 +124,34 @@
   background: transparent;
   font-family: var(--font-sans);
   font-size: 11px;
+  font-weight: 500;
 }
 
 .primaryAction .shortcut {
-  color: color-mix(in srgb, var(--color-surface) 75%, transparent);
+  color: var(--color-on-accent);
+  font-weight: 600;
 }
 
 .sessionGroups {
   flex: 1;
   min-height: 0;
-  margin-top: 12px;
+  margin-top: 14px;
   overflow: auto;
 }
 
 .groupHeading,
 .commandHeading {
-  margin: 14px 8px 5px;
+  margin: 16px 10px 6px;
   color: var(--color-ink-small);
   font-size: 11px;
   font-weight: 650;
-  letter-spacing: 0.04em;
+  letter-spacing: 0.07em;
   text-transform: uppercase;
 }
 
 .sessionList {
   display: grid;
-  gap: 2px;
+  gap: 1px;
   margin: 0;
   padding: 0;
   list-style: none;
@@ -139,10 +162,21 @@
   display: flex;
   min-width: 0;
   border-radius: var(--radius-control);
+  transition: background-color var(--motion-fast) var(--motion-easing);
 }
 
 .row[data-active] {
-  background: color-mix(in srgb, var(--color-accent) 13%, transparent);
+  background: var(--color-accent-tint);
+}
+
+.row[data-active]::before {
+  content: "";
+  position: absolute;
+  inset-block: 7px;
+  inset-inline-start: 0;
+  width: 3px;
+  border-radius: var(--radius-round);
+  background: var(--color-accent-solid);
 }
 
 .sessionButton {
@@ -151,13 +185,14 @@
   flex: 1;
   align-items: center;
   min-width: 0;
-  gap: 7px;
-  padding: 6px 26px 6px 8px;
+  gap: 8px;
+  padding: 6px 26px 6px 10px;
   text-align: start;
   cursor: pointer;
+  transition: background-color var(--motion-fast) var(--motion-easing);
 }
 
-.sessionButton:hover {
+.row:not([data-active]) .sessionButton:hover {
   background: color-mix(in srgb, var(--color-ink) 6%, transparent);
 }
 
@@ -176,6 +211,10 @@
   font-weight: 550;
 }
 
+.row[data-active] .sessionTitle {
+  font-weight: 650;
+}
+
 .workspace,
 .statusText {
   color: var(--color-ink-small);
@@ -187,12 +226,12 @@
   display: grid;
   max-width: min(280px, calc(100vw - 24px));
   gap: 2px;
-  padding: 7px 9px;
-  border: 1px solid var(--color-ink-small);
-  border-radius: var(--radius-control);
+  padding: 8px 10px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-menu);
   color: var(--color-ink);
-  background: var(--color-surface);
-  box-shadow: 0 8px 24px color-mix(in srgb, #000 18%, transparent);
+  background: var(--color-elevated);
+  box-shadow: var(--shadow-md);
   font-size: 11px;
   line-height: 1.35;
   overflow-wrap: anywhere;
@@ -208,7 +247,7 @@
 }
 
 .statusIcon {
-  color: var(--color-border);
+  color: var(--color-border-strong);
 }
 
 .statusIcon[data-status="running"],
@@ -235,16 +274,17 @@
   padding: 0;
   place-items: center;
   cursor: pointer;
+  transition: background-color var(--motion-fast) var(--motion-easing);
 }
 
 .menu {
   z-index: 50;
-  min-width: 150px;
-  padding: 5px;
+  min-width: 168px;
+  padding: 4px;
   border: 1px solid var(--color-border);
   border-radius: var(--radius-menu);
-  background: var(--color-surface);
-  box-shadow: 0 10px 28px color-mix(in srgb, #000 18%, transparent);
+  background: var(--color-elevated);
+  box-shadow: var(--shadow-md);
 }
 
 .menuItem {
@@ -254,14 +294,15 @@
   border-radius: 6px;
   outline: 0;
   cursor: default;
+  transition: background-color var(--motion-fast) var(--motion-easing);
 }
 
 .menuItem[data-highlighted] {
-  background: color-mix(in srgb, var(--color-accent) 13%, transparent);
+  background: var(--color-accent-tint);
 }
 
 .dangerItem {
-  color: var(--color-danger);
+  color: var(--color-danger-text);
 }
 
 .itemIndicator {
@@ -286,8 +327,8 @@
   transform: translate(-50%, -50%);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-card);
-  background: var(--color-surface);
-  box-shadow: 0 18px 50px color-mix(in srgb, #000 25%, transparent);
+  background: var(--color-elevated);
+  box-shadow: var(--shadow-lg);
 }
 
 .renameForm input,
@@ -323,6 +364,7 @@
   padding: 0;
   place-items: center;
   cursor: pointer;
+  transition: background-color var(--motion-fast) var(--motion-easing);
 }
 
 .sidebar[data-collapsed="true"] {
@@ -368,6 +410,10 @@
   display: grid;
 }
 
+.sidebar[data-collapsed="true"] .row[data-active]::before {
+  inset-block: 9px;
+}
+
 .sidebar[data-collapsed="true"] .moreButton {
   position: static;
   display: grid;
@@ -395,7 +441,7 @@
 
 .context {
   min-width: 0;
-  gap: 12px;
+  gap: 10px;
 }
 
 .context h1,
@@ -412,7 +458,10 @@
 
 .branch {
   gap: 5px;
-  color: var(--color-ink-muted);
+  padding: 2px 8px;
+  border-radius: var(--radius-round);
+  color: var(--color-ink-small);
+  background: color-mix(in srgb, var(--color-ink) 6%, transparent);
   font-family: var(--font-mono);
   font-size: 12px;
 }
@@ -423,15 +472,17 @@
 
 .headerButton {
   gap: 6px;
-  padding: 5px 8px;
+  padding: 5px 9px;
   cursor: pointer;
+  font-weight: 500;
+  transition: background-color var(--motion-fast) var(--motion-easing);
 }
 
 .overlay {
   position: fixed;
   z-index: 60;
   inset: 0;
-  background: color-mix(in srgb, #000 28%, transparent);
+  background: color-mix(in srgb, #08080b 32%, transparent);
 }
 
 .confirmDialog,
@@ -444,14 +495,16 @@
   padding: 20px;
   transform: translate(-50%, -50%);
   border: 1px solid var(--color-border);
-  border-radius: var(--radius-card);
-  background: var(--color-surface);
-  box-shadow: 0 18px 50px color-mix(in srgb, #000 25%, transparent);
+  border-radius: 14px;
+  background: var(--color-elevated);
+  box-shadow: var(--shadow-lg);
 }
 
 .dialogTitle {
   margin: 0;
   font-size: 16px;
+  font-weight: 700;
+  letter-spacing: var(--tracking-display);
 }
 
 .dialogDescription {
@@ -469,13 +522,28 @@
 .dangerButton {
   padding: 6px 12px;
   border: 1px solid var(--color-border);
+  font-weight: 550;
   cursor: pointer;
+  transition: background-color var(--motion-fast) var(--motion-easing),
+    border-color var(--motion-fast) var(--motion-easing);
+}
+
+.secondaryButton {
+  background: var(--color-surface);
+}
+
+.secondaryButton:hover {
+  border-color: var(--color-border-strong);
 }
 
 .dangerButton {
   border-color: var(--color-danger-strong);
   color: #fff;
   background: var(--color-danger-strong);
+}
+
+.dangerButton:hover {
+  filter: brightness(1.08);
 }
 
 .palette {
@@ -491,16 +559,26 @@
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
   align-items: center;
-  gap: 9px;
-  padding: 12px 14px;
+  gap: 10px;
+  padding: 12px 16px;
   border-bottom: 1px solid var(--color-border);
+  color: var(--color-ink-muted);
 }
 
 .searchField input {
   height: 36px;
-  padding: 6px 9px;
+  padding: 6px 0;
   border: 0;
   background: transparent;
+  font-size: 15px;
+}
+
+.searchField input::placeholder {
+  color: var(--color-ink-muted);
+}
+
+.searchField input:focus-visible {
+  box-shadow: none;
 }
 
 .commandList {
@@ -515,20 +593,25 @@
   align-items: center;
   width: 100%;
   min-height: 40px;
-  gap: 8px;
-  padding: 6px 9px;
+  gap: 10px;
+  padding: 6px 10px;
   border: 0;
   border-radius: var(--radius-control);
   color: inherit;
   background: transparent;
   text-align: start;
   cursor: pointer;
+  transition: background-color var(--motion-fast) var(--motion-easing);
+}
+
+.command > svg {
+  color: var(--color-ink-muted);
 }
 
 .command:hover,
 .command:focus-visible,
 .command[aria-selected="true"] {
-  background: color-mix(in srgb, var(--color-accent) 13%, transparent);
+  background: var(--color-accent-tint);
 }
 
 .command kbd,
@@ -613,6 +696,10 @@
 
   .sidebar .row {
     display: grid;
+  }
+
+  .sidebar .row[data-active]::before {
+    inset-block: 9px;
   }
 
   .sidebar .moreButton,

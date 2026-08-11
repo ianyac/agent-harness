@@ -6,6 +6,13 @@ import { expect, test } from "./fixtures";
 const axeSource = readFileSync(join(process.cwd(), "node_modules/axe-core/axe.min.js"), "utf8");
 
 async function assertAxe(page: Parameters<Parameters<typeof test>[1]>[0]["page"]) {
+  // Let in-flight transitions (e.g. an animated theme switch) settle so axe
+  // measures the final colors, capped so an unexpected infinite animation
+  // cannot hang the scan.
+  await page.evaluate(() => Promise.race([
+    Promise.all(document.getAnimations().map((animation) => animation.finished)).catch(() => {}),
+    new Promise((resolve) => { setTimeout(resolve, 500); }),
+  ]));
   await page.addScriptTag({ content: axeSource });
   const violations = await page.evaluate(async () => {
     const axe = (window as unknown as { axe: { run: () => Promise<{ violations: Array<{ id: string; impact: string | null; nodes: Array<{ target: unknown; failureSummary: string }> }> }> } }).axe;

@@ -162,10 +162,7 @@ class MCPServer:
 
     def close(self) -> None:
         if self._stderr is not None:
-            try:
-                self._stderr.close()
-            except OSError:
-                pass
+            self._stderr.close()
         if self._proc is None:
             return
         if self._proc.poll() is None:
@@ -203,13 +200,17 @@ class MCPServer:
         # no id: no reply expected
         self._send({"jsonrpc": "2.0", "method": method}, time.monotonic() + self.timeout)
 
-    def _send(self, payload: dict, deadline: float) -> None:
-        if self._proc is None or self._proc.stdin is None:
+    def _fd(self, pipe_name: str) -> int:
+        pipe = getattr(self._proc, pipe_name, None)  # None before start()
+        if pipe is None:
             raise MCPError(f"MCP server {self.name!r} was never started")
         try:
-            fd = self._proc.stdin.fileno()
+            return pipe.fileno()
         except ValueError:  # pipe closed by close()
             raise MCPError(f"MCP server {self.name!r} is not running")
+
+    def _send(self, payload: dict, deadline: float) -> None:
+        fd = self._fd("stdin")
         # non-blocking writes under the request deadline: a wedged server
         # that stops draining stdin must not hang the harness on a large
         # payload — the read side's timeout would never even start
@@ -266,12 +267,7 @@ class MCPServer:
                 return result
 
     def _read_line(self, deadline: float) -> bytes:
-        if self._proc is None or self._proc.stdout is None:
-            raise MCPError(f"MCP server {self.name!r} was never started")
-        try:
-            fd = self._proc.stdout.fileno()
-        except ValueError:
-            raise MCPError(f"MCP server {self.name!r} is not running")
+        fd = self._fd("stdout")
         # our own line buffer over os.read: select() sees the raw fd, so a
         # buffered file object can't hide bytes from the readiness check
         while b"\n" not in self._buf:

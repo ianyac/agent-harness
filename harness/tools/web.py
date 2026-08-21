@@ -229,13 +229,12 @@ def _embedded_v4(ip):
     """The IPv4 address an IPv6 form actually reaches, or None."""
     if ip.version != 6:
         return None
-    for attr in ("ipv4_mapped", "sixtofour"):
-        embedded = getattr(ip, attr, None)
-        if embedded is not None:
-            return embedded
-    teredo = getattr(ip, "teredo", None)
-    if teredo is not None:
-        return teredo[1]  # the client's own address
+    if ip.ipv4_mapped is not None:
+        return ip.ipv4_mapped
+    if ip.sixtofour is not None:
+        return ip.sixtofour
+    if ip.teredo is not None:
+        return ip.teredo[1]  # the client's own address
     if any(ip in net for net in _V4_IN_V6):
         return ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
     return None
@@ -291,50 +290,6 @@ def normalise(url: str) -> str:
     certificate validation, Basic auth from userinfo, and multi-address
     failover with httpx, which implements all of them correctly.
 
-    Known gap, unchanged and deliberate: DNS may change between this check and
-    the connect (rebinding). Pinning the IP would need a custom httpx transport
-    — an earlier attempt hand-rolled it and broke five other things instead.
-    """
-    parsed = urlparse(url)
-    host = parsed.hostname or ""
-    if not host.isascii():
-        try:
-            host = host.encode("idna").decode("ascii")
-        except (UnicodeError, ValueError) as error:
-            raise ValueError(f"refused {url!r}: invalid international host ({error})") from None
-    port, username, password = parsed.port, parsed.username, parsed.password
-    netloc = f"[{host}]" if ":" in host else host
-    if port is not None:
-        netloc = f"{netloc}:{port}"
-    if username is not None:
-        credentials = username
-        if password is not None:
-            credentials = f"{credentials}:{password}"
-        netloc = f"{credentials}@{netloc}"
-    ascii_url = urlunparse(parsed._replace(netloc=netloc))
-    check_url(ascii_url)
-    return ascii_url
-
-
-def _resolve(url: str, host: str, port) -> list[str]:
-    """Every address `host` resolves to, refusing unless all are reachable."""
-    try:
-        resolved = socket.getaddrinfo(host, port or 0, proto=socket.IPPROTO_TCP)
-    except (OSError, UnicodeError, ValueError) as error:
-        raise ValueError(_REFUSED.format(url=label(url))) from None
-    addresses = [str(info[4][0]) for info in resolved]
-    for address in addresses:
-        if not _reachable(address):
-            raise ValueError(_REFUSED.format(url=label(url)))
-    if not addresses:
-        raise ValueError(_REFUSED.format(url=label(url)))
-    return addresses
-
-
-def check_url(url: str) -> None:
-    """Raise ValueError unless `url` is http(s) and every address it resolves
-    to is globally routable.
-
     The check is on the RESOLVED address, not the hostname: a public name can
     resolve to 127.0.0.1, so a string test for "localhost" is bypassable. Every
     address is checked, not just the first — a name can publish both a public
@@ -342,25 +297,59 @@ def check_url(url: str) -> None:
 
     Known gaps, documented rather than half-built (the LinuxSandbox precedent):
     DNS can change between this check and the connect that follows (rebinding);
-    pinning the resolved IP needs a custom httpx transport. And getaddrinfo is
-    a blocking call with no timeout, so a slow resolver stalls the agent loop.
+    pinning the resolved IP needs a custom httpx transport — an earlier attempt
+    hand-rolled it and broke five other things instead. And getaddrinfo is a
+    blocking call with no timeout, so a slow resolver stalls the agent loop.
     """
     try:
         parsed = urlparse(url)
-        scheme, host, port = parsed.scheme, parsed.hostname, parsed.port
+        host, port = parsed.hostname or "", parsed.port
     except ValueError as error:  # malformed port, bad IPv6 literal, …
         raise ValueError(f"refused {url!r}: malformed URL ({error})") from None
-    if scheme not in ("http", "https"):
+    if parsed.scheme not in ("http", "https"):
         raise ValueError(
             f"refused {url!r}: only http and https are fetchable, not "
-            f"{scheme or 'a missing scheme'!r}"
+            f"{parsed.scheme or 'a missing scheme'!r}"
         )
     if not host:
         raise ValueError(f"refused {url!r}: no host in the URL")
+    if not host.isascii():
+        try:
+            host = host.encode("idna").decode("ascii")
+        except (UnicodeError, ValueError) as error:
+            raise ValueError(f"refused {url!r}: invalid international host ({error})") from None
+    netloc = f"[{host}]" if ":" in host else host
+    if port is not None:
+        netloc = f"{netloc}:{port}"
+    if parsed.username is not None:
+        credentials = parsed.username
+        if parsed.password is not None:
+            credentials = f"{credentials}:{parsed.password}"
+        netloc = f"{credentials}@{netloc}"
+    ascii_url = urlunparse(parsed._replace(netloc=netloc))
     # the refusal deliberately does NOT name the resolved address: reporting it
     # would turn web_fetch into an internal DNS/topology oracle, which pairs
     # badly with the deliberately-open outbound channel
-    _resolve(url, host, port)
+    _resolve(ascii_url, host, port)
+    return ascii_url
+
+
+def _resolve(url: str, host: str, port) -> None:
+    """Refuse unless every address `host` resolves to is reachable."""
+    refused = ValueError(_REFUSED.format(url=label(url)))
+    try:
+        resolved = socket.getaddrinfo(host, port or 0, proto=socket.IPPROTO_TCP)
+    except (OSError, UnicodeError, ValueError):
+        raise refused from None
+    addresses = [str(info[4][0]) for info in resolved]
+    if not addresses or not all(_reachable(a) for a in addresses):
+        raise refused
+
+
+def check_url(url: str) -> None:
+    """Raise ValueError unless `url` is http(s) and every address it resolves
+    to is globally routable — `normalise` without the rewritten URL."""
+    normalise(url)
 
 
 def fetch(
@@ -377,11 +366,12 @@ def fetch(
     """
     original = url  # keep for error messages; `url` is rebound per hop
     deadline = time.monotonic() + total_timeout
+    expired = ValueError(
+        f"refused {original!r}: exceeded {total_timeout}s across redirects"
+    )
     for _ in range(max_redirects + 1):
         if time.monotonic() > deadline:
-            raise ValueError(
-                f"refused {original!r}: exceeded {total_timeout}s across redirects"
-            )
+            raise expired
         # normalise to an ASCII host and verify it; httpx then resolves that
         # same unambiguous string, so guard and connection agree
         target = normalise(url)
@@ -407,9 +397,7 @@ def fetch(
                 # character every 14s would otherwise hold the agent loop for
                 # weeks while never exceeding a single read timeout
                 if time.monotonic() > deadline:
-                    raise ValueError(
-                        f"refused {original!r}: exceeded {total_timeout}s across redirects"
-                    )
+                    raise expired
                 chunks.append(chunk)
                 total += len(chunk)
                 if total >= MAX_BODY_CHARS:
@@ -454,9 +442,6 @@ def web_fetch_tool(client=None, char_limit: int = DEFAULT_CHAR_LIMIT) -> Tool:
         finally:
             if owned:
                 active.close()
-        # the server decides Content-Type, so it must not decide whether the
-        # stripper runs: a page opting out with text/plain would keep its
-        # <script> bodies. Strip whenever the text looks like markup at all.
         # only when the server declares markup: sniffing for "<" mangled
         # plain-text source files and JSON (eating `List<int>`, `a < b`).
         # A text/plain body keeping a literal <script> is harmless — it is

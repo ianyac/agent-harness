@@ -36,7 +36,7 @@ def run_subagent(
     max_iterations: int = 20,
     compact_threshold: int | None = None,
     keep_recent: int = 8,
-    substitutions: "Substitutions" = None,
+    substitutions: Substitutions = None,
 ) -> str:
     """Run one subagent to completion and return its final answer. Its registry
     is DERIVED from the parent's: filter out delegating tools (the
@@ -64,10 +64,10 @@ def run_subagent(
     # Tool objects inside are shared, as they are with the parent registry —
     # this guards the membership, not the tools themselves.)
     chosen = substitutions(dict(inner)) if callable(substitutions) else substitutions
-    # validate the whole map BEFORE applying any of it, so a bad substitution is
-    # caught the same way on every delegation — checking inside the per-name
-    # offer test would make it fire only when that name happens to be offered
     for name, variant in (chosen or {}).items():
+        # validated unconditionally — NOT inside the offer test below — so a bad
+        # substitution is caught the same way on every delegation, not only
+        # when that name happens to be offered
         if variant.spawns_subagents:
             raise ValueError(
                 f"substitution {name!r} is a delegating tool; a subagent must "
@@ -79,7 +79,6 @@ def run_subagent(
                 f"{variant.name!r}; the sub would be offered a tool the loop "
                 "cannot dispatch"
             )
-    for name, variant in (chosen or {}).items():
         # never smuggle a tool past the caller's restriction: substitution may
         # only REPLACE a name the caller offered, never add capability.
         # (Inherited tools keep the caller's own keys — that registry is the
@@ -120,7 +119,7 @@ def agent_tool(
     max_iterations: int = 20,
     compact_threshold: int | None = None,
     keep_recent: int = 8,
-    substitutions: "Substitutions" = None,
+    substitutions: Substitutions = None,
 ) -> Tool:
     """A subagent as a plain registry tool: fresh context in, one answer out.
 
@@ -143,7 +142,7 @@ def agent_tool(
             keep_recent=keep_recent, substitutions=substitutions,
         )
 
-    tool = Tool(
+    return Tool(
         name="agent",
         description=_DESCRIPTION,
         parameters={
@@ -166,4 +165,3 @@ def agent_tool(
         spawns_subagents=True,
         foldable_inputs=("task",),
     )
-    return tool

@@ -251,6 +251,22 @@ def _longest_first(replacements: dict[str, str]) -> dict[str, str]:
     )
 
 
+def _reasoning_text(reasoning: str | list) -> str:
+    """The readable text of an assistant message's ``reasoning`` payload.
+
+    Contract for provider adapters: ``reasoning`` is the turn's thinking as a
+    string, or a list of blocks each carrying a ``"text"`` string (possibly
+    empty for opaque reasoning) beside whatever the provider needs replayed
+    verbatim — signatures, encrypted content, item ids. The harness reads only
+    the text; it never edits or re-creates the payload.
+    """
+    if isinstance(reasoning, str):
+        return reasoning
+    return "\n".join(
+        str(block.get("text", "")) for block in reasoning if isinstance(block, dict)
+    )
+
+
 def _token_label(tokens: int) -> str:
     if tokens < 1_000:
         return str(tokens)
@@ -388,7 +404,7 @@ class FoldingContext:
             {
                 "harness_version": "0.1.0",
                 "schema_version": _SCHEMA_VERSION,
-                "marker_template_version": 2,
+                "marker_template_version": 3,
                 "token_estimator_version": "o200k_base-v1",
                 "tier1_ruleset_hash": _sha(
                     "duplicate|superseded_read|handled_failure|write_payload|agent_brief:v1"
@@ -602,6 +618,18 @@ class FoldingContext:
         if role == "user" and self.turn > 0:
             self._surface_user_reference(message_id, content)
         if role == "assistant":
+            reasoning = message.get("reasoning")
+            if reasoning:
+                # One thinking span per message; see _reasoning_text for the
+                # payload contract.
+                self._insert_entry(
+                    f"{message_id}.t0",
+                    message_id,
+                    "assistant",
+                    "reasoning",
+                    _reasoning_text(reasoning),
+                    {},
+                )
             for call_index, call in enumerate(message.get("tool_calls") or []):
                 function = call["function"]
                 args_json = function["arguments"]
@@ -1081,7 +1109,6 @@ class FoldingContext:
         self._current_notices = []
         self._current_notice_ids = []
         self.checkpoint(reason="turn boundary")
-        self._queue_pressure_notice()
         rows = self._db.execute(
             "SELECT notice_id, kind, content FROM notices n "
             "WHERE emitted_turn IS NULL AND created_turn < ? "
@@ -1104,38 +1131,6 @@ class FoldingContext:
             for row in rows:
                 self._event(
                     "notice_emitted", kind=row["kind"], ref=row["notice_id"]
-                )
-
-    def _queue_pressure_notice(self) -> None:
-        rows = self._db.execute(
-            "SELECT e.span_id, e.tokens_est FROM entries e "
-            "JOIN span_state s USING(span_id) WHERE e.session_id = ? "
-            "AND e.active = 1 AND e.origin = 'tool' AND e.parent_id IS NULL "
-            "AND e.created_turn < ? AND e.tokens_est >= ? AND s.state = 'visible' "
-            "ORDER BY e.rowid",
-            (self.session_id, self.turn, self.config.min_span_tokens),
-        ).fetchall()
-        if len(rows) < 3:
-            return
-        candidates = rows[:3]
-        labels = ", ".join(
-            f"{row['span_id']} ~{_token_label(row['tokens_est'])} tok"
-            for row in candidates
-        )
-        content = (
-            f"[workspace: {len(candidates)} spans look closed ({labels}). "
-            "Fold with a verdict when at a pause.]"
-        )
-        exists = self._db.execute(
-            "SELECT 1 FROM notices WHERE kind = 'pressure' AND content = ?",
-            (content,),
-        ).fetchone()
-        if exists is None:
-            with self._db:
-                self._db.execute(
-                    "INSERT INTO notices(kind, content, created_turn) "
-                    "VALUES ('pressure', ?, ?)",
-                    (content, self.turn - 1),
                 )
 
     @staticmethod
@@ -2961,9 +2956,15 @@ class FoldingContext:
         origin = entry["origin"]
         if origin in ("user", "system"):
             raise FoldError(f"{span_id} is protected ({origin} content)")
-        if origin == "assistant" and reason != "poisoned":
+        if origin == "assistant" and reason != "poisoned" and not entry["content"]:
+            raise FoldError(f"{span_id} has no text to fold")
+        # A turn's reasoning stays in the replay while the turn runs: providers
+        # may require it for continuity (signed thinking before the latest
+        # tool calls), and a checkpoint can land mid-turn.
+        if origin == "reasoning" and entry["created_turn"] >= self.turn:
             raise FoldError(
-                f"{span_id} is protected; assistant turns allow only whole-turn poisoned folds"
+                f"{span_id} is live reasoning for the current turn; "
+                "fold it once the turn ends"
             )
         current = self.state(span_id)
         if current != "visible":
@@ -2979,22 +2980,27 @@ class FoldingContext:
             )
             raise FoldError(f"{span_id} is already {current}{detail}")
 
-        parent_id = entry["parent_id"]
-        while parent_id is not None:
-            if self.state(parent_id) != "visible":
-                raise FoldError(f"overlap with {parent_id}; unfold it first")
-            parent = self._entry(parent_id)
-            parent_id = parent["parent_id"]
-        child = self._db.execute(
-            "SELECT e.span_id FROM entries e JOIN span_state s USING(span_id) "
-            "WHERE e.parent_id = ? AND e.active = 1 AND s.state != 'visible' "
-            "ORDER BY e.rowid LIMIT 1",
-            (span_id,),
-        ).fetchone()
-        if child is not None:
-            raise FoldError(
-                f"overlap with {child['span_id']}; fold remaining chunks or unfold it first"
-            )
+        # Overlap means the same bytes folded twice: a result and its chunks.
+        # An assistant message's text and its tool-input payloads are disjoint
+        # spans of one message, so neither blocks the other.
+        if origin == "tool":
+            parent_id = entry["parent_id"]
+            while parent_id is not None:
+                if self.state(parent_id) != "visible":
+                    raise FoldError(f"overlap with {parent_id}; unfold it first")
+                parent = self._entry(parent_id)
+                parent_id = parent["parent_id"]
+            child = self._db.execute(
+                "SELECT e.span_id FROM entries e JOIN span_state s USING(span_id) "
+                "WHERE e.parent_id = ? AND e.active = 1 AND s.state != 'visible' "
+                "ORDER BY e.rowid LIMIT 1",
+                (span_id,),
+            ).fetchone()
+            if child is not None:
+                raise FoldError(
+                    f"overlap with {child['span_id']}; fold remaining chunks or "
+                    "unfold it first"
+                )
 
         if reason != "poisoned" and entry["tokens_est"] < self.config.min_span_tokens:
             raise FoldError(
@@ -3029,6 +3035,7 @@ class FoldingContext:
             "overlap",
             "unknown",
             "already",
+            "live",
             "note",
             "minimum",
         ):
@@ -3242,6 +3249,7 @@ class FoldingContext:
                 append(message, f"message:{message_id}")
                 continue
             if role == "assistant":
+                self._project_assistant(message, message_id, turn)
                 self._project_input_payloads(message, message_id, turn)
             notice = ""
             if turn is not None and role == "user":
@@ -3316,6 +3324,46 @@ class FoldingContext:
             if replacement is not None:
                 arguments[meta["field"]] = replacement
                 call["function"]["arguments"] = _canonical(arguments)
+
+    def _project_assistant(
+        self, message: dict, message_id: str, turn: int | None
+    ) -> None:
+        """Decorate one projected assistant message in place. Folded reasoning
+        is dropped from the replay and folded text replaced, each by its
+        marker; foldable spans carry their ids (ids are copied, never deduced).
+        Everything rides in the text: reasoning payloads are opaque and may be
+        signed, so they are replayed verbatim or not at all."""
+        lines: list[str] = []
+        if message.get("reasoning"):
+            thinking_id = f"{message_id}.t0"
+            marker = self._state_marker(thinking_id, turn)
+            if marker is not None:
+                message.pop("reasoning")
+                lines.append(marker)
+            else:
+                label = self._label(thinking_id, " thinking")
+                if label is not None:
+                    lines.append(label)
+        marker = self._state_marker(message_id, turn)
+        if marker is not None:
+            lines.append(marker)
+        else:
+            label = self._label(message_id)
+            if label is not None:
+                lines.append(label)
+            if message.get("content") is not None:
+                lines.append(message["content"])
+        if lines:
+            message["content"] = "\n".join(lines)
+
+    def _label(self, span_id: str, kind: str = "") -> str | None:
+        """``[id · ~N tok]`` for an assistant span the agent may fold, else
+        None. Shorter spans stay unlabeled: they cannot be folded, and a label
+        on every assistant message invites the model to mimic it."""
+        entry = self._entry(span_id)
+        if not entry["content"] or entry["tokens_est"] < self.config.min_span_tokens:
+            return None
+        return f"[{span_id} · ~{_token_label(entry['tokens_est'])} tok{kind}]"
 
     def _render_result(self, span_id: str, turn: int | None = None) -> str:
         entry = self._entry(span_id)

@@ -6,10 +6,14 @@ from harness.tools.base import Tool
 
 _SPAN_PROPERTY = {
     "type": "string",
-    "pattern": r"^m\d+(\.(r|i)\d+(\.c\d+)?)?$",
+    "pattern": r"^m\d+(\.r\d+(\.c\d+)?|\.i\d+|\.t\d+)?$",
     "description": (
         "One span id exactly as shown in a context label or fold marker. "
-        "Copy it; unknown ids are rejected with a nearest-match suggestion."
+        "Copy it; unknown ids are rejected with a nearest-match suggestion. "
+        "Ids appear next to what they name: [m8.r0 · ~41K tok] on a tool "
+        "result (m8.r0.c1 for a chunk), m7.i0 for a written payload, "
+        "[m7 · ~1.2K tok] on your own earlier text, [m7.t0 · ~3K tok "
+        "thinking] on its reasoning."
     ),
 }
 
@@ -20,9 +24,12 @@ def fold_tool(context: FoldingContext) -> Tool:
         description=(
             "Collapse one span after its line of work closes, replacing it at "
             "the next checkpoint with a marker carrying your written verdict. "
-            "The note is what future-you will have instead of the evidence: "
-            "state the conclusion, key support, paths, lines, and exact values "
-            "you would otherwise re-check. Never fold mid-investigation."
+            "One span per call, each with its own note; when several spans "
+            "close together, fold them in the same step as parallel fold calls "
+            "rather than one call per step. The note is what future-you will "
+            "have instead of the content: state the conclusion, key support, "
+            "paths, lines, and exact values you would otherwise re-check. "
+            "Never fold mid-investigation."
         ),
         parameters={
             "type": "object",

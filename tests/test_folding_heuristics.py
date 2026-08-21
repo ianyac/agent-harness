@@ -164,10 +164,10 @@ def test_refetch_of_a_folded_operation_is_logged_without_content_or_arguments(tm
     assert not ({"content", "note", "path", "args"} & refetch.keys())
 
 
-def test_pressure_notice_surfaces_three_older_open_spans_once(tmp_path):
-    # Regression caught: without ambient candidates, long sessions rely on a
-    # standing prompt whose compliance decays; repeated identical notices are
-    # equally bad because they become background noise.
+def test_turn_boundary_surfaces_no_fold_candidates(tmp_path):
+    # Decision: the harness never nudges the agent toward folding — no "spans
+    # look closed" notice, however many open spans have aged. When to fold is
+    # the agent's call, from the standing hygiene policy alone.
     messages = tool_exchange("one", {}, "first")
     messages.extend(
         tool_exchange("two", {}, "second", call_id="call_1", user="again")
@@ -176,47 +176,12 @@ def test_pressure_notice_surfaces_three_older_open_spans_once(tmp_path):
         tool_exchange("three", {}, "third", call_id="call_2", user="again")
     )
     context = context_for(tmp_path)
-    tools = {
-        "one": noop_tool(name="one"),
-        "two": noop_tool(name="two"),
-        "three": noop_tool(name="three"),
-    }
+    tools = {name: noop_tool(name=name) for name in ("one", "two", "three")}
     context.sync(messages, tools)
 
     context.begin_turn(messages, tools)
-    notice = context.turn_notice()
-    context.begin_turn(messages, tools)
 
-    assert notice.startswith("[workspace: 3 spans look closed")
-    assert all(span in notice for span in ("m2.r0", "m5.r0", "m8.r0"))
-    assert "spans look closed" not in context.turn_notice()
-
-
-def test_pressure_notice_is_bound_to_the_user_message_for_replay(tmp_path):
-    messages = tool_exchange("one", {}, "first")
-    messages.extend(
-        tool_exchange("two", {}, "second", call_id="call_1", user="again")
-    )
-    messages.extend(
-        tool_exchange("three", {}, "third", call_id="call_2", user="again")
-    )
-    context = context_for(tmp_path)
-    context.sync(
-        messages,
-        {
-            "one": noop_tool(name="one"),
-            "two": noop_tool(name="two"),
-            "three": noop_tool(name="three"),
-        },
-    )
-    context.begin_turn(messages)
-    messages.append({"role": "user", "content": "continue"})
-
-    context.sync(messages)
-
-    assert context.reconstruct(turn=context.turn)[-1]["content"].startswith(
-        "[workspace: 3 spans look closed"
-    )
+    assert context.turn_notice() == ""
 
 
 def test_checkpoint_notice_reports_open_and_folded_workspace_shape(tmp_path):

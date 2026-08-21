@@ -1,4 +1,5 @@
 import json
+import re
 
 import pytest
 
@@ -40,6 +41,20 @@ def test_fold_tool_schema_rejects_sensitive_before_execution(tmp_path):
     assert "sensitive" not in tool.parameters["properties"]["reason"]["enum"]
     with pytest.raises(FoldError, match="invalid fold reason"):
         tool.execute(span_id="m2.r0", reason="sensitive", note=rich_note())
+
+
+def test_fold_tool_keeps_one_span_per_call_and_asks_for_parallel_calls(tmp_path):
+    # One span per call keeps atomic success/failure and one note per span;
+    # several closed spans are folded in the same step as parallel calls.
+    tool = fold_tool(context_with_result(tmp_path))
+    pattern = tool.parameters["properties"]["span_id"]["pattern"]
+
+    assert "parallel fold calls" in tool.description
+    assert all(
+        re.fullmatch(pattern, span_id)
+        for span_id in ("m7", "m8.r0", "m8.r0.c1", "m7.i0", "m7.t0")
+    )
+    assert not any(re.fullmatch(pattern, span_id) for span_id in ("m7.t0.c0", "m7.x0"))
 
 
 def test_unfold_tool_restores_full_content_not_an_excerpt(tmp_path):

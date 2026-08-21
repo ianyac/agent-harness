@@ -447,6 +447,147 @@ def test_poisoned_assistant_turn_quarantines_result_ids_against_unfold(tmp_path)
         context.unfold("m2.r0")
 
 
+def test_assistant_text_is_labeled_and_folds_in_place_keeping_its_calls(tmp_path):
+    # The agent's own analysis is a span: foldable for any reason once its
+    # line of work closes. Only the text is replaced — the turn's tool calls
+    # and their results stay — and unfold reinstates the text at the tail.
+    analysis = "The middleware is clean; the bug must be in the refresh path."
+    messages = [
+        {"role": "user", "content": "do it"},
+        {
+            "role": "assistant",
+            "content": analysis,
+            "tool_calls": [tool_call("read_file", {"path": "auth.py"})],
+        },
+        {"role": "tool", "tool_call_id": "call_0", "content": "evidence"},
+    ]
+    context = context_for(tmp_path)
+    context.sync(messages, {"read_file": noop_tool(name="read_file")})
+    labeled = context.project(messages)[1]["content"]
+    assert labeled.startswith("[m1 · ~") and labeled.endswith(f"tok]\n{analysis}")
+
+    context.fold("m1", "superseded", rich_note())
+    context.checkpoint()
+
+    projected = context.project(messages)
+    assert projected[1]["content"].startswith("[folded m1, ~")
+    assert rich_note() in projected[1]["content"]
+    assert projected[1]["tool_calls"] == messages[1]["tool_calls"]
+    assert projected[2]["content"].endswith("evidence")
+    context.unfold("m1")
+    projected = context.project(messages)
+    assert projected[1]["content"].startswith("[unfolded m1 → tail")
+    assert projected[-1]["content"].endswith(analysis)
+
+
+def test_short_assistant_text_stays_unlabeled_and_below_the_fold_minimum(tmp_path):
+    # A label on every assistant message would teach the model to write its
+    # own; text too small to fold gets neither the label nor the fold.
+    context = FoldingContext(tmp_path / "default.sqlite3", "default")
+    messages = tool_exchange("noop", {}, "tiny") + [
+        {"role": "assistant", "content": "done"}
+    ]
+    context.sync(messages, {"noop": noop_tool()})
+
+    projected = context.project(messages)
+
+    assert projected[1]["content"] is None
+    assert projected[3]["content"] == "done"
+    with pytest.raises(FoldError, match="below the 500-token minimum"):
+        context.fold("m3", "finished", rich_note())
+
+
+def test_assistant_text_and_its_write_payload_fold_independently(tmp_path):
+    # Regression caught: a message's text and the payload of its write call
+    # are disjoint spans; treating them as overlapping would leave a
+    # write-heavy turn's analysis unfoldable once the payload auto-folds.
+    messages = [
+        {"role": "user", "content": "do it"},
+        {
+            "role": "assistant",
+            "content": "Writing the agreed implementation; the analysis stands.",
+            "tool_calls": [tool_call("write", {"content": "print('hello')\n" * 3})],
+        },
+        {"role": "tool", "tool_call_id": "call_0", "content": "ok"},
+    ]
+    context = context_for(tmp_path)
+    context.sync(messages, {"write": foldable_tool()})
+    assert context.state("m1.i0") == "folded"
+
+    context.fold("m1", "finished", rich_note())
+    context.checkpoint()
+
+    projected = context.project(messages)
+    assert projected[1]["content"].startswith("[folded m1, ~")
+    arguments = json.loads(projected[1]["tool_calls"][0]["function"]["arguments"])
+    assert arguments["content"].startswith("[folded m1.i0, ~")
+
+
+def reasoning_exchange(thinking: str) -> list[dict]:
+    """A user turn and an assistant message that thought before calling a
+    tool, with the tool's result — the provider-neutral reasoning shape."""
+    return [
+        {"role": "user", "content": "do it"},
+        {
+            "role": "assistant",
+            "reasoning": [{"text": thinking, "signature": "sig-1"}],
+            "content": "Checking refresh.",
+            "tool_calls": [tool_call("read_file", {"path": "refresh.py"})],
+        },
+        {"role": "tool", "tool_call_id": "call_0", "content": "evidence"},
+    ]
+
+
+def test_reasoning_is_a_thinking_span_that_folds_once_its_turn_has_ended(tmp_path):
+    # Reasoning rides on the assistant message as an opaque, provider-shaped
+    # payload the adapter replays verbatim; the harness reads only the blocks'
+    # text. Folding drops it from the replay and leaves the verdict in the
+    # message text — but never a live turn's reasoning, which the provider may
+    # still require behind the latest tool calls.
+    thinking = "If middleware is clean the bug is in refresh; check the expiry math."
+    messages = reasoning_exchange(thinking)
+    context = context_for(tmp_path)
+    context.sync(messages, {"read_file": noop_tool(name="read_file")})
+    assert context.span_ids() == ["m0", "m1", "m1.t0", "m2.r0"]
+    with pytest.raises(FoldError, match="live reasoning"):
+        context.fold("m1.t0", "scaffolding", rich_note())
+
+    context.begin_turn(messages)
+    projected = context.project(messages)
+    assert projected[1]["content"].startswith("[m1.t0 · ~")
+    assert " tok thinking]\n" in projected[1]["content"]
+    assert projected[1]["reasoning"] == messages[1]["reasoning"]
+    context.fold("m1.t0", "scaffolding", rich_note())
+    context.checkpoint()
+
+    projected = context.project(messages)
+    assert "reasoning" not in projected[1]
+    assert projected[1]["content"].startswith("[folded m1.t0, ~")
+    assert projected[1]["content"].endswith("Checking refresh.")
+    assert projected[1]["tool_calls"] == messages[1]["tool_calls"]
+    assert messages[1]["reasoning"] == [{"text": thinking, "signature": "sig-1"}]
+    context.unfold("m1.t0")
+    assert context.project(messages)[-1]["content"].endswith(thinking)
+
+
+def test_poisoned_turn_quarantines_its_reasoning_with_the_rest_of_the_turn(tmp_path):
+    messages = reasoning_exchange("The bug is in the middleware, obviously.")
+    context = context_for(tmp_path)
+    context.sync(messages, {"read_file": noop_tool(name="read_file")})
+    correction = (
+        "The middleware conclusion was false; the refresh path owns the bug, "
+        "verified against the installed source."
+    )
+
+    context.fold("m1", "poisoned", correction)
+
+    assert context.state("m1.t0") == "quarantined"
+    assert context.project(messages)[1] == {
+        "role": "assistant",
+        "content": f'[removed m1 — poisoned: "{correction}"]',
+    }
+
+
 def test_secret_scanner_purges_tool_output_and_rebuilds_immediately(tmp_path):
     # Regression caught: retaining a detected credential in either SQLite or
     # the caller's soon-to-be-persisted transcript creates a secret archive.

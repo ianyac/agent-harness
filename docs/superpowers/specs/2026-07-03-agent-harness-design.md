@@ -21,8 +21,8 @@ original inverted protocol: learner wrote, teacher reviewed.)
 
 | Decision | Choice | Rationale |
 |---|---|---|
-| Language | Python 3.14 for the full curriculum; TypeScript re-expression afterward (parked on branch `ts-speedrun`, tag `ts-lesson-01`) | Learner's call (2026-07-04, revised same day): concepts first in one language end to end; the TS port becomes a consolidation exercise once the harness is complete |
-| Env/deps | `uv` (`bun` on the parked TS branch) | Simple, fast, lockfile |
+| Language | Python 3.14 for the full curriculum; TypeScript rewrite afterward, from scratch | Learner's call (2026-07-04, revised same day): concepts first in one language end to end; the TS port becomes a consolidation exercise once the harness is complete. Revised 2026-08-22: the parked `ts-speedrun` line (tags `ts-lesson-01`, `python-final`) was removed — the TS rewrite restarts clean |
+| Env/deps | `uv` | Simple, fast, lockfile |
 | LLM backend | Codex subscription, behind a learner-written adapter | Forces a real provider-abstraction boundary |
 | Message format | OpenAI chat-completions dicts (`{"role", "content"}`), no wrapper type | Learner's call: de facto ecosystem standard, zero translation for the backend. Accepted knowingly: OpenAI tool-call warts (JSON-string `arguments`) live in our code |
 | Frameworks | None that own the control flow | The harness *is* the framework; the loop must be ours. Libraries that stay out of the loop (HTTP client, pytest, pydantic) are fine |
@@ -112,9 +112,6 @@ agent-harness/
 ├── tests/               # fake model test double + per-module tests
 └── main.py              # the REPL
 ```
-(TypeScript mirror of this tree lives on the `ts-speedrun` branch, resumed
-after L15.)
-
 **Data flow (from L4):** REPL appends user input to `messages` → loop sends
 messages + tool definitions through `LLMClient` → adapter translates to/from
 the provider API → tool calls in the reply are looked up in the registry and

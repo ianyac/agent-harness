@@ -3,7 +3,6 @@ from pathlib import Path
 
 from harness.skills import (
     NOT_RUN,
-    Skill,
     cmd_blocks,
     discover,
     expand_body,
@@ -15,26 +14,7 @@ from harness.skills import (
     substitute_args,
     view_skill_tool,
 )
-
-
-def write_skill(skills_dir, name, description, body):
-    skills_dir.mkdir(exist_ok=True)
-    (skills_dir / f"{name}.md").write_text(
-        f"---\nname: {name}\ndescription: {description}\n---\n{body}"
-    )
-
-
-def write_dir_skill(skills_dir, dirname, name, description, body, files=None):
-    d = skills_dir / dirname
-    d.mkdir(parents=True, exist_ok=True)
-    (d / "SKILL.md").write_text(
-        f"---\nname: {name}\ndescription: {description}\n---\n{body}"
-    )
-    for relpath, content in (files or {}).items():
-        f = d / relpath
-        f.parent.mkdir(parents=True, exist_ok=True)
-        f.write_text(content)
-    return d
+from tests.helpers import write_dir_skill, write_skill
 
 
 def test_discover_parses_frontmatter_and_body(tmp_path):
@@ -403,9 +383,8 @@ def test_substitute_args_fills_a_positional_inside_a_command():
 def test_discover_warns_on_a_misspelled_allowed_tools_key(tmp_path):
     # 'allowed_tools' (underscore) reads as absent → allowed_tools stays None,
     # which WIDENS a fork skill to the full registry; warn instead of silence
-    (tmp_path / "r").mkdir()
-    (tmp_path / "r" / "SKILL.md").write_text(
-        "---\nname: r\ndescription: d\ncontext: fork\nallowed_tools: read_file\n---\nBody."
+    write_dir_skill(
+        tmp_path, "r", "r", "d", "Body.", extra="context: fork\nallowed_tools: read_file\n"
     )
     warnings = []
     (skill,) = discover(tmp_path, on_warning=warnings.append)
@@ -414,10 +393,7 @@ def test_discover_warns_on_a_misspelled_allowed_tools_key(tmp_path):
 
 
 def test_discover_warns_on_empty_allowed_tools(tmp_path):
-    (tmp_path / "r").mkdir()
-    (tmp_path / "r" / "SKILL.md").write_text(
-        "---\nname: r\ndescription: d\ncontext: fork\nallowed-tools:\n---\nBody."
-    )
+    write_dir_skill(tmp_path, "r", "r", "d", "Body.", extra="context: fork\nallowed-tools:\n")
     warnings = []
     (skill,) = discover(tmp_path, on_warning=warnings.append)
     assert skill.allowed_tools == []
@@ -425,10 +401,7 @@ def test_discover_warns_on_empty_allowed_tools(tmp_path):
 
 
 def test_discover_warns_when_context_is_not_exactly_fork(tmp_path):
-    (tmp_path / "r").mkdir()
-    (tmp_path / "r" / "SKILL.md").write_text(
-        "---\nname: r\ndescription: d\ncontext: Fork\n---\nBody."
-    )
+    write_dir_skill(tmp_path, "r", "r", "d", "Body.", extra="context: Fork\n")
     warnings = []
     (skill,) = discover(tmp_path, on_warning=warnings.append)
     assert skill.fork is False  # a case typo degrades to a plain skill...
@@ -447,11 +420,14 @@ def test_skill_dir_with_a_space_stays_shell_safe(tmp_path):
 
 
 def test_discover_reads_fork_model_and_allowed_tools(tmp_path):
-    # frontmatter written directly to control the fork/model/allowed-tools keys
-    (tmp_path / "research").mkdir()
-    (tmp_path / "research" / "SKILL.md").write_text(
-        "---\nname: research\ndescription: d\ncontext: fork\n"
-        "model: gpt-5.4-mini\nallowed-tools: read_file list_dir\n---\nBody."
+    # extra frontmatter controls the fork/model/allowed-tools keys
+    write_dir_skill(
+        tmp_path,
+        "research",
+        "research",
+        "d",
+        "Body.",
+        extra="context: fork\nmodel: gpt-5.4-mini\nallowed-tools: read_file list_dir\n",
     )
     (skill,) = discover(tmp_path)
     assert skill.fork is True
@@ -485,10 +461,7 @@ def test_discover_survives_an_unreadable_skills_directory(tmp_path, monkeypatch)
 
 def test_discover_keeps_a_plain_skill_but_ignores_its_model(tmp_path):
     # model is meaningless on a non-fork skill: don't drop the skill over it
-    (tmp_path / "bad").mkdir()
-    (tmp_path / "bad" / "SKILL.md").write_text(
-        "---\nname: bad\ndescription: d\nmodel: gpt-9-imaginary\n---\nBody."
-    )
+    write_dir_skill(tmp_path, "bad", "bad", "d", "Body.", extra="model: gpt-9-imaginary\n")
     write_skill(tmp_path, "good", "d", "b")
     warnings = []
     skills = discover(tmp_path, on_warning=warnings.append)
@@ -499,9 +472,8 @@ def test_discover_keeps_a_plain_skill_but_ignores_its_model(tmp_path):
 
 def test_discover_skips_a_fork_skill_with_an_unknown_model(tmp_path):
     # a fork skill NEEDS a real model to build its client, so a bad one is fatal
-    (tmp_path / "bad").mkdir()
-    (tmp_path / "bad" / "SKILL.md").write_text(
-        "---\nname: bad\ndescription: d\ncontext: fork\nmodel: gpt-9-imaginary\n---\nBody."
+    write_dir_skill(
+        tmp_path, "bad", "bad", "d", "Body.", extra="context: fork\nmodel: gpt-9-imaginary\n"
     )
     write_skill(tmp_path, "good", "d", "b")
     warnings = []
@@ -523,10 +495,13 @@ def test_skill_tool_substitutes_args_when_injecting(tmp_path):
 
 
 def test_skill_tool_forks_and_returns_the_subagent_answer(tmp_path):
-    (tmp_path / "r").mkdir()
-    (tmp_path / "r" / "SKILL.md").write_text(
-        "---\nname: r\ndescription: d\ncontext: fork\nmodel: gpt-5.4-mini\n"
-        "allowed-tools: read_file\n---\nresearch $1"
+    write_dir_skill(
+        tmp_path,
+        "r",
+        "r",
+        "d",
+        "research $1",
+        extra="context: fork\nmodel: gpt-5.4-mini\nallowed-tools: read_file\n",
     )
     calls = {}
     def fake_fork(task, model, allowed_tools):
@@ -542,9 +517,8 @@ def test_a_refused_fork_skill_never_runs_its_commands(tmp_path):
     # expansion RUNS the body's !`cmd`, so a build that will refuse a fork
     # skill must refuse BEFORE expanding — otherwise a subagent fires the
     # skill's side effects (twice, if the model retries) and gets only an error
-    (tmp_path / "release").mkdir()
-    (tmp_path / "release" / "SKILL.md").write_text(
-        "---\nname: release\ndescription: d\ncontext: fork\n---\ntag: !`git tag rc-$1`"
+    write_dir_skill(
+        tmp_path, "release", "release", "d", "tag: !`git tag rc-$1`", extra="context: fork\n"
     )
     ran = []
     tool = skill_tool(discover(tmp_path), run=lambda cmd: ran.append(cmd) or "ok")
@@ -566,10 +540,7 @@ def test_the_fork_guard_tracks_fork_capability(tmp_path):
 
 
 def test_a_fork_skill_without_fork_run_reports_an_error(tmp_path):
-    (tmp_path / "r").mkdir()
-    (tmp_path / "r" / "SKILL.md").write_text(
-        "---\nname: r\ndescription: d\ncontext: fork\n---\nBody."
-    )
+    write_dir_skill(tmp_path, "r", "r", "d", "Body.", extra="context: fork\n")
     tool = skill_tool(discover(tmp_path))  # no fork_run
     assert tool.execute(name="r").startswith("Error")
 

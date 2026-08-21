@@ -62,10 +62,6 @@ class FakeClient:
             raise AssertionError(f"unexpected fetch of {url}")
         return self.pages[url]
 
-    def get(self, url, **kwargs):
-        self.requested.append(url)
-        return self.pages[url]
-
 
 @pytest.fixture
 def public_dns(monkeypatch):

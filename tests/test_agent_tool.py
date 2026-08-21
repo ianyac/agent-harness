@@ -5,9 +5,8 @@ import pytest
 from harness.loop import run_turn
 from harness.permissions import PermissionPolicy
 from harness.tools.agent import agent_tool, run_subagent
-from harness.tools.base import Tool
 from tests.fake_llm import FakeLLM
-from tests.helpers import noop_tool
+from tests.helpers import noop_tool, simple_tool
 
 
 def test_subagent_returns_only_the_final_answer():
@@ -255,11 +254,10 @@ def test_run_subagent_excludes_session_local_non_inheritable_tools():
     # belonging to a transcript it cannot see.
     llm = FakeLLM([{"type": "text", "content": "done"}])
     tools = {
-        "local": Tool(
-            name="local",
+        "local": simple_tool(
+            "local",
+            lambda: "ok",
             description="parent-local control",
-            parameters={"type": "object", "properties": {}},
-            execute=lambda: "ok",
             read_only=True,
             inheritable=False,
         ),

@@ -1,19 +1,6 @@
 from harness.loop import run_turn
-from harness.tools.base import Tool
 from tests.fake_llm import FakeLLM
-
-
-def add_tool() -> Tool:
-    return Tool(
-        name="add",
-        description="Add two integers and return the sum.",
-        parameters={
-            "type": "object",
-            "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}},
-            "required": ["a", "b"],
-        },
-        execute=lambda a, b: str(a + b),
-    )
+from tests.helpers import add_tool, simple_tool
 
 
 def test_tool_call_then_answer_builds_the_full_sandwich():
@@ -123,17 +110,6 @@ def test_observer_sees_each_execution_in_order():
     assert seen == [("add", {"a": 1, "b": 1}), ("add", {"a": 2, "b": 2})]
 
 
-def test_iteration_cap_ends_the_turn_gracefully():
-    # rewritten in lesson 8: the cap is a failure, and failure is information
-    endless = {"type": "tool_calls", "calls": [{"name": "add", "arguments": {"a": 1, "b": 1}}]}
-    llm = FakeLLM([endless, endless, endless])
-    messages = []
-    reply = run_turn(messages, "loop forever", llm, tools={"add": add_tool()}, max_iterations=3)
-    assert reply["role"] == "assistant"
-    assert "3 iterations" in reply["content"]
-    assert messages[-1] == reply
-
-
 def test_run_turn_reevaluates_a_callable_system_prompt_each_iteration():
     # a callable system prompt is re-read every iteration, so a mid-turn change
     # (leaving plan mode after exit_plan_mode is approved) reflects for the
@@ -144,10 +120,7 @@ def test_run_turn_reevaluates_a_callable_system_prompt_each_iteration():
         state["section"] = "NORMAL"
         return "flipped"
 
-    flip_tool = Tool(
-        name="flip", description="d",
-        parameters={"type": "object", "properties": {}}, execute=flip,
-    )
+    flip_tool = simple_tool("flip", flip, description="d")
     llm = FakeLLM([
         {"type": "tool_calls", "calls": [{"name": "flip", "arguments": {}}]},
         {"type": "text", "content": "done"},

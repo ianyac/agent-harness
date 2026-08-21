@@ -1,15 +1,7 @@
 from harness.compaction import DEFAULT_SUMMARY_INSTRUCTION
 from harness.loop import run_turn
-from harness.tools.base import Tool
 from tests.fake_llm import FakeLLM
-
-
-def history(n_exchanges: int) -> list[dict]:
-    messages = []
-    for i in range(n_exchanges):
-        messages.append({"role": "user", "content": f"question {i} " + "detail " * 30})
-        messages.append({"role": "assistant", "content": f"answer {i} " + "detail " * 30})
-    return messages
+from tests.helpers import history, simple_tool
 
 
 def test_turn_compacts_history_over_the_threshold():
@@ -84,11 +76,8 @@ def test_mid_turn_tool_growth_triggers_compaction():
     for i in range(3):
         messages.append({"role": "user", "content": f"q{i}"})
         messages.append({"role": "assistant", "content": f"a{i}"})
-    dump = Tool(
-        name="dump",
-        description="Returns a huge payload, for tests.",
-        parameters={"type": "object", "properties": {}},
-        execute=lambda: "x " * 3000,
+    dump = simple_tool(
+        "dump", lambda: "x " * 3000, description="Returns a huge payload, for tests."
     )
     llm = FakeLLM(
         [

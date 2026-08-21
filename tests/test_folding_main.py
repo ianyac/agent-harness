@@ -10,6 +10,28 @@ from main import folding_paths
 ROOT = Path(__file__).parents[1]
 
 
+def run_main(*args, workspace=None, env=None):
+    """Run main.py as a real child process: the CLI boundary, not the library."""
+    argv = [sys.executable, str(ROOT / "main.py")]
+    if workspace is not None:
+        argv += ["--workspace", str(workspace)]
+    return subprocess.run([*argv, *args], capture_output=True, text=True, env=env)
+
+
+def persisted_folding_session(tmp_path, *, ledger=True):
+    """A recorded session whose context-mode file says folding; ``ledger=False``
+    leaves its folds database missing."""
+    sessions = tmp_path / ".agent" / "sessions"
+    sessions.mkdir(parents=True)
+    (sessions / "s.jsonl").write_text(
+        '{"type":"message","message":{"role":"assistant","content":"done"}}\n'
+    )
+    (sessions / "s.context-mode").write_text("folding\n")
+    if ledger:
+        FoldingContext(sessions / "s.folds.sqlite3", "s").close()
+    return sessions
+
+
 def test_folding_artifacts_are_stably_derived_from_the_session_path(tmp_path):
     # Regression caught: resume must reopen the original ledger instead of
     # silently creating a fresh visibility state under a process-specific name.
@@ -23,58 +45,23 @@ def test_folding_artifacts_are_stably_derived_from_the_session_path(tmp_path):
 def test_cli_rejects_explicit_compaction_with_folding_before_startup(tmp_path):
     # Real CLI boundary: conflict rejection must happen before credentials,
     # hooks, session files, or the model client can produce unrelated failures.
-    result = subprocess.run(
-        [
-            sys.executable,
-            str(ROOT / "main.py"),
-            "--workspace",
-            str(tmp_path),
-            "--fold-context",
-            "--compact-threshold",
-            "100",
-        ],
-        capture_output=True,
-        text=True,
-    )
+    result = run_main("--fold-context", "--compact-threshold", "100", workspace=tmp_path)
     assert result.returncode == 2
     assert "--fold-context cannot be combined with --compact-threshold" in result.stderr
     assert not (tmp_path / ".agent").exists()
 
 
 def test_cli_help_advertises_recoverable_context_folding():
-    result = subprocess.run(
-        [sys.executable, str(ROOT / "main.py"), "--help"],
-        capture_output=True,
-        text=True,
-    )
+    result = run_main("--help")
     assert result.returncode == 0
     assert "--fold-context" in result.stdout
     assert "recoverable context folding" in result.stdout
 
 
 def test_resume_rejects_compaction_for_a_persisted_folding_session(tmp_path):
-    sessions = tmp_path / ".agent" / "sessions"
-    sessions.mkdir(parents=True)
-    (sessions / "s.jsonl").write_text(
-        '{"type":"message","message":{"role":"assistant","content":"done"}}\n'
-    )
-    (sessions / "s.context-mode").write_text("folding\n")
-    FoldingContext(sessions / "s.folds.sqlite3", "s").close()
+    sessions = persisted_folding_session(tmp_path)
 
-    result = subprocess.run(
-        [
-            sys.executable,
-            str(ROOT / "main.py"),
-            "--workspace",
-            str(tmp_path),
-            "--resume",
-            "s",
-            "--compact-threshold",
-            "100",
-        ],
-        capture_output=True,
-        text=True,
-    )
+    result = run_main("--resume", "s", "--compact-threshold", "100", workspace=tmp_path)
 
     assert result.returncode == 2
     assert "session uses context folding" in result.stderr
@@ -82,31 +69,15 @@ def test_resume_rejects_compaction_for_a_persisted_folding_session(tmp_path):
 
 
 def test_resume_automatically_restores_the_persisted_folding_mode(tmp_path):
-    sessions = tmp_path / ".agent" / "sessions"
-    sessions.mkdir(parents=True)
-    (sessions / "s.jsonl").write_text(
-        '{"type":"message","message":{"role":"assistant","content":"done"}}\n'
-    )
-    (sessions / "s.context-mode").write_text("folding\n")
-    FoldingContext(sessions / "s.folds.sqlite3", "s").close()
+    sessions = persisted_folding_session(tmp_path)
     auth = tmp_path / ".codex" / "auth.json"
     auth.parent.mkdir()
     auth.write_text(
         '{"tokens":{"access_token":"test-token","account_id":"test-account"}}'
     )
 
-    result = subprocess.run(
-        [
-            sys.executable,
-            str(ROOT / "main.py"),
-            "--workspace",
-            str(tmp_path),
-            "--resume",
-            "s",
-        ],
-        capture_output=True,
-        text=True,
-        env={**os.environ, "HOME": str(tmp_path)},
+    result = run_main(
+        "--resume", "s", workspace=tmp_path, env={**os.environ, "HOME": str(tmp_path)}
     )
 
     assert result.returncode == 0
@@ -115,25 +86,9 @@ def test_resume_automatically_restores_the_persisted_folding_mode(tmp_path):
 
 
 def test_resume_refuses_to_silently_replace_a_missing_folding_ledger(tmp_path):
-    sessions = tmp_path / ".agent" / "sessions"
-    sessions.mkdir(parents=True)
-    (sessions / "s.jsonl").write_text(
-        '{"type":"message","message":{"role":"assistant","content":"done"}}\n'
-    )
-    (sessions / "s.context-mode").write_text("folding\n")
+    persisted_folding_session(tmp_path, ledger=False)
 
-    result = subprocess.run(
-        [
-            sys.executable,
-            str(ROOT / "main.py"),
-            "--workspace",
-            str(tmp_path),
-            "--resume",
-            "s",
-        ],
-        capture_output=True,
-        text=True,
-    )
+    result = run_main("--resume", "s", workspace=tmp_path)
 
     assert result.returncode == 2
     assert "folding ledger is missing" in result.stderr

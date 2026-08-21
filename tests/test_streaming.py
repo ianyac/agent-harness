@@ -1,7 +1,7 @@
 from harness.loop import run_turn
 from harness.tools.agent import agent_tool
 from tests.fake_llm import FakeLLM
-from tests.helpers import noop_tool
+from tests.helpers import history, noop_tool
 
 
 def test_chunks_join_to_exactly_the_returned_content():
@@ -33,10 +33,7 @@ def test_run_turn_forwards_on_text_delta_through_tool_iterations():
 
 
 def test_summarizer_output_never_streams():
-    messages = []
-    for i in range(6):
-        messages.append({"role": "user", "content": f"q{i} " + "detail " * 30})
-        messages.append({"role": "assistant", "content": f"a{i} " + "detail " * 30})
+    messages = history(6)
     llm = FakeLLM(
         [
             {"type": "text", "content": "SUMMARY"},

@@ -13,7 +13,7 @@ from harness.hooks import (
     with_hooks,
 )
 from harness.tools.base import Tool
-from tests.helpers import noop_tool
+from tests.helpers import noop_tool, simple_tool
 
 
 def hooked(hookset: HookSet, **kwargs) -> Tool:
@@ -67,12 +67,7 @@ def test_post_hooks_observe_failing_calls(tmp_path):
     def boom(**args):
         raise ValueError("kaboom")
 
-    tool = Tool(
-        name="noop",
-        description="Explodes, for tests.",
-        parameters={"type": "object", "properties": {}},
-        execute=boom,
-    )
+    tool = simple_tool("noop", boom, description="Explodes, for tests.")
     capture = tmp_path / "payload.json"
     tools = with_hooks(
         {"noop": tool}, HookSet(post_tool_use=[Hook(command=f"cat > {capture}")])

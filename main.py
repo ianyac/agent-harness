@@ -30,7 +30,7 @@ from harness.prompts import (
 )
 from harness.sandbox import LinuxSandbox, NoSandbox, SandboxPolicy, default_sandbox
 from harness.search import default_provider
-from harness.session import SessionLog, lock, unlock
+from harness.session import SessionLog, is_boundary, lock, unlock
 from harness.skills import (
     Skill,
     cmd_blocks,
@@ -49,7 +49,6 @@ from harness.tools.read_file import read_file_tool
 from harness.tools.web import web_fetch_tool, web_search_tool
 from harness.tools.write_file import write_file_tool
 
-KEEP_RECENT = 8  # messages kept verbatim through a compaction
 # fraction of the model's context window that triggers compaction; the rest
 # is headroom for output tokens, mid-turn growth, and estimate bias
 COMPACT_FRACTION = 0.8
@@ -85,6 +84,85 @@ def _session_used_compaction(session_path: Path) -> bool:
         if event.get("type") == "compact":
             return True
     return False
+
+
+def resolve_session_path(
+    cli_args: argparse.Namespace, sessions_dir: Path, parser: argparse.ArgumentParser
+) -> Path:
+    """The session file this process appends to: the most recently used one
+    for --continue, the named one for --resume, a fresh stamped one otherwise."""
+    if cli_args.continue_:
+        candidates = [
+            path
+            for path in sessions_dir.glob("*.jsonl")
+            if not path.name.endswith(".fold-decisions.jsonl")
+        ]
+        if not candidates:
+            parser.error(f"no sessions to continue in {sessions_dir}")
+        # most recently used, not most recently created: a resumed old
+        # session must win over a newer-stamped abandoned one
+        return max(candidates, key=lambda p: p.stat().st_mtime)
+    if cli_args.resume is not None:
+        name = cli_args.resume.removesuffix(".jsonl")
+        if not name or Path(name).name != name:
+            parser.error(f"invalid session id: {cli_args.resume!r}")
+        session_path = sessions_dir / f"{name}.jsonl"
+        if not session_path.exists():
+            parser.error(f"no such session: {session_path}")
+        return session_path
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    return sessions_dir / f"{stamp}-{os.getpid()}.jsonl"
+
+
+def resolve_context_mode(
+    cli_args: argparse.Namespace,
+    session_path: Path,
+    resuming: bool,
+    parser: argparse.ArgumentParser,
+) -> str:
+    """Reconcile the CLI flags with the mode the session was created in and
+    return the mode this process runs in: "folding" or "compaction". The
+    caller persists the verdict; this only decides (or refuses)."""
+    mode_path = context_mode_path(session_path)
+    try:
+        stored_context_mode = mode_path.read_text().strip() if mode_path.exists() else None
+    except OSError as error:
+        parser.error(f"cannot read context mode for {session_path.name}: {error}")
+    if stored_context_mode not in (None, "folding", "compaction"):
+        parser.error(
+            f"invalid persisted context mode for {session_path.name}: "
+            f"{stored_context_mode!r}"
+        )
+    fold_db_path = folding_paths(session_path)[0]
+    if stored_context_mode == "folding" and resuming and not fold_db_path.exists():
+        parser.error(
+            f"session {session_path.name} uses context folding but its folding "
+            "ledger is missing"
+        )
+    if stored_context_mode is None and fold_db_path.exists():
+        # Compatibility with folding sessions created before the sidecar was
+        # introduced: the stable ledger is authoritative evidence of the mode.
+        stored_context_mode = "folding"
+    fold_context = cli_args.fold_context
+    if stored_context_mode == "folding":
+        if cli_args.compact_threshold is not None:
+            parser.error(
+                "session uses context folding; --compact-threshold is incompatible"
+            )
+        fold_context = True
+    elif stored_context_mode == "compaction" and cli_args.fold_context:
+        parser.error("session uses compaction and cannot resume with --fold-context")
+    elif (
+        resuming
+        and stored_context_mode is None
+        and cli_args.fold_context
+        and _session_used_compaction(session_path)
+    ):
+        parser.error(
+            "session already contains compaction events and cannot resume with "
+            "--fold-context"
+        )
+    return "folding" if fold_context else "compaction"
 
 
 def may_run_skill_commands(offered: dict, mode: str) -> bool:
@@ -171,13 +249,13 @@ def approve_mcp(servers: dict[str, str]) -> bool:
     return approve_commands("mcp.json", "servers", commands)
 
 
-def approve_skill_execution(skills: list[Skill], sandboxed: bool) -> bool:
+def approve_skill_execution(skills: list[Skill]) -> bool:
     commands = [
         f"{skill.name}: {command}"
         for skill in skills
         for command in cmd_blocks(skill.body)
     ]
-    return approve_commands("skills/", "skill commands", commands, sandboxed=sandboxed)
+    return approve_commands("skills/", "skill commands", commands, sandboxed=True)
 
 
 class StreamLine:
@@ -210,9 +288,7 @@ class StreamLine:
     def close(self) -> str:
         """End of turn: close the line and return the final call's text."""
         text = "".join(self.chunks)
-        if self.open:
-            print()
-        self.discard()
+        self.break_line()
         return text
 
     def discard(self) -> None:
@@ -232,25 +308,14 @@ def environment(workspace: Path) -> Environment:
     )
 
 
-def current_system_prompt(
-    workspace: Path, extra_sections: list[str] | None = None
-) -> str:
-    return build_system_prompt(environment(workspace), extra_sections=extra_sections)
-
-
-def current_subagent_prompt(
-    workspace: Path, extra_sections: list[str] | None = None
-) -> str:
-    # same core prompt, plus the role section — the extra_sections seam
-    role = (
-        "You are a subagent: another agent delegated one self-contained "
-        "task to you. Work it to completion and make your final reply "
-        "the complete answer — it is the only thing the delegating "
-        "agent will see."
-    )
-    return build_system_prompt(
-        environment(workspace), extra_sections=[role] + (extra_sections or [])
-    )
+# a subagent gets the same core prompt plus this role section, injected
+# through the extra_sections seam
+SUBAGENT_ROLE = (
+    "You are a subagent: another agent delegated one self-contained "
+    "task to you. Work it to completion and make your final reply "
+    "the complete answer — it is the only thing the delegating "
+    "agent will see."
+)
 
 
 def main():
@@ -305,80 +370,21 @@ def main():
     except OSError as error:
         parser.error(f"cannot prepare {sessions_dir}: {error}")
 
-    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    if cli_args.continue_:
-        candidates = [
-            path
-            for path in sessions_dir.glob("*.jsonl")
-            if not path.name.endswith(".fold-decisions.jsonl")
-        ]
-        if not candidates:
-            parser.error(f"no sessions to continue in {sessions_dir}")
-        # most recently used, not most recently created: a resumed old
-        # session must win over a newer-stamped abandoned one
-        session_path = max(candidates, key=lambda p: p.stat().st_mtime)
-    elif cli_args.resume is not None:
-        name = cli_args.resume.removesuffix(".jsonl")
-        if not name or Path(name).name != name:
-            parser.error(f"invalid session id: {cli_args.resume!r}")
-        session_path = sessions_dir / f"{name}.jsonl"
-        if not session_path.exists():
-            parser.error(f"no such session: {session_path}")
-    else:
-        session_path = sessions_dir / f"{stamp}-{os.getpid()}.jsonl"
-
+    session_path = resolve_session_path(cli_args, sessions_dir, parser)
     resuming = cli_args.continue_ or cli_args.resume is not None
-    mode_path = context_mode_path(session_path)
-    try:
-        stored_context_mode = mode_path.read_text().strip() if mode_path.exists() else None
-    except OSError as error:
-        parser.error(f"cannot read context mode for {session_path.name}: {error}")
-    if stored_context_mode not in (None, "folding", "compaction"):
-        parser.error(
-            f"invalid persisted context mode for {session_path.name}: "
-            f"{stored_context_mode!r}"
-        )
-    fold_db_path = folding_paths(session_path)[0]
-    if stored_context_mode == "folding" and resuming and not fold_db_path.exists():
-        parser.error(
-            f"session {session_path.name} uses context folding but its folding "
-            "ledger is missing"
-        )
-    if stored_context_mode is None and fold_db_path.exists():
-        # Compatibility with folding sessions created before the sidecar was
-        # introduced: the stable ledger is authoritative evidence of the mode.
-        stored_context_mode = "folding"
-    if stored_context_mode == "folding":
-        if cli_args.compact_threshold is not None:
-            parser.error(
-                "session uses context folding; --compact-threshold is incompatible"
-            )
-        cli_args.fold_context = True
-    elif stored_context_mode == "compaction" and cli_args.fold_context:
-        parser.error("session uses compaction and cannot resume with --fold-context")
-    elif (
-        resuming
-        and stored_context_mode is None
-        and cli_args.fold_context
-        and _session_used_compaction(session_path)
-    ):
-        parser.error(
-            "session already contains compaction events and cannot resume with "
-            "--fold-context"
-        )
-    selected_context_mode = "folding" if cli_args.fold_context else "compaction"
+    selected_context_mode = resolve_context_mode(cli_args, session_path, resuming, parser)
     try:
         lock(session_path)
     except RuntimeError as error:
         parser.error(str(error))
     try:
-        mode_path.write_text(selected_context_mode + "\n")
+        context_mode_path(session_path).write_text(selected_context_mode + "\n")
     except OSError as error:
         unlock(session_path)
         parser.error(f"cannot persist context mode for {session_path.name}: {error}")
 
     folding = None
-    if cli_args.fold_context:
+    if selected_context_mode == "folding":
         fold_db, decision_log = folding_paths(session_path)
         folding = FoldingContext(
             fold_db,
@@ -469,17 +475,18 @@ def main():
                 f"(no working sandbox here — {len(executable)} skill(s) with "
                 "commands will not run those commands)"
             )
-        elif not approve_skill_execution(executable, sandboxed=True):
+        elif not approve_skill_execution(executable):
             print(f"(skill execution declined — dropping {len(executable)} executable skill(s))")
             skills = [s for s in skills if not has_cmd_blocks(s.body)]
     section = skills_section(skills)
-    context_sections = hook_sections + ([section] if section else [])
-    main_context_sections = context_sections + (
-        [WORKSPACE_HYGIENE] if folding is not None else []
+    main_context_sections = (
+        hook_sections
+        + ([section] if section else [])
+        + ([WORKSPACE_HYGIENE] if folding is not None else [])
     )
-    # NOTE: context_sections is the MAIN LOOP's. A subagent's sections are built
-    # separately by subagent_prompt_for, from what that sub actually holds — a
-    # new section added here does NOT reach subagents unless added there too.
+    # NOTE: main_context_sections is the MAIN LOOP's. A subagent's sections are
+    # built separately by subagent_prompt_for, from what that sub actually holds
+    # — a new section added here does NOT reach subagents unless added there too.
 
     try:
         server_commands = load_config(workspace / "mcp.json")
@@ -576,7 +583,9 @@ def main():
             # plan-mode turn (the sub shares the plan policy but cannot exit
             # plan mode, so PLAN_MODE_SUBAGENT — not PLAN_MODE)
             extra = sections + ([PLAN_MODE_SUBAGENT] if policy.mode == "plan" else [])
-            return current_subagent_prompt(workspace, extra)
+            return build_system_prompt(
+                environment(workspace), extra_sections=[SUBAGENT_ROLE] + extra
+            )
 
         return build
 
@@ -714,12 +723,11 @@ def main():
     # wrapped IN PLACE after the agent tool joins: every tool including the
     # delegation is hooked, the sub's closure sees the hooked registry, and
     # the spawns_subagents field keeps the recursion guard intact through
-    # the wrapping
-    with_hooks(tools, hookset, on_warning=lambda w: print(f"({w})"), cwd=workspace)
-    # a derived tool is model-driven too, so it gets the same hook wrapping —
-    # unlike the raw slash-command tool captured above, which is a human action
-    for variants in (sub_variants_exec, sub_variants_plain):
-        with_hooks(variants, hookset, on_warning=lambda w: print(f"({w})"), cwd=workspace)
+    # the wrapping. A derived tool is model-driven too, so the sub variants get
+    # the same hook wrapping — unlike the raw slash-command tool captured
+    # above, which is a human action
+    for tool_set in (tools, sub_variants_exec, sub_variants_plain):
+        with_hooks(tool_set, hookset, on_warning=lambda w: print(f"({w})"), cwd=workspace)
     session = SessionLog(session_path)
     try:
         messages = session.load()
@@ -822,13 +830,12 @@ def main():
                 # a callable, re-read each iteration: when exit_plan_mode is
                 # approved mid-turn, policy.mode flips and the PLAN_MODE section
                 # drops for the rest of the turn
-                system=lambda: current_system_prompt(
-                    workspace,
-                    main_context_sections
+                system=lambda: build_system_prompt(
+                    environment(workspace),
+                    extra_sections=main_context_sections
                     + ([PLAN_MODE] if policy.mode == "plan" else []),
                 ),
                 compact_threshold=None if folding is not None else compact_threshold,
-                keep_recent=KEEP_RECENT,
                 on_compact=on_compact,
                 breadcrumbs=breadcrumb_note,
                 on_text_delta=stream.write,
@@ -857,10 +864,7 @@ def main():
             # indices mid-turn, so roll back to the last completed exchange
             # rather than to a saved position.
             dropped = 0
-            while messages and not (
-                messages[-1]["role"] == "assistant"
-                and not messages[-1].get("tool_calls")
-            ):
+            while messages and not is_boundary(messages[-1]):
                 messages.pop()
                 dropped += 1
             if dropped:

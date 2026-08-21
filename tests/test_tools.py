@@ -4,23 +4,11 @@ import pytest
 
 from harness.tools.base import Tool, definitions
 from harness.tools.write_file import write_file_tool
-
-
-def sample_tool() -> Tool:
-    return Tool(
-        name="add",
-        description="Add two integers and return the sum.",
-        parameters={
-            "type": "object",
-            "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}},
-            "required": ["a", "b"],
-        },
-        execute=lambda a, b: str(a + b),
-    )
+from tests.helpers import add_tool
 
 
 def test_definition_is_openai_function_format():
-    tool = sample_tool()
+    tool = add_tool()
     assert tool.definition() == {
         "type": "function",
         "function": {
@@ -32,12 +20,12 @@ def test_definition_is_openai_function_format():
 
 
 def test_definitions_covers_the_whole_registry():
-    registry = {"add": sample_tool()}
+    registry = {"add": add_tool()}
     assert definitions(registry) == [registry["add"].definition()]
 
 
 def test_execute_round_trips_through_json_arguments():
-    tool = sample_tool()
+    tool = add_tool()
     arguments = '{"a": 2, "b": 3}'  # exactly the string a model emits
     assert tool.execute(**json.loads(arguments)) == "5"
 

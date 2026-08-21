@@ -4,6 +4,7 @@ from functools import cache
 import tiktoken
 
 from harness.llm import LLMClient
+from harness.session import is_boundary
 from harness.truncate import truncate
 
 DEFAULT_SUMMARY_INSTRUCTION = (
@@ -32,13 +33,6 @@ def _encoding() -> tiktoken.Encoding:
     return tiktoken.get_encoding("o200k_base")
 
 
-def _count(text: str) -> int:
-    # disallowed_special=(): a special-token literal inside content (e.g. a
-    # file containing "<|endoftext|>") is data to count, not a control
-    # token to reject — the default raises ValueError on it
-    return len(_encoding().encode(text, disallowed_special=()))
-
-
 def count_text_tokens(text: str) -> int:
     """Return the harness's deterministic token estimate for one text span.
 
@@ -46,7 +40,10 @@ def count_text_tokens(text: str) -> int:
     span can cross one policy's threshold but not the other's solely because
     two tokenizers disagreed.
     """
-    return _count(text)
+    # disallowed_special=(): a special-token literal inside content (e.g. a
+    # file containing "<|endoftext|>") is data to count, not a control
+    # token to reject — the default raises ValueError on it
+    return len(_encoding().encode(text, disallowed_special=()))
 
 
 def estimate_tokens(
@@ -62,21 +59,17 @@ def estimate_tokens(
     OpenAI's accounting."""
     total = 0
     if system:
-        total += _count(system)
+        total += count_text_tokens(system)
     for definition in tools or []:
-        total += _count(json.dumps(definition))
+        total += count_text_tokens(json.dumps(definition))
     for m in messages:
         total += 4
         if m.get("content"):
-            total += _count(m["content"])
+            total += count_text_tokens(m["content"])
         for call in m.get("tool_calls") or []:
-            total += _count(call["function"]["name"])
-            total += _count(call["function"]["arguments"])
+            total += count_text_tokens(call["function"]["name"])
+            total += count_text_tokens(call["function"]["arguments"])
     return total
-
-
-def _is_plain_assistant(message: dict) -> bool:
-    return message["role"] == "assistant" and not message.get("tool_calls")
 
 
 def _safe_cut(messages: list[dict], keep_recent: int) -> int:
@@ -89,10 +82,10 @@ def _safe_cut(messages: list[dict], keep_recent: int) -> int:
     doing."""
     target = len(messages) - keep_recent
     for cut in range(min(target, len(messages) - 1), 1, -1):
-        if _is_plain_assistant(messages[cut - 1]):
+        if is_boundary(messages[cut - 1]):
             return cut
     for cut in range(max(target + 1, 2), len(messages)):
-        if _is_plain_assistant(messages[cut - 1]):
+        if is_boundary(messages[cut - 1]):
             return cut
     return 0
 

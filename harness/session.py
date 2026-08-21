@@ -3,7 +3,7 @@ import os
 from pathlib import Path
 
 
-def _is_boundary(message: dict) -> bool:
+def is_boundary(message: dict) -> bool:
     # a completed exchange ends with a plain assistant reply — the same
     # boundary compaction cuts on and the REPL rolls back to
     return message["role"] == "assistant" and not message.get("tool_calls")
@@ -52,7 +52,7 @@ class SessionLog:
                     messages.append(event["message"])
                 case "compact":
                     messages = [event["summary"]] + messages[event["cut"] :]
-            if messages and _is_boundary(messages[-1]):
+            if messages and is_boundary(messages[-1]):
                 good = consumed
                 checkpoint = list(messages)
         if good < len(raw):

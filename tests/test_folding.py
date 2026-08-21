@@ -1,4 +1,3 @@
-import hashlib
 import json
 import sqlite3
 from copy import deepcopy
@@ -9,7 +8,11 @@ from harness.compaction import count_text_tokens
 from harness.folding import FoldConfig, FoldError, FoldingContext, ProjectionError
 from harness.session import SessionLog
 from harness.tools.base import Tool
-from tests.helpers import noop_tool
+from tests.helpers import canonical, canonical_hash, noop_tool, tool_call
+
+SECRET = "sk-abcdefghijklmnopqrstuvwxyz123456789"
+# the identifier the scanner substitutes for SECRET wherever it names a tool or call
+ALIAS = FoldingContext._identifier_alias(SECRET)
 
 
 def tool_exchange(
@@ -18,35 +21,51 @@ def tool_exchange(
     result: str,
     *,
     call_id: str = "call_0",
+    user: str = "do it",
 ) -> list[dict]:
+    """A user turn, one assistant tool call, and its result — three messages."""
     return [
-        {"role": "user", "content": "do it"},
+        {"role": "user", "content": user},
         {
             "role": "assistant",
             "content": None,
-            "tool_calls": [
-                {
-                    "id": call_id,
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "arguments": json.dumps(arguments),
-                    },
-                }
-            ],
+            "tool_calls": [tool_call(name, arguments, call_id)],
         },
         {"role": "tool", "tool_call_id": call_id, "content": result},
     ]
 
 
+def context_for(
+    tmp_path,
+    *,
+    config: FoldConfig | None = FoldConfig(min_span_tokens=0),
+    session_log_path=None,
+    decision_log: bool = False,
+    **config_fields,
+) -> FoldingContext:
+    """Open the test ledger at ``tmp_path / "folds.sqlite3"`` for "session".
+
+    The default config drops the 500-token minimum so tiny fixtures are
+    foldable; keyword fields (``chunk_tokens=3``) override that test default,
+    and ``config=None`` keeps the production defaults (``FoldConfig()``).
+    """
+    if config_fields:
+        config = FoldConfig(min_span_tokens=0, **config_fields)
+    elif config is None:
+        config = FoldConfig()
+    return FoldingContext(
+        tmp_path / "folds.sqlite3",
+        "session",
+        decision_log_path=(tmp_path / "decisions.jsonl") if decision_log else None,
+        config=config,
+        session_log_path=session_log_path,
+    )
+
+
 def test_sync_assigns_stable_result_span_and_projection_labels_it(tmp_path):
     # Regression caught: re-syncing a transcript must not allocate new IDs,
     # because every existing fold record points at the original handle.
-    context = FoldingContext(
-        tmp_path / "folds.sqlite3",
-        "session",
-        config=FoldConfig(min_span_tokens=0),
-    )
+    context = context_for(tmp_path)
     messages = tool_exchange("read_file", {"path": "a.py"}, "print('a')")
     context.sync(messages, {"read_file": noop_tool(name="read_file")})
 
@@ -62,11 +81,7 @@ def test_sync_assigns_stable_result_span_and_projection_labels_it(tmp_path):
 def test_large_result_is_chunked_once_with_stable_child_ids(tmp_path):
     # Regression caught: re-chunking on projection would make an existing
     # chunk handle name different content after a tokenizer/config change.
-    context = FoldingContext(
-        tmp_path / "folds.sqlite3",
-        "session",
-        config=FoldConfig(min_span_tokens=0, chunk_tokens=4),
-    )
+    context = context_for(tmp_path, chunk_tokens=4)
     messages = tool_exchange(
         "dump",
         {},
@@ -87,7 +102,7 @@ def test_large_result_is_chunked_once_with_stable_child_ids(tmp_path):
 def test_projection_rejects_an_orphaned_tool_result(tmp_path):
     # Regression caught: sending this shape would produce a provider 400 and
     # poison every retry, so the local projection must fail before dispatch.
-    context = FoldingContext(tmp_path / "folds.sqlite3", "session")
+    context = context_for(tmp_path, config=None)
     messages = [
         {"role": "user", "content": "start"},
         {"role": "tool", "tool_call_id": "missing", "content": "orphan"},
@@ -101,7 +116,7 @@ def test_projection_rejects_an_orphaned_tool_result(tmp_path):
 def test_projection_rejects_a_call_without_exactly_one_result(tmp_path):
     # Regression caught: folding or projection code must not silently drop a
     # result while leaving the assistant's call in the provider transcript.
-    context = FoldingContext(tmp_path / "folds.sqlite3", "session")
+    context = context_for(tmp_path, config=None)
     messages = tool_exchange("noop", {}, "ok")[:-1]
     context.sync(messages)
 
@@ -112,15 +127,14 @@ def test_projection_rejects_a_call_without_exactly_one_result(tmp_path):
 def test_resume_replays_the_same_projection_and_hash(tmp_path):
     # Regression caught: persisted metadata must fully determine what the
     # resumed model sees; process-local counters cannot affect projection.
-    path = tmp_path / "folds.sqlite3"
     messages = tool_exchange("read_file", {"path": "a.py"}, "body")
-    first = FoldingContext(path, "session", config=FoldConfig(min_span_tokens=0))
+    first = context_for(tmp_path)
     first.sync(messages, {"read_file": noop_tool(name="read_file")})
     expected_projection = first.project(messages)
     expected_hash = first.projection_hash(messages)
     first.close()
 
-    resumed = FoldingContext(path, "session", config=FoldConfig(min_span_tokens=0))
+    resumed = context_for(tmp_path)
     resumed.sync(messages, {"read_file": noop_tool(name="read_file")})
 
     assert resumed.project(messages) == expected_projection
@@ -130,31 +144,108 @@ def test_resume_replays_the_same_projection_and_hash(tmp_path):
 def test_reconstruct_uses_the_persisted_shadow_ledger(tmp_path):
     # Regression caught: replay must not require the caller to retain an
     # in-memory transcript after a process exits.
-    path = tmp_path / "folds.sqlite3"
     messages = tool_exchange("noop", {}, "durable result")
-    context = FoldingContext(path, "session", config=FoldConfig(min_span_tokens=0))
+    context = context_for(tmp_path)
     context.sync(messages, {"noop": noop_tool()})
     live_projection = context.project(messages)
     context.close()
 
-    resumed = FoldingContext(path, "session", config=FoldConfig(min_span_tokens=0))
+    resumed = context_for(tmp_path)
 
     assert resumed.reconstruct() == live_projection
 
 
 def context_with_result(tmp_path, content: str, *, chunk_tokens: int = 2_000):
     messages = tool_exchange("read_file", {"path": "auth.py"}, content)
-    context = FoldingContext(
-        tmp_path / "folds.sqlite3",
-        "session",
-        config=FoldConfig(min_span_tokens=0, chunk_tokens=chunk_tokens),
-    )
+    context = context_for(tmp_path, chunk_tokens=chunk_tokens)
     context.sync(messages, {"read_file": noop_tool(name="read_file")})
     return context, messages
 
 
 def rich_note() -> str:
     return "Auth validation and middleware are clean; refresh.py is the remaining path."
+
+
+def first_second_tools() -> dict[str, Tool]:
+    return {"first": noop_tool(name="first"), "second": noop_tool(name="second")}
+
+
+def two_results(
+    tmp_path,
+    first: str,
+    second: str,
+    *,
+    chunk_tokens: int | None = None,
+    second_user: str = "do it",
+) -> tuple[FoldingContext, list[dict]]:
+    """Two exchanges — "first" -> m2.r0, "second" -> m5.r0 — synced into a
+    fresh ledger whose chunk size lets the second result's children alias the
+    first result's payload. Returns ``(context, messages)``."""
+    messages = tool_exchange("first", {}, first)
+    messages.extend(
+        tool_exchange("second", {}, second, call_id="call_1", user=second_user)
+    )
+    config = {} if chunk_tokens is None else {"chunk_tokens": chunk_tokens}
+    context = context_for(tmp_path, **config)
+    context.sync(messages, first_second_tools())
+    return context, messages
+
+
+def completed_then_crashed(
+    first: str, second: str, *, names: tuple[str, str] = ("first", "second")
+) -> tuple[list[dict], list[dict]]:
+    """A finished turn (``completed``) and that turn with an in-flight second
+    exchange appended (``crashed``) — what a crash mid-turn leaves behind."""
+    completed = tool_exchange(names[0], {}, first) + [
+        {"role": "assistant", "content": "done"}
+    ]
+    crashed = completed + tool_exchange(names[1], {}, second, call_id="call_1")
+    return completed, crashed
+
+
+def foldable_tool(name: str = "write", field: str = "content") -> Tool:
+    """A tool whose ``field`` argument is registered as a foldable input.
+
+    These tests only sync transcripts, so ``execute`` is never called.
+    """
+    return Tool(
+        name=name,
+        description=f"consume {field}",
+        parameters={
+            "type": "object",
+            "properties": {field: {"type": "string"}},
+            "required": [field],
+        },
+        execute=lambda **args: "ok",
+        foldable_inputs=(field,),
+    )
+
+
+def projection_rows(context: FoldingContext) -> list[dict]:
+    """Every stored request snapshot, for before/after comparisons."""
+    return [
+        dict(row)
+        for row in context._db.execute(
+            "SELECT projection_id, projection_hash, parent_hash, projection_json, "
+            "source_ids_json, redacted FROM projections ORDER BY projection_id"
+        ).fetchall()
+    ]
+
+
+def stored_projection(context: FoldingContext, projection_id: int) -> sqlite3.Row:
+    """The raw stored bytes of one request snapshot and its provenance list."""
+    return context._db.execute(
+        "SELECT projection_json, source_ids_json FROM projections "
+        "WHERE projection_id = ?",
+        (projection_id,),
+    ).fetchone()
+
+
+def table_counts(context: FoldingContext) -> dict[str, int]:
+    return {
+        table: context._db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in ("messages", "entries", "span_state", "tool_calls", "folds")
+    }
 
 
 def test_fold_remains_visible_until_checkpoint_then_renders_its_verdict(tmp_path):
@@ -290,11 +381,7 @@ def test_imperative_and_marker_breaking_fold_notes_are_rejected(tmp_path, note):
 
 def test_fold_marker_flags_a_verdict_derived_from_untrusted_output(tmp_path):
     messages = tool_exchange("remote", {}, "third-party claim")
-    context = FoldingContext(
-        tmp_path / "folds.sqlite3",
-        "session",
-        config=FoldConfig(min_span_tokens=0),
-    )
+    context = context_for(tmp_path)
     remote = noop_tool(name="remote")
     remote.untrusted_output = True
     context.sync(messages, {"remote": remote})
@@ -363,91 +450,60 @@ def test_poisoned_assistant_turn_quarantines_result_ids_against_unfold(tmp_path)
 def test_secret_scanner_purges_tool_output_and_rebuilds_immediately(tmp_path):
     # Regression caught: retaining a detected credential in either SQLite or
     # the caller's soon-to-be-persisted transcript creates a secret archive.
-    secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
-    messages = tool_exchange("web_fetch", {}, f"token={secret}")
-    context = FoldingContext(
-        tmp_path / "folds.sqlite3",
-        "session",
-        config=FoldConfig(min_span_tokens=0),
-    )
+    messages = tool_exchange("web_fetch", {}, f"token={SECRET}")
+    context = context_for(tmp_path)
 
     context.sync(messages, {"web_fetch": noop_tool(name="web_fetch")})
 
     assert context.state("m2.r0") == "purged"
     assert context.content("m2.r0") is None
-    assert secret not in json.dumps(messages)
+    assert SECRET not in json.dumps(messages)
     assert context.project(messages)[2]["content"] == (
         "[redacted — credential detected in tool output]"
     )
 
 
 def test_scanner_purges_a_matched_secret_from_every_local_alias(tmp_path):
-    secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
     path = tmp_path / "folds.sqlite3"
     session_path = tmp_path / "session.jsonl"
     actions_path = tmp_path / "actions.jsonl"
     session_path.write_text(
-        json.dumps({"type": "message", "message": {"role": "user", "content": secret}})
+        json.dumps({"type": "message", "message": {"role": "user", "content": SECRET}})
         + "\n"
     )
     actions_path.write_text(
-        json.dumps({"name": "leak", "args": {"token": secret}}) + "\n"
+        json.dumps({"name": "leak", "args": {"token": SECRET}}) + "\n"
     )
-    messages = [
-        {"role": "user", "content": f"inspect {secret}"},
-        {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [{
-                "id": "call_0",
-                "type": "function",
-                "function": {
-                    "name": "leak",
-                    "arguments": json.dumps({"token": secret}),
-                },
-            }],
-        },
-        {
-            "role": "tool",
-            "tool_call_id": "call_0",
-            "content": f"diagnostic prefix {secret} diagnostic suffix",
-        },
-    ]
-    context = FoldingContext(path, "session", session_log_path=session_path)
+    messages = tool_exchange(
+        "leak",
+        {"token": SECRET},
+        f"diagnostic prefix {SECRET} diagnostic suffix",
+        user=f"inspect {SECRET}",
+    )
+    context = context_for(tmp_path, config=None, session_log_path=session_path)
     context.register_purge_path(actions_path)
     context.sync(messages, {"leak": noop_tool(name="leak")})
 
     assert context.state("m2.r0") == "purged"
-    assert secret not in json.dumps(messages)
-    assert secret not in json.dumps(context.shadow_messages())
-    assert secret not in json.dumps(context.project(messages))
-    assert secret not in session_path.read_text()
-    assert secret not in actions_path.read_text()
-    assert secret.encode() not in path.read_bytes()
+    assert SECRET not in json.dumps(messages)
+    assert SECRET not in json.dumps(context.shadow_messages())
+    assert SECRET not in json.dumps(context.project(messages))
+    assert SECRET not in session_path.read_text()
+    assert SECRET not in actions_path.read_text()
+    assert SECRET.encode() not in path.read_bytes()
 
 
 def test_scanner_remaps_credential_identifiers_without_orphaning_the_result(tmp_path):
-    secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
     path = tmp_path / "folds.sqlite3"
-    messages = [
-        {"role": "user", "content": "inspect"},
-        {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [{
-                "id": secret,
-                "type": "function",
-                "function": {"name": secret, "arguments": "{}"},
-            }],
-        },
-        {
-            "role": "tool",
-            "tool_call_id": secret,
-            "content": f"diagnostic prefix {secret} diagnostic suffix",
-        },
-    ]
-    context = FoldingContext(path, "session")
-    context.sync(messages, {secret: noop_tool(name=secret)})
+    messages = tool_exchange(
+        SECRET,
+        {},
+        f"diagnostic prefix {SECRET} diagnostic suffix",
+        call_id=SECRET,
+        user="inspect",
+    )
+    context = context_for(tmp_path, config=None)
+    context.sync(messages, {SECRET: noop_tool(name=SECRET)})
 
     call = messages[1]["tool_calls"][0]
     stored = context._db.execute(
@@ -457,126 +513,117 @@ def test_scanner_remaps_credential_identifiers_without_orphaning_the_result(tmp_
     assert call["id"] == messages[2]["tool_call_id"]
     assert call["id"] == stored["call_id"]
     assert call["function"]["name"] == stored["tool_name"]
-    assert call["id"] != secret
-    assert call["function"]["name"] != secret
-    assert secret not in json.dumps(messages)
-    assert secret not in json.dumps(context.shadow_messages())
-    assert secret not in json.dumps(context.project(messages))
-    assert secret.encode() not in path.read_bytes()
+    assert call["id"] != SECRET
+    assert call["function"]["name"] != SECRET
+    assert SECRET not in json.dumps(messages)
+    assert SECRET not in json.dumps(context.shadow_messages())
+    assert SECRET not in json.dumps(context.project(messages))
+    assert SECRET.encode() not in path.read_bytes()
 
 
 def test_scanner_scrubs_embedded_unknown_jsonl_values_without_rewriting_keys(tmp_path):
-    secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
     actions_path = tmp_path / "actions.jsonl"
     actions_path.write_text(
         json.dumps(
             {
-                "unknown_payload": f"prefix {secret} suffix",
+                "unknown_payload": f"prefix {SECRET} suffix",
                 "role": "audit",
             }
         )
         + "\n"
     )
-    messages = tool_exchange("leak", {}, f"diagnostic {secret}")
-    context = FoldingContext(tmp_path / "folds.sqlite3", "session")
+    messages = tool_exchange("leak", {}, f"diagnostic {SECRET}")
+    context = context_for(tmp_path, config=None)
     context.register_purge_path(actions_path)
     context.sync(messages, {"leak": noop_tool(name="leak")})
 
     artifact = json.loads(actions_path.read_text())
     assert "unknown_payload" in artifact
     assert artifact["role"] == "audit"
-    assert secret not in artifact["unknown_payload"]
-    assert secret not in actions_path.read_text()
+    assert SECRET not in artifact["unknown_payload"]
+    assert SECRET not in actions_path.read_text()
 
 
 def test_scanner_scrubs_every_non_role_jsonl_value_in_exhaustive_mode(tmp_path):
-    secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
     actions_path = tmp_path / "actions.jsonl"
     original = {
-        "event": f"event-{secret}",
-        "message_id": f"message-{secret}",
-        "session_id": f"session-{secret}",
-        "span_id": f"span-{secret}",
-        "type": f"type-{secret}",
+        "event": f"event-{SECRET}",
+        "message_id": f"message-{SECRET}",
+        "session_id": f"session-{SECRET}",
+        "span_id": f"span-{SECRET}",
+        "type": f"type-{SECRET}",
         "role": "audit",
     }
     actions_path.write_text(json.dumps(original) + "\n")
-    messages = tool_exchange("leak", {}, f"diagnostic {secret}")
-    context = FoldingContext(tmp_path / "folds.sqlite3", "session")
+    messages = tool_exchange("leak", {}, f"diagnostic {SECRET}")
+    context = context_for(tmp_path, config=None)
     context.register_purge_path(actions_path)
     context.sync(messages, {"leak": noop_tool(name="leak")})
 
     artifact = json.loads(actions_path.read_text())
     assert artifact.keys() == original.keys()
     assert artifact["role"] == "audit"
-    assert all(secret not in artifact[key] for key in original if key != "role")
-    assert secret not in actions_path.read_text()
+    assert all(SECRET not in artifact[key] for key in original if key != "role")
+    assert SECRET not in actions_path.read_text()
 
 
 def test_scanner_scrubs_confirmed_secrets_from_torn_jsonl_lines(tmp_path):
-    secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
     path = tmp_path / "folds.sqlite3"
     actions_path = tmp_path / "actions.jsonl"
     actions_path.write_text(
-        f'{{"event":"torn write","payload":"prefix {secret} suffix"\n'
+        f'{{"event":"torn write","payload":"prefix {SECRET} suffix"\n'
     )
-    messages = tool_exchange("leak", {"token": secret}, "queued")
-    context = FoldingContext(path, "session")
+    messages = tool_exchange("leak", {"token": SECRET}, "queued")
+    context = context_for(tmp_path, config=None)
     context.register_purge_path(actions_path)
     context.sync(messages, {"leak": noop_tool(name="leak")})
     context.record_request(context.project(messages))
     projection_id = context.projection_chain()[0]["projection_id"]
-    messages[2]["content"] = f"diagnostic {secret}"
+    messages[2]["content"] = f"diagnostic {SECRET}"
 
     context.sync(messages, {"leak": noop_tool(name="leak")})
 
-    assert secret.encode() not in actions_path.read_bytes()
-    assert secret not in json.dumps(messages)
-    assert secret not in json.dumps(context.shadow_messages())
-    assert secret not in json.dumps(context.project(messages))
-    assert secret not in json.dumps(context.reconstruct_projection(projection_id))
-    assert secret.encode() not in path.read_bytes()
+    assert SECRET.encode() not in actions_path.read_bytes()
+    assert SECRET not in json.dumps(messages)
+    assert SECRET not in json.dumps(context.shadow_messages())
+    assert SECRET not in json.dumps(context.project(messages))
+    assert SECRET not in json.dumps(context.reconstruct_projection(projection_id))
+    assert SECRET.encode() not in path.read_bytes()
 
 
 def test_scanner_scrubs_confirmed_secrets_from_invalid_utf8_artifacts(tmp_path):
-    secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
     actions_path = tmp_path / "actions.jsonl"
     actions_path.write_bytes(
-        b"\xff\xfe{\"payload\":\"prefix " + secret.encode() + b" suffix\"}\n"
+        b"\xff\xfe{\"payload\":\"prefix " + SECRET.encode() + b" suffix\"}\n"
     )
-    messages = tool_exchange("leak", {}, f"diagnostic {secret}")
-    context = FoldingContext(tmp_path / "folds.sqlite3", "session")
+    messages = tool_exchange("leak", {}, f"diagnostic {SECRET}")
+    context = context_for(tmp_path, config=None)
     context.register_purge_path(actions_path)
 
     context.sync(messages, {"leak": noop_tool(name="leak")})
 
     artifact = actions_path.read_bytes()
     assert artifact.startswith(b"\xff\xfe")
-    assert secret.encode() not in artifact
+    assert SECRET.encode() not in artifact
     assert "[redacted — credential detected in tool output]".encode() in artifact
-    assert secret not in json.dumps(messages)
-    assert secret not in json.dumps(context.shadow_messages())
-    assert secret.encode() not in context.path.read_bytes()
+    assert SECRET not in json.dumps(messages)
+    assert SECRET not in json.dumps(context.shadow_messages())
+    assert SECRET.encode() not in context.path.read_bytes()
 
 
 def test_failed_scanner_artifact_purge_rolls_back_sync_state(tmp_path):
-    secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
     path = tmp_path / "folds.sqlite3"
     unreadable_artifact = tmp_path / "artifact-directory"
     unreadable_artifact.mkdir()
-    messages = tool_exchange("leak", {}, f"diagnostic {secret}")
-    context = FoldingContext(path, "session")
+    messages = tool_exchange("leak", {}, f"diagnostic {SECRET}")
+    context = context_for(tmp_path, config=None)
     context.register_purge_path(unreadable_artifact)
 
     with pytest.raises(FoldError, match="could not purge external artifact"):
         context.sync(messages, {"leak": noop_tool(name="leak")})
 
     context.record_request([])
-    row_counts = {
-        table: context._db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-        for table in ("messages", "entries", "span_state", "tool_calls", "folds")
-    }
-    assert row_counts == {
+    assert table_counts(context) == {
         "messages": 0,
         "entries": 0,
         "span_state": 0,
@@ -588,19 +635,18 @@ def test_failed_scanner_artifact_purge_rolls_back_sync_state(tmp_path):
     assert context._shadow_ref is None
     assert context._vacuum_pending is False
     assert context.shadow_messages() == []
-    assert secret.encode() not in path.read_bytes()
+    assert SECRET.encode() not in path.read_bytes()
     request_id = context.projection_chain()[0]["projection_id"]
     assert context.reconstruct_projection(request_id) == []
     context.close()
 
-    resumed = FoldingContext(path, "session")
+    resumed = context_for(tmp_path, config=None)
     assert resumed.shadow_messages() == []
     assert resumed.span_ids() == []
-    assert secret.encode() not in path.read_bytes()
+    assert SECRET.encode() not in path.read_bytes()
 
 
 def test_post_scanner_failure_rolls_back_the_whole_sync_transaction(tmp_path):
-    secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
     path = tmp_path / "folds.sqlite3"
 
     class FailingAfterScannerContext(FoldingContext):
@@ -613,7 +659,7 @@ def test_post_scanner_failure_rolls_back_the_whole_sync_transaction(tmp_path):
             super()._event(event, **fields)
 
     context = FailingAfterScannerContext(path, "session")
-    messages = tool_exchange("leak", {}, f"diagnostic {secret}")
+    messages = tool_exchange("leak", {}, f"diagnostic {SECRET}")
     before = deepcopy(messages)
 
     with pytest.raises(RuntimeError, match="forced post-scanner failure"):
@@ -621,22 +667,12 @@ def test_post_scanner_failure_rolls_back_the_whole_sync_transaction(tmp_path):
 
     assert messages == before
     context.record_request([])
-    row_counts = {
-        table: context._db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-        for table in (
-            "messages",
-            "entries",
-            "span_state",
-            "tool_calls",
-            "folds",
-        )
-    }
-    assert set(row_counts.values()) == {0}
+    assert set(table_counts(context).values()) == {0}
     assert context._active_ids == []
     assert context._snapshots == []
     assert context._shadow_ref is None
     assert context._vacuum_pending is False
-    assert secret.encode() not in path.read_bytes()
+    assert SECRET.encode() not in path.read_bytes()
 
     context.sync(messages, {"leak": noop_tool(name="leak")})
 
@@ -646,35 +682,30 @@ def test_post_scanner_failure_rolls_back_the_whole_sync_transaction(tmp_path):
     assert stored_result["scrubbed"] == 1
     assert context.state("m2.r0") == "purged"
     assert context._db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 3
-    assert secret not in json.dumps(messages)
-    assert secret.encode() not in path.read_bytes()
+    assert SECRET not in json.dumps(messages)
+    assert SECRET.encode() not in path.read_bytes()
     context.close()
 
-    resumed = FoldingContext(path, "session")
+    resumed = context_for(tmp_path, config=None)
     assert len(resumed.shadow_messages()) == 3
     assert resumed.state("m2.r0") == "purged"
-    assert secret.encode() not in path.read_bytes()
+    assert SECRET.encode() not in path.read_bytes()
 
 
 def test_failed_scanner_sync_rolls_back_prior_heuristic_mutations(tmp_path):
-    secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
     unreadable_artifact = tmp_path / "artifact-directory"
     unreadable_artifact.mkdir()
     messages = [
         *tool_exchange("first", {}, "duplicate", call_id="call_0"),
         *tool_exchange("second", {}, "duplicate", call_id="call_1"),
-        *tool_exchange("leak", {}, f"diagnostic {secret}", call_id="call_2"),
+        *tool_exchange("leak", {}, f"diagnostic {SECRET}", call_id="call_2"),
     ]
     tools = {
         "first": noop_tool(name="first"),
         "second": noop_tool(name="second"),
         "leak": noop_tool(name="leak"),
     }
-    context = FoldingContext(
-        tmp_path / "folds.sqlite3",
-        "session",
-        config=FoldConfig(min_span_tokens=0),
-    )
+    context = context_for(tmp_path)
     context.register_purge_path(unreadable_artifact)
 
     with pytest.raises(FoldError, match="could not purge external artifact"):
@@ -688,15 +719,33 @@ def test_failed_scanner_sync_rolls_back_prior_heuristic_mutations(tmp_path):
     assert context._snapshots == []
 
 
-def test_scanner_purges_a_complete_multiline_private_key_from_every_copy(tmp_path):
-    private_key = (
-        "-----BEGIN RSA PRIVATE KEY-----\n"
-        "MIIEowIBAAKCAQEAu7QxYzN4R0VhNlVmd0J2N1FZSkVnNVhV\n"
-        "Q29udGV4dEZvbGRpbmdEaXN0aW5jdGl2ZUJvZHlGcmFnbWVudA==\n"
-        "-----END RSA PRIVATE KEY-----"
-    )
-    body_fragment = "EaXN0aW5jdGl2ZUJvZHlGcmFnbWVudA"
-    path = tmp_path / "folds.sqlite3"
+@pytest.mark.parametrize(
+    ("private_key", "body_fragments"),
+    [
+        pytest.param(
+            "-----BEGIN RSA PRIVATE KEY-----\n"
+            "MIIEowIBAAKCAQEAu7QxYzN4R0VhNlVmd0J2N1FZSkVnNVhV\n"
+            "Q29udGV4dEZvbGRpbmdEaXN0aW5jdGl2ZUJvZHlGcmFnbWVudA==\n"
+            "-----END RSA PRIVATE KEY-----",
+            ("EaXN0aW5jdGl2ZUJvZHlGcmFnbWVudA",),
+            id="complete_key",
+        ),
+        pytest.param(
+            # an AWS key id sits inside the PEM body: the outer match must be
+            # scrubbed before the inner one, or the inner scrub tears the PEM
+            "-----BEGIN RSA PRIVATE KEY-----\n"
+            "MIIEowIBAAKCAQEAZXh0ZXJuYWxQZW1Cb2R5RnJhZ21lbnQx\n"
+            "AKIAABCDEFGHIJKLMNOP\n"
+            "RGlzdGluY3RpdmVPdXRlclBlbUJvZHlSZW1uYW50\n"
+            "-----END RSA PRIVATE KEY-----",
+            ("AKIAABCDEFGHIJKLMNOP", "RGlzdGluY3RpdmVPdXRlclBlbUJvZHlSZW1uYW50"),
+            id="outer_pem_before_inner_credential",
+        ),
+    ],
+)
+def test_scanner_purges_a_multiline_private_key_from_every_copy(
+    tmp_path, private_key, body_fragments
+):
     session_path = tmp_path / "session.jsonl"
     actions_path = tmp_path / "actions.jsonl"
     session_path.write_text(
@@ -717,38 +766,25 @@ def test_scanner_purges_a_complete_multiline_private_key_from_every_copy(tmp_pat
         "inspect_key": noop_tool(name="inspect_key"),
         "leak": noop_tool(name="leak"),
     }
-    context = FoldingContext(path, "session", session_log_path=session_path)
+    context = context_for(tmp_path, config=None, session_log_path=session_path)
     context.register_purge_path(actions_path)
     context.sync(messages, tools)
     context.record_request(context.project(messages))
     projection_id = context.projection_chain()[0]["projection_id"]
-    messages.extend(
-        [
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [{
-                    "id": "call_1",
-                    "type": "function",
-                    "function": {
-                        "name": "leak",
-                        "arguments": json.dumps({"private_key": private_key}),
-                    },
-                }],
-            },
-            {
-                "role": "tool",
-                "tool_call_id": "call_1",
-                "content": f"diagnostic output\n{private_key}",
-            },
-        ]
+    messages.extend(  # the call/result pair only, appended to the open turn
+        tool_exchange(
+            "leak",
+            {"private_key": private_key},
+            f"diagnostic output\n{private_key}",
+            call_id="call_1",
+        )[1:]
     )
 
     context.sync(messages, tools)
 
     fragments = (
         "-----BEGIN RSA PRIVATE KEY-----",
-        body_fragment,
+        *body_fragments,
         "-----END RSA PRIVATE KEY-----",
     )
     text_copies = (
@@ -761,15 +797,11 @@ def test_scanner_purges_a_complete_multiline_private_key_from_every_copy(tmp_pat
     )
     assert context.state("m4.r0") == "purged"
     assert all(fragment not in copy for fragment in fragments for copy in text_copies)
-    database_bytes = path.read_bytes()
+    database_bytes = context.path.read_bytes()
     assert all(fragment.encode() not in database_bytes for fragment in fragments)
 
 
 def test_scanner_remaps_identifiers_without_colliding_with_an_existing_alias(tmp_path):
-    secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
-    existing_alias = (
-        "redacted_db3qobsommarzjeek2fytgek5zgie47kkosagadvfuywhxw7mraa"
-    )
     path = tmp_path / "folds.sqlite3"
     messages = [
         {"role": "user", "content": "inspect"},
@@ -777,34 +809,26 @@ def test_scanner_remaps_identifiers_without_colliding_with_an_existing_alias(tmp
             "role": "assistant",
             "content": None,
             "tool_calls": [
-                {
-                    "id": secret,
-                    "type": "function",
-                    "function": {"name": "secret_tool", "arguments": "{}"},
-                },
-                {
-                    "id": existing_alias,
-                    "type": "function",
-                    "function": {"name": "alias_tool", "arguments": "{}"},
-                },
+                tool_call("secret_tool", {}, call_id=SECRET),
+                tool_call("alias_tool", {}, call_id=ALIAS),
             ],
         },
         {
             "role": "tool",
-            "tool_call_id": existing_alias,
+            "tool_call_id": ALIAS,
             "content": "existing alias result",
         },
     ]
     triggering_result = {
         "role": "tool",
-        "tool_call_id": secret,
-        "content": f"diagnostic {secret}",
+        "tool_call_id": SECRET,
+        "content": f"diagnostic {SECRET}",
     }
     tools = {
         "secret_tool": noop_tool(name="secret_tool"),
         "alias_tool": noop_tool(name="alias_tool"),
     }
-    context = FoldingContext(path, "session")
+    context = context_for(tmp_path, config=None)
     context.sync(messages, tools)
     context.record_request(deepcopy([*messages, triggering_result]))
     projection_id = context.projection_chain()[0]["projection_id"]
@@ -814,9 +838,9 @@ def test_scanner_remaps_identifiers_without_colliding_with_an_existing_alias(tmp
 
     live_calls = messages[1]["tool_calls"]
     remapped_id = live_calls[0]["id"]
-    assert remapped_id not in {secret, existing_alias}
-    assert live_calls[1]["id"] == existing_alias
-    assert messages[2]["tool_call_id"] == existing_alias
+    assert remapped_id not in {SECRET, ALIAS}
+    assert live_calls[1]["id"] == ALIAS
+    assert messages[2]["tool_call_id"] == ALIAS
     assert messages[3]["tool_call_id"] == remapped_id
     assert len({call["id"] for call in live_calls}) == 2
 
@@ -825,7 +849,7 @@ def test_scanner_remaps_identifiers_without_colliding_with_an_existing_alias(tmp
     ).fetchall()
     assert [(row["call_id"], row["tool_name"]) for row in stored_calls] == [
         (remapped_id, "secret_tool"),
-        (existing_alias, "alias_tool"),
+        (ALIAS, "alias_tool"),
     ]
     result_meta = {
         row["span_id"]: json.loads(row["meta_json"])
@@ -834,7 +858,7 @@ def test_scanner_remaps_identifiers_without_colliding_with_an_existing_alias(tmp
             "WHERE span_id IN ('m2.r0', 'm3.r0')"
         ).fetchall()
     }
-    assert result_meta["m2.r0"]["call_id"] == existing_alias
+    assert result_meta["m2.r0"]["call_id"] == ALIAS
     assert result_meta["m3.r0"]["call_id"] == remapped_id
 
     for copy in (
@@ -844,130 +868,40 @@ def test_scanner_remaps_identifiers_without_colliding_with_an_existing_alias(tmp
     ):
         calls = copy[1]["tool_calls"]
         assert calls[0]["id"] == remapped_id
-        assert calls[1]["id"] == existing_alias
-        assert copy[2]["tool_call_id"] == existing_alias
+        assert calls[1]["id"] == ALIAS
+        assert copy[2]["tool_call_id"] == ALIAS
         assert copy[3]["tool_call_id"] == remapped_id
-        assert secret not in json.dumps(copy)
+        assert SECRET not in json.dumps(copy)
     assert context.state("m3.r0") == "purged"
-    assert secret not in json.dumps(messages)
-    assert secret.encode() not in path.read_bytes()
-
-
-def test_scanner_scrubs_an_outer_pem_before_its_inner_credential_match(tmp_path):
-    inner_secret = "AKIAABCDEFGHIJKLMNOP"
-    private_key = (
-        "-----BEGIN RSA PRIVATE KEY-----\n"
-        "MIIEowIBAAKCAQEAZXh0ZXJuYWxQZW1Cb2R5RnJhZ21lbnQx\n"
-        f"{inner_secret}\n"
-        "RGlzdGluY3RpdmVPdXRlclBlbUJvZHlSZW1uYW50\n"
-        "-----END RSA PRIVATE KEY-----"
-    )
-    body_fragment = "RGlzdGluY3RpdmVPdXRlclBlbUJvZHlSZW1uYW50"
-    path = tmp_path / "folds.sqlite3"
-    session_path = tmp_path / "session.jsonl"
-    actions_path = tmp_path / "actions.jsonl"
-    session_path.write_text(
-        json.dumps({"type": "message", "message": {"role": "user", "content": private_key}})
-        + "\n"
-    )
-    actions_path.write_text(
-        json.dumps({"name": "inspect_key", "args": {"private_key": private_key}})
-        + "\n"
-    )
-    messages = tool_exchange(
-        "inspect_key", {"private_key": private_key}, "key queued for inspection"
-    )
-    messages[0]["content"] = f"inspect this key\n{private_key}"
-    tools = {
-        "inspect_key": noop_tool(name="inspect_key"),
-        "leak": noop_tool(name="leak"),
-    }
-    context = FoldingContext(path, "session", session_log_path=session_path)
-    context.register_purge_path(actions_path)
-    context.sync(messages, tools)
-    context.record_request(context.project(messages))
-    projection_id = context.projection_chain()[0]["projection_id"]
-    messages.extend(
-        [
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [{
-                    "id": "call_1",
-                    "type": "function",
-                    "function": {
-                        "name": "leak",
-                        "arguments": json.dumps({"private_key": private_key}),
-                    },
-                }],
-            },
-            {
-                "role": "tool",
-                "tool_call_id": "call_1",
-                "content": f"diagnostic output\n{private_key}",
-            },
-        ]
-    )
-
-    context.sync(messages, tools)
-
-    fragments = (
-        "-----BEGIN RSA PRIVATE KEY-----",
-        inner_secret,
-        body_fragment,
-        "-----END RSA PRIVATE KEY-----",
-    )
-    text_copies = (
-        json.dumps(messages),
-        json.dumps(context.shadow_messages()),
-        json.dumps(context.project(messages)),
-        json.dumps(context.reconstruct_projection(projection_id)),
-        session_path.read_text(),
-        actions_path.read_text(),
-    )
-    assert context.state("m4.r0") == "purged"
-    assert all(fragment not in copy for fragment in fragments for copy in text_copies)
-    database_bytes = path.read_bytes()
-    assert all(fragment.encode() not in database_bytes for fragment in fragments)
+    assert SECRET not in json.dumps(messages)
+    assert SECRET.encode() not in path.read_bytes()
 
 
 def test_scanner_identifier_inventory_includes_registered_jsonl_records(tmp_path):
-    secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
-    existing_alias = (
-        "redacted_db3qobsommarzjeek2fytgek5zgie47kkosagadvfuywhxw7mraa"
-    )
     actions_path = tmp_path / "actions.jsonl"
     assistant_record = {
         "kind": "unknown_wrapper",
         "envelope": {
             "role": "assistant",
             "tool_calls": [
-                {
-                    "id": secret,
-                    "type": "function",
-                    "function": {"name": "secret_tool", "arguments": "{}"},
-                },
-                {
-                    "id": existing_alias,
-                    "type": "function",
-                    "function": {"name": "alias_tool", "arguments": "{}"},
-                },
+                tool_call("secret_tool", {}, call_id=SECRET),
+                tool_call("alias_tool", {}, call_id=ALIAS),
             ],
         },
     }
     secret_result = {
-        "envelope": {"role": "tool", "tool_call_id": secret, "content": "first"}
+        "envelope": {"role": "tool", "tool_call_id": SECRET, "content": "first"}
     }
     alias_result = {
         "envelope": {
             "role": "tool",
-            "tool_call_id": existing_alias,
+            "tool_call_id": ALIAS,
             "content": "second",
         }
     }
     nested_record = {
         "role": "audit",
-        "unknown": {"nested": [{"id": secret}, {"id": existing_alias}]},
+        "unknown": {"nested": [{"id": SECRET}, {"id": ALIAS}]},
     }
     actions_path.write_text(
         "\n".join(
@@ -981,8 +915,8 @@ def test_scanner_identifier_inventory_includes_registered_jsonl_records(tmp_path
         )
         + "\n"
     )
-    messages = tool_exchange("leak", {}, f"diagnostic {secret}")
-    context = FoldingContext(tmp_path / "folds.sqlite3", "session")
+    messages = tool_exchange("leak", {}, f"diagnostic {SECRET}")
+    context = context_for(tmp_path, config=None)
     context.register_purge_path(actions_path)
 
     context.sync(messages, {"leak": noop_tool(name="leak")})
@@ -994,19 +928,19 @@ def test_scanner_identifier_inventory_includes_registered_jsonl_records(tmp_path
     second_result = json.loads(lines[3])["envelope"]
     nested = json.loads(lines[4])
     remapped_id = assistant["tool_calls"][0]["id"]
-    assert remapped_id not in {secret, existing_alias}
-    assert assistant["tool_calls"][1]["id"] == existing_alias
+    assert remapped_id not in {SECRET, ALIAS}
+    assert assistant["tool_calls"][1]["id"] == ALIAS
     assert first_result["tool_call_id"] == remapped_id
-    assert second_result["tool_call_id"] == existing_alias
+    assert second_result["tool_call_id"] == ALIAS
     assert len({call["id"] for call in assistant["tool_calls"]}) == 2
     assert [item["id"] for item in nested["unknown"]["nested"]] == [
         remapped_id,
-        existing_alias,
+        ALIAS,
     ]
     assert assistant["role"] == "assistant"
     assert first_result["role"] == second_result["role"] == "tool"
     assert nested["role"] == "audit"
-    assert secret not in actions_path.read_text()
+    assert SECRET not in actions_path.read_text()
 
 
 def test_sensitive_reason_cannot_be_used_as_a_recoverable_fold(tmp_path):
@@ -1022,22 +956,16 @@ def test_sensitive_reason_cannot_be_used_as_a_recoverable_fold(tmp_path):
 
 
 def test_secret_scanner_scrubs_a_raw_mounted_session_on_resume(tmp_path):
-    secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
     session_path = tmp_path / "session.jsonl"
-    messages = tool_exchange("leak", {}, secret) + [
+    messages = tool_exchange("leak", {}, SECRET) + [
         {"role": "assistant", "content": "done"}
     ]
     SessionLog(session_path).record_turn(messages)
-    context = FoldingContext(
-        tmp_path / "folds.sqlite3",
-        "session",
-        session_log_path=session_path,
-        config=FoldConfig(min_span_tokens=0),
-    )
+    context = context_for(tmp_path, session_log_path=session_path)
 
     context.sync(messages, {"leak": noop_tool(name="leak")})
 
-    assert secret not in session_path.read_text()
+    assert SECRET not in session_path.read_text()
     assert SessionLog(session_path).load()[2]["content"] == (
         "[redacted — credential detected in tool output]"
     )
@@ -1095,9 +1023,7 @@ def test_projection_record_persists_canonical_snapshot_and_aligned_sources(tmp_p
     row = context._db.execute(
         "SELECT projection_json, source_ids_json FROM projections"
     ).fetchone()
-    assert row["projection_json"] == json.dumps(
-        outgoing, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    )
+    assert row["projection_json"] == canonical(outgoing)
     sources = json.loads(row["source_ids_json"])
     assert sources == ["message:m0", "message:m1", "message:m2"]
     assert len(sources) == len(outgoing)
@@ -1106,13 +1032,12 @@ def test_projection_record_persists_canonical_snapshot_and_aligned_sources(tmp_p
 def test_projection_without_matching_capture_uses_aligned_unknown_sources(tmp_path):
     # Regression caught: a process-local capture from a prior projection must
     # never be reused just because a caller supplies matching bytes later.
-    path = tmp_path / "folds.sqlite3"
-    first = FoldingContext(path, "session", config=FoldConfig(min_span_tokens=0))
+    first = context_for(tmp_path)
     messages = [{"role": "user", "content": "inspect"}]
     first.sync(messages)
     outgoing = first.project(messages)
     first.close()
-    resumed = FoldingContext(path, "session", config=FoldConfig(min_span_tokens=0))
+    resumed = context_for(tmp_path)
 
     resumed.record_request(outgoing)
 
@@ -1123,9 +1048,7 @@ def test_projection_without_matching_capture_uses_aligned_unknown_sources(tmp_pa
 def test_projection_with_misaligned_capture_uses_unknown_sources(tmp_path):
     # Regression caught: a matching hash is insufficient when the associated
     # provenance list cannot index every outgoing message exactly once.
-    context = FoldingContext(
-        tmp_path / "folds.sqlite3", "session", config=FoldConfig(min_span_tokens=0)
-    )
+    context = context_for(tmp_path)
     messages = [{"role": "user", "content": "inspect"}]
     context.sync(messages)
     outgoing = context.project(messages)
@@ -1160,9 +1083,7 @@ def test_tail_projection_snapshot_records_the_unfolded_span_source(tmp_path):
 def test_reconstruct_projection_rejects_unknown_malformed_and_corrupt_rows(tmp_path):
     # Regression caught: historical bytes must never be presented as audited
     # model input when their row is absent, malformed, or hash-corrupt.
-    context = FoldingContext(
-        tmp_path / "folds.sqlite3", "session", config=FoldConfig(min_span_tokens=0)
-    )
+    context = context_for(tmp_path)
     messages = [{"role": "user", "content": "inspect"}]
     context.sync(messages)
     context.record_request(context.project(messages))
@@ -1200,14 +1121,9 @@ def test_projection_erasure_rejects_invalid_structure_before_any_mutation(
 ):
     # Regression caught: zip-truncation and unchecked scanner snapshots could
     # silently bless malformed provenance after partially changing earlier rows.
-    secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
     messages = tool_exchange("read_file", {"path": "auth.py"}, "delete target")
-    messages[0]["content"] = f"inspect {secret}"
-    context = FoldingContext(
-        tmp_path / "folds.sqlite3",
-        "session",
-        config=FoldConfig(min_span_tokens=0),
-    )
+    messages[0]["content"] = f"inspect {SECRET}"
+    context = context_for(tmp_path)
     context.sync(messages, {"read_file": noop_tool(name="read_file")})
     context.record_request(context.project(messages))
     first_id = context.projection_chain()[0]["projection_id"]
@@ -1219,17 +1135,11 @@ def test_projection_erasure_rejects_invalid_structure_before_any_mutation(
         (projection_json, source_ids_json, second_id),
     )
     context._db.commit()
-    projections_before = [
-        dict(row)
-        for row in context._db.execute(
-            "SELECT projection_id, projection_hash, parent_hash, projection_json, "
-            "source_ids_json, redacted FROM projections ORDER BY projection_id"
-        ).fetchall()
-    ]
+    projections_before = projection_rows(context)
     shadow_before = context.shadow_messages()
     if erasure == "scanner":
         messages.extend(
-            tool_exchange("leak", {}, f"observed {secret}", call_id="call_1")
+            tool_exchange("leak", {}, f"observed {SECRET}", call_id="call_1")
         )
     live_before = deepcopy(messages)
 
@@ -1245,13 +1155,7 @@ def test_projection_erasure_rejects_invalid_structure_before_any_mutation(
                 },
             )
 
-    projections_after = [
-        dict(row)
-        for row in context._db.execute(
-            "SELECT projection_id, projection_hash, parent_hash, projection_json, "
-            "source_ids_json, redacted FROM projections ORDER BY projection_id"
-        ).fetchall()
-    ]
+    projections_after = projection_rows(context)
     assert projections_after == projections_before
     assert context.projection_chain()[0]["projection_id"] == first_id
     assert context.state("m2.r0") == "visible"
@@ -1266,26 +1170,16 @@ def test_projection_erasure_rejects_nonredacted_hash_tampering_and_rolls_back(
 ):
     # Regression caught: setting redacted after an erasure must not launder
     # unrelated bytes that already disagree with the immutable request hash.
-    secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
     messages = tool_exchange("read_file", {"path": "auth.py"}, "delete target")
-    messages[0]["content"] = f"inspect {secret}"
-    context = FoldingContext(
-        tmp_path / "folds.sqlite3",
-        "session",
-        config=FoldConfig(min_span_tokens=0),
-    )
+    messages[0]["content"] = f"inspect {SECRET}"
+    context = context_for(tmp_path)
     context.sync(messages, {"read_file": noop_tool(name="read_file")})
     context.record_request(context.project(messages))
     projection_id = context.projection_chain()[0]["projection_id"]
-    stored = context._db.execute(
-        "SELECT projection_json FROM projections WHERE projection_id = ?",
-        (projection_id,),
-    ).fetchone()
+    stored = stored_projection(context, projection_id)
     tampered = json.loads(stored["projection_json"])
     tampered[1]["content"] = "unrelated tampering"
-    tampered_json = json.dumps(
-        tampered, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    )
+    tampered_json = canonical(tampered)
     context._db.execute(
         "UPDATE projections SET projection_json = ? WHERE projection_id = ?",
         (tampered_json, projection_id),
@@ -1303,7 +1197,7 @@ def test_projection_erasure_rejects_nonredacted_hash_tampering_and_rolls_back(
         context.reconstruct_projection(projection_id)
     if erasure == "scanner":
         messages.extend(
-            tool_exchange("leak", {}, f"observed {secret}", call_id="call_1")
+            tool_exchange("leak", {}, f"observed {SECRET}", call_id="call_1")
         )
     live_before = deepcopy(messages)
 
@@ -1339,18 +1233,17 @@ def test_projection_erasure_rejects_nonredacted_hash_tampering_and_rolls_back(
 def test_schema_version_two_is_rejected_explicitly(tmp_path):
     # Regression caught: opening an unreleased v2 ledger without its immutable
     # request snapshots would make reconstruction silently incomplete.
-    path = tmp_path / "folds.sqlite3"
-    context = FoldingContext(path, "session")
+    context = context_for(tmp_path, config=None)
     context._db.execute("UPDATE schema_meta SET version = 2")
     context._db.commit()
     context.close()
 
     with pytest.raises(FoldError, match="schema version is incompatible"):
-        FoldingContext(path, "session")
+        context_for(tmp_path, config=None)
 
 
 def test_schema_version_three_uses_only_its_declared_tables(tmp_path):
-    context = FoldingContext(tmp_path / "folds.sqlite3", "session")
+    context = context_for(tmp_path, config=None)
 
     tables = {
         row["name"]
@@ -1375,8 +1268,7 @@ def test_schema_version_three_uses_only_its_declared_tables(tmp_path):
 
 
 def test_schema_version_three_rejects_the_undeclared_scanner_alias_table(tmp_path):
-    path = tmp_path / "folds.sqlite3"
-    context = FoldingContext(path, "session")
+    context = context_for(tmp_path, config=None)
     context._db.execute(
         "CREATE TABLE scanner_aliases ("
         "session_id TEXT NOT NULL, secret_sha TEXT NOT NULL, "
@@ -1386,7 +1278,7 @@ def test_schema_version_three_rejects_the_undeclared_scanner_alias_table(tmp_pat
     context.close()
 
     with pytest.raises(FoldError, match="schema.*incompatible"):
-        FoldingContext(path, "session")
+        context_for(tmp_path, config=None)
 
 
 def test_failed_checkpoint_rolls_back_visibility_and_hash_together(tmp_path, monkeypatch):
@@ -1409,11 +1301,10 @@ def test_failed_checkpoint_rolls_back_visibility_and_hash_together(tmp_path, mon
 def test_resume_rejects_a_config_that_would_change_historical_projection(tmp_path):
     # Regression caught: changing marker/token/rule configuration silently on
     # resume makes an old ledger produce different bytes.
-    path = tmp_path / "folds.sqlite3"
-    FoldingContext(path, "session", config=FoldConfig(chunk_tokens=100)).close()
+    context_for(tmp_path, config=FoldConfig(chunk_tokens=100)).close()
 
     with pytest.raises(FoldError, match="config does not match"):
-        FoldingContext(path, "session", config=FoldConfig(chunk_tokens=200))
+        context_for(tmp_path, config=FoldConfig(chunk_tokens=200))
 
 
 def test_pin_blocks_both_agent_and_heuristic_folds(tmp_path):
@@ -1484,11 +1375,7 @@ def test_user_delete_redacts_only_affected_stored_projection_sources(tmp_path):
     # deletion must still respect message/span provenance instead of prose.
     messages = tool_exchange("noop", {}, "true")
     messages[0]["content"] = "keep the true branch intact"
-    context = FoldingContext(
-        tmp_path / "folds.sqlite3",
-        "session",
-        config=FoldConfig(min_span_tokens=0),
-    )
+    context = context_for(tmp_path)
     context.sync(messages, {"noop": noop_tool()})
     outgoing = context.project(messages)
     context.record_request(outgoing)
@@ -1508,45 +1395,20 @@ def test_user_delete_redacts_only_affected_stored_projection_sources(tmp_path):
 def test_sensitive_scan_redacts_stored_requests_without_changing_hash_chain(tmp_path):
     # Regression caught: scanner purging a new tool result must scrub every
     # older model-boundary snapshot that carried the same credential.
-    secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
-    messages = [{"role": "user", "content": f"inspect {secret}"}]
-    context = FoldingContext(
-        tmp_path / "folds.sqlite3",
-        "session",
-        config=FoldConfig(min_span_tokens=0),
-    )
+    messages = [{"role": "user", "content": f"inspect {SECRET}"}]
+    context = context_for(tmp_path)
     context.sync(messages)
     context.record_request(context.project(messages))
     before = context.projection_chain()[0]
     projection_id = before["projection_id"]
-    messages.extend(
-        [
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
-                    {
-                        "id": "call_0",
-                        "type": "function",
-                        "function": {
-                            "name": "leak",
-                            "arguments": json.dumps({"token": secret}),
-                        },
-                    }
-                ],
-            },
-            {
-                "role": "tool",
-                "tool_call_id": "call_0",
-                "content": f"observed {secret} in output",
-            },
-        ]
+    messages.extend(  # the call/result pair only, appended to the open turn
+        tool_exchange("leak", {"token": SECRET}, f"observed {SECRET} in output")[1:]
     )
 
     context.sync(messages, {"leak": noop_tool(name="leak")})
 
     after = context.projection_chain()[0]
-    assert secret not in json.dumps(context.reconstruct_projection(projection_id))
+    assert SECRET not in json.dumps(context.reconstruct_projection(projection_id))
     assert after["redacted"] is True
     assert after["projection_hash"] == before["projection_hash"]
     assert after["parent_hash"] == before["parent_hash"]
@@ -1555,14 +1417,9 @@ def test_sensitive_scan_redacts_stored_requests_without_changing_hash_chain(tmp_
 def test_sensitive_scan_can_redact_a_valid_already_redacted_projection(tmp_path):
     # Regression caught: an intentional prior erasure no longer reproduces the
     # original hash, but its valid aligned snapshot must support later erasure.
-    secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
     messages = tool_exchange("read_file", {"path": "auth.py"}, "delete target")
-    messages[0]["content"] = f"inspect {secret}"
-    context = FoldingContext(
-        tmp_path / "folds.sqlite3",
-        "session",
-        config=FoldConfig(min_span_tokens=0),
-    )
+    messages[0]["content"] = f"inspect {SECRET}"
+    context = context_for(tmp_path)
     context.sync(messages, {"read_file": noop_tool(name="read_file")})
     context.record_request(context.project(messages))
     before = context.projection_chain()[0]
@@ -1573,7 +1430,7 @@ def test_sensitive_scan_can_redact_a_valid_already_redacted_projection(tmp_path)
     assert context.reconstruct_projection(projection_id)[2]["content"] == (
         "[deleted by user]"
     )
-    messages.extend(tool_exchange("leak", {}, f"observed {secret}", call_id="call_1"))
+    messages.extend(tool_exchange("leak", {}, f"observed {SECRET}", call_id="call_1"))
 
     context.sync(
         messages,
@@ -1585,7 +1442,7 @@ def test_sensitive_scan_can_redact_a_valid_already_redacted_projection(tmp_path)
 
     after_scan = context.projection_chain()[0]
     historical = context.reconstruct_projection(projection_id)
-    assert secret not in json.dumps(historical)
+    assert SECRET not in json.dumps(historical)
     assert historical[2]["content"] == "[deleted by user]"
     assert after_scan["redacted"] is True
     assert after_scan["projection_hash"] == before["projection_hash"]
@@ -1595,37 +1452,27 @@ def test_sensitive_scan_can_redact_a_valid_already_redacted_projection(tmp_path)
 def test_sensitive_scan_exhaustively_scrubs_stored_snapshot_data(tmp_path):
     # Regression caught: every snapshot value is a persisted credential copy,
     # while protocol keys and roles must remain usable after scanner cleanup.
-    secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
-    call_id = f"call-{secret}"
-    tool_name = f"leak-{secret}"
+    call_id = f"call-{SECRET}"
+    tool_name = f"leak-{SECRET}"
     snapshot = [
-        {"role": "user", "content": f"inspect {secret}", "opaque": secret},
+        {"role": "user", "content": f"inspect {SECRET}", "opaque": SECRET},
         {
             "role": "assistant",
-            "content": f"thinking about {secret}",
+            "content": f"thinking about {SECRET}",
             "tool_calls": [
-                {
-                    "id": call_id,
-                    "type": "function",
-                    "function": {
-                        "name": tool_name,
-                        "arguments": json.dumps({"token": secret, "copy": secret}),
-                    },
-                }
+                tool_call(tool_name, {"token": SECRET, "copy": SECRET}, call_id)
             ],
         },
-        {"role": "tool", "tool_call_id": call_id, "content": f"saw {secret}"},
+        {"role": "tool", "tool_call_id": call_id, "content": f"saw {SECRET}"},
     ]
-    context = FoldingContext(
-        tmp_path / "folds.sqlite3", "session", config=FoldConfig(min_span_tokens=0)
-    )
+    context = context_for(tmp_path)
     context.record_request(snapshot)
     projection_id = context.projection_chain()[0]["projection_id"]
 
     context.sync(deepcopy(snapshot), {tool_name: noop_tool(name=tool_name)})
 
     historical = context.reconstruct_projection(projection_id)
-    assert secret not in json.dumps(historical)
+    assert SECRET not in json.dumps(historical)
     assert historical[0]["role"] == "user"
     assert "opaque" in historical[0]
     assert historical[1]["tool_calls"][0]["id"] == historical[2]["tool_call_id"]
@@ -1635,13 +1482,12 @@ def test_user_delete_remains_purged_when_the_raw_session_log_is_resumed(tmp_path
     # Regression caught: the JSONL session log may still contain bytes erased
     # from the folding ledger. Resume must reapply the durable purge before it
     # compares or ingests that transcript.
-    path = tmp_path / "folds.sqlite3"
     context, messages = context_with_result(tmp_path, "delete me permanently")
     raw_session_log = deepcopy(messages)
     context.delete("m2.r0")
     context.close()
 
-    resumed = FoldingContext(path, "session", config=FoldConfig(min_span_tokens=0))
+    resumed = context_for(tmp_path)
     resumed.sync(raw_session_log)
 
     assert "delete me permanently" not in json.dumps(raw_session_log)
@@ -1668,12 +1514,7 @@ def test_user_delete_scrubs_the_external_session_log_when_mounted(tmp_path):
         + "\n"
     )
     database_path = tmp_path / "folds.sqlite3"
-    context = FoldingContext(
-        database_path,
-        "session",
-        session_log_path=session_path,
-        config=FoldConfig(min_span_tokens=0),
-    )
+    context = context_for(tmp_path, session_log_path=session_path)
     context.register_purge_path(actions_path)
     context.sync(messages, {"noop": noop_tool()})
     context.fold(
@@ -1701,11 +1542,7 @@ def test_user_delete_preserves_unrelated_prose_containing_common_payloads(
         *tool_exchange("noop", {}, payload),
         {"role": "user", "content": f"the word {payload} here is unrelated"},
     ]
-    context = FoldingContext(
-        tmp_path / "folds.sqlite3",
-        "session",
-        config=FoldConfig(min_span_tokens=0),
-    )
+    context = context_for(tmp_path)
     context.sync(messages, {"noop": noop_tool()})
     system_before = deepcopy(messages[0])
     user_before = deepcopy(messages[-1])
@@ -1734,28 +1571,14 @@ def test_incompatible_legacy_schema_fails_with_an_explicit_version_error(tmp_pat
 )
 def test_user_delete_scrubs_short_tool_input_from_every_local_copy(tmp_path, payload):
     messages = tool_exchange("write", {"content": payload}, "ok")
-    tool = Tool(
-        name="write",
-        description="consume content",
-        parameters={
-            "type": "object",
-            "properties": {"content": {"type": "string"}},
-            "required": ["content"],
-        },
-        execute=lambda content: "ok",
-        foldable_inputs=("content",),
-    )
+    tool = foldable_tool()
     database_path = tmp_path / "folds.sqlite3"
     actions_path = tmp_path / "actions.jsonl"
     actions_path.write_text(
         json.dumps({"actor": "parent", "name": "write", "args": {"content": payload}})
         + "\n"
     )
-    context = FoldingContext(
-        database_path,
-        "session",
-        config=FoldConfig(min_span_tokens=0),
-    )
+    context = context_for(tmp_path)
     context.register_purge_path(actions_path)
     context.sync(messages, {"write": tool})
 
@@ -1779,43 +1602,15 @@ def test_user_delete_of_tool_input_only_rewrites_its_selected_call_field(tmp_pat
             "role": "assistant",
             "content": "the true status prose is unrelated",
             "tool_calls": [
-                {
-                    "id": "call_0",
-                    "type": "function",
-                    "function": {
-                        "name": "write",
-                        "arguments": json.dumps(
-                            {"content": "true", "note": "keep true"}
-                        ),
-                    },
-                },
-                {
-                    "id": "call_1",
-                    "type": "function",
-                    "function": {
-                        "name": "noop",
-                        "arguments": json.dumps({"value": "true"}),
-                    },
-                },
+                tool_call("write", {"content": "true", "note": "keep true"}, "call_0"),
+                tool_call("noop", {"value": "true"}, "call_1"),
             ],
         },
         {"role": "tool", "tool_call_id": "call_0", "content": "written"},
         {"role": "tool", "tool_call_id": "call_1", "content": "unrelated"},
     ]
-    write = Tool(
-        name="write",
-        description="consume content",
-        parameters={
-            "type": "object",
-            "properties": {"content": {"type": "string"}},
-            "required": ["content"],
-        },
-        execute=lambda content: "written",
-        foldable_inputs=("content",),
-    )
-    context = FoldingContext(
-        tmp_path / "folds.sqlite3", "session", config=FoldConfig(min_span_tokens=0)
-    )
+    write = foldable_tool()
+    context = context_for(tmp_path)
     context.sync(messages, {"write": write, "noop": noop_tool()})
     assistant_before = deepcopy(messages[1])
     unrelated_meta_before = context._entry("m3.r0")["meta_json"]
@@ -1842,20 +1637,8 @@ def test_user_delete_of_tool_input_only_rewrites_its_selected_call_field(tmp_pat
 
 def test_user_delete_of_tool_input_preserves_unrelated_metadata_fields(tmp_path):
     messages = tool_exchange("write", {"content": "true", "note": "keep true"}, "written")
-    write = Tool(
-        name="write",
-        description="consume content",
-        parameters={
-            "type": "object",
-            "properties": {"content": {"type": "string"}},
-            "required": ["content"],
-        },
-        execute=lambda content: "written",
-        foldable_inputs=("content",),
-    )
-    context = FoldingContext(
-        tmp_path / "folds.sqlite3", "session", config=FoldConfig(min_span_tokens=0)
-    )
+    write = foldable_tool()
+    context = context_for(tmp_path)
     context.sync(messages, {"write": write})
 
     context.delete("m1.i0")
@@ -1889,45 +1672,21 @@ def test_user_delete_metadata_scopes_reused_call_ids_to_their_owner_message(tmp_
             call_id="reused",
         )
     )
-    content_tool = Tool(
-        name="write_content",
-        description="consume content",
-        parameters={"type": "object", "properties": {"content": {"type": "string"}}},
-        execute=lambda content: "first result",
-        foldable_inputs=("content",),
-    )
-    body_tool = Tool(
-        name="write_body",
-        description="consume body",
-        parameters={"type": "object", "properties": {"body": {"type": "string"}}},
-        execute=lambda body: "second result",
-        foldable_inputs=("body",),
-    )
-    context = FoldingContext(
-        tmp_path / "folds.sqlite3", "session", config=FoldConfig(min_span_tokens=0)
-    )
+    content_tool = foldable_tool("write_content")
+    body_tool = foldable_tool("write_body", field="body")
+    context = context_for(tmp_path)
     context.sync(messages, {"write_content": content_tool, "write_body": body_tool})
     first_before = deepcopy(messages[1])
     second_before = deepcopy(messages[4])
     first_request = deepcopy(messages[:3])
-    first_hash = hashlib.sha256(
-        json.dumps(
-            first_request, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-        ).encode()
-    ).hexdigest()
     context._last_projection_sources = (
-        first_hash,
+        canonical_hash(first_request),
         ["message:m0", "message:m1", "message:m2"],
     )
     context.record_request(first_request)
     second_request = deepcopy(messages[3:])
-    second_hash = hashlib.sha256(
-        json.dumps(
-            second_request, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-        ).encode()
-    ).hexdigest()
     context._last_projection_sources = (
-        second_hash,
+        canonical_hash(second_request),
         ["message:m3", "message:m4", "message:m5"],
     )
     context.record_request(second_request)
@@ -1988,45 +1747,15 @@ def test_user_delete_redacts_all_selected_inputs_in_one_stored_message(tmp_path)
             "role": "assistant",
             "content": None,
             "tool_calls": [
-                {
-                    "id": "call_0",
-                    "type": "function",
-                    "function": {
-                        "name": "write",
-                        "arguments": json.dumps(
-                            {"content": payload, "note": "keep first"}
-                        ),
-                    },
-                },
-                {
-                    "id": "call_1",
-                    "type": "function",
-                    "function": {
-                        "name": "write",
-                        "arguments": json.dumps(
-                            {"content": payload, "note": "keep second"}
-                        ),
-                    },
-                },
+                tool_call("write", {"content": payload, "note": "keep first"}, "call_0"),
+                tool_call("write", {"content": payload, "note": "keep second"}, "call_1"),
             ],
         },
         {"role": "tool", "tool_call_id": "call_0", "content": "written first"},
         {"role": "tool", "tool_call_id": "call_1", "content": "written second"},
     ]
-    write = Tool(
-        name="write",
-        description="consume content",
-        parameters={
-            "type": "object",
-            "properties": {"content": {"type": "string"}},
-            "required": ["content"],
-        },
-        execute=lambda content: "written",
-        foldable_inputs=("content",),
-    )
-    context = FoldingContext(
-        tmp_path / "folds.sqlite3", "session", config=FoldConfig(min_span_tokens=0)
-    )
+    write = foldable_tool()
+    context = context_for(tmp_path)
     context.sync(messages, {"write": write})
     context.record_request(context.project(messages))
     projection_id = context.projection_chain()[-1]["projection_id"]
@@ -2046,25 +1775,14 @@ def test_user_delete_redacts_all_selected_inputs_in_one_stored_message(tmp_path)
 
 def test_user_delete_purges_duplicate_entry_and_live_shadow_copies(tmp_path):
     payload = "ERASE_DUPLICATE_77"
-    messages = tool_exchange("first", {}, payload)
-    messages.extend(tool_exchange("second", {}, payload, call_id="call_1"))
-    database_path = tmp_path / "folds.sqlite3"
-    context = FoldingContext(
-        database_path,
-        "session",
-        config=FoldConfig(min_span_tokens=0),
-    )
-    context.sync(
-        messages,
-        {"first": noop_tool(name="first"), "second": noop_tool(name="second")},
-    )
+    context, messages = two_results(tmp_path, payload, payload)
 
     context.delete("m2.r0")
 
     assert context.state("m5.r0") == "purged"
     assert payload not in json.dumps(messages)
     assert payload not in json.dumps(context.project(messages))
-    assert payload.encode() not in database_path.read_bytes()
+    assert payload.encode() not in context.path.read_bytes()
 
 
 def test_user_delete_of_short_payload_preserves_message_structure(tmp_path):
@@ -2072,11 +1790,7 @@ def test_user_delete_of_short_payload_preserves_message_structure(tmp_path):
         {"role": "assistant", "content": "task remains"}
     ]
     messages[0]["content"] = "task"
-    context = FoldingContext(
-        tmp_path / "folds.sqlite3",
-        "session",
-        config=FoldConfig(min_span_tokens=0),
-    )
+    context = context_for(tmp_path)
     context.sync(messages, {"noop": noop_tool()})
 
     context.delete("m2.r0")
@@ -2090,23 +1804,8 @@ def test_user_delete_of_short_payload_preserves_message_structure(tmp_path):
 
 def test_user_delete_preserves_unrelated_result_with_payload_across_chunks(tmp_path):
     payload = "XYZ12345"
-    messages = tool_exchange("first", {}, payload)
-    messages.extend(
-        tool_exchange(
-            "second",
-            {},
-            f"prefix {payload} suffix",
-            call_id="call_1",
-        )
-    )
-    context = FoldingContext(
-        tmp_path / "folds.sqlite3",
-        "session",
-        config=FoldConfig(min_span_tokens=0, chunk_tokens=3),
-    )
-    context.sync(
-        messages,
-        {"first": noop_tool(name="first"), "second": noop_tool(name="second")},
+    context, messages = two_results(
+        tmp_path, payload, f"prefix {payload} suffix", chunk_tokens=3
     )
 
     context.delete("m2.r0")
@@ -2125,22 +1824,8 @@ def test_user_delete_does_not_reconcile_tool_inputs_as_result_chunks(tmp_path):
     removed = "REMOVE_THIS_RESULT"
     messages = tool_exchange("write", {"content": retained}, "ok")
     messages.extend(tool_exchange("noop", {}, removed, call_id="call_1"))
-    write = Tool(
-        name="write",
-        description="consume content",
-        parameters={
-            "type": "object",
-            "properties": {"content": {"type": "string"}},
-            "required": ["content"],
-        },
-        execute=lambda content: "ok",
-        foldable_inputs=("content",),
-    )
-    context = FoldingContext(
-        tmp_path / "folds.sqlite3",
-        "session",
-        config=FoldConfig(min_span_tokens=0, chunk_tokens=3),
-    )
+    write = foldable_tool()
+    context = context_for(tmp_path, chunk_tokens=3)
     context.sync(messages, {"write": write, "noop": noop_tool()})
 
     context.delete("m5.r0")
@@ -2151,24 +1836,9 @@ def test_user_delete_does_not_reconcile_tool_inputs_as_result_chunks(tmp_path):
 
 def test_user_delete_preserves_unrelated_inactive_crash_tail_chunks(tmp_path):
     payload = "XYZ12345"
-    completed = tool_exchange("first", {}, payload) + [
-        {"role": "assistant", "content": "done"}
-    ]
-    crashed = completed + tool_exchange(
-        "second",
-        {},
-        f"prefix {payload} suffix",
-        call_id="call_1",
-    )
-    context = FoldingContext(
-        tmp_path / "folds.sqlite3",
-        "session",
-        config=FoldConfig(min_span_tokens=0, chunk_tokens=3),
-    )
-    context.sync(
-        crashed,
-        {"first": noop_tool(name="first"), "second": noop_tool(name="second")},
-    )
+    completed, crashed = completed_then_crashed(payload, f"prefix {payload} suffix")
+    context = context_for(tmp_path, chunk_tokens=3)
+    context.sync(crashed, first_second_tools())
     context.sync(completed, {"first": noop_tool(name="first")})
 
     context.delete("m2.r0")
@@ -2185,16 +1855,9 @@ def test_user_delete_preserves_unrelated_inactive_crash_tail_chunks(tmp_path):
 
 def test_user_delete_purges_an_inactive_exact_duplicate_and_its_chunks(tmp_path):
     payload = "alpha beta gamma delta epsilon zeta"
-    completed = tool_exchange("first", {}, payload) + [
-        {"role": "assistant", "content": "done"}
-    ]
-    crashed = completed + tool_exchange("second", {}, payload, call_id="call_1")
-    context = FoldingContext(
-        tmp_path / "folds.sqlite3",
-        "session",
-        config=FoldConfig(min_span_tokens=0, chunk_tokens=3),
-    )
-    tools = {"first": noop_tool(name="first"), "second": noop_tool(name="second")}
+    completed, crashed = completed_then_crashed(payload, payload)
+    context = context_for(tmp_path, chunk_tokens=3)
+    tools = first_second_tools()
     context.sync(crashed, tools)
     context.sync(completed, {"first": tools["first"]})
 
@@ -2211,23 +1874,8 @@ def test_user_delete_purges_an_inactive_exact_duplicate_and_its_chunks(tmp_path)
 
 def test_user_delete_reconciles_an_exact_duplicate_result_chunk(tmp_path):
     payload = "XYZ12345"
-    messages = tool_exchange("first", {}, payload)
-    messages.extend(
-        tool_exchange(
-            "second",
-            {},
-            f"prefix\n{payload}\nsuffix\n",
-            call_id="call_1",
-        )
-    )
-    context = FoldingContext(
-        tmp_path / "folds.sqlite3",
-        "session",
-        config=FoldConfig(min_span_tokens=0, chunk_tokens=3),
-    )
-    context.sync(
-        messages,
-        {"first": noop_tool(name="first"), "second": noop_tool(name="second")},
+    context, messages = two_results(
+        tmp_path, payload, f"prefix\n{payload}\nsuffix\n", chunk_tokens=3
     )
 
     context.delete("m2.r0")
@@ -2244,23 +1892,8 @@ def test_user_delete_reconciles_an_exact_duplicate_result_chunk(tmp_path):
 def test_user_delete_preserves_non_alias_indexed_siblings_with_common_payload(tmp_path):
     payload = "turn"
     marker = "[deleted by user]"
-    messages = tool_exchange("first", {}, payload)
-    messages.extend(
-        tool_exchange(
-            "second",
-            {},
-            "prefix turn stays\nturn\nturn",
-            call_id="call_1",
-        )
-    )
-    context = FoldingContext(
-        tmp_path / "folds.sqlite3",
-        "session",
-        config=FoldConfig(min_span_tokens=0, chunk_tokens=1),
-    )
-    context.sync(
-        messages,
-        {"first": noop_tool(name="first"), "second": noop_tool(name="second")},
+    context, messages = two_results(
+        tmp_path, payload, "prefix turn stays\nturn\nturn", chunk_tokens=1
     )
     child_ids = context.child_ids("m5.r0")
     before_children = {span_id: context.content(span_id) for span_id in child_ids}
@@ -2299,23 +1932,8 @@ def test_user_delete_rewrites_only_selected_chunk_in_stored_projection(tmp_path)
     # Regression caught: an indexed child aliases only part of its owning
     # message, so stored history must preserve the surrounding result prose.
     payload = "XYZ12345"
-    messages = tool_exchange("first", {}, payload)
-    messages.extend(
-        tool_exchange(
-            "second",
-            {},
-            f"prefix\n{payload}\nsuffix\n",
-            call_id="call_1",
-        )
-    )
-    context = FoldingContext(
-        tmp_path / "folds.sqlite3",
-        "session",
-        config=FoldConfig(min_span_tokens=0, chunk_tokens=3),
-    )
-    context.sync(
-        messages,
-        {"first": noop_tool(name="first"), "second": noop_tool(name="second")},
+    context, messages = two_results(
+        tmp_path, payload, f"prefix\n{payload}\nsuffix\n", chunk_tokens=3
     )
     context.record_request(context.project(messages))
     before = context.projection_chain()[-1]
@@ -2340,35 +1958,19 @@ def test_user_delete_redacts_indexed_alias_in_stored_unfolded_tail(tmp_path):
     # receive the same indexed-content deletion operation.
     payload = "XYZ12345"
     path = tmp_path / "folds.sqlite3"
-    messages = tool_exchange("first", {}, payload)
-    messages.extend(
-        tool_exchange(
-            "second",
-            {},
-            f"prefix\n{payload}\nsuffix\n",
-            call_id="call_1",
-        )
-    )
-    messages[3]["content"] = "keep unrelated source prose"
-    context = FoldingContext(
-        path,
-        "session",
-        config=FoldConfig(min_span_tokens=0, chunk_tokens=3),
-    )
-    context.sync(
-        messages,
-        {"first": noop_tool(name="first"), "second": noop_tool(name="second")},
+    context, messages = two_results(
+        tmp_path,
+        payload,
+        f"prefix\n{payload}\nsuffix\n",
+        chunk_tokens=3,
+        second_user="keep unrelated source prose",
     )
     context.fold("m5.r0", "finished", rich_note())
     context.checkpoint()
     context.unfold("m5.r0")
     context.record_request(context.project(messages))
     before = context.projection_chain()[-1]
-    stored = context._db.execute(
-        "SELECT projection_json, source_ids_json FROM projections "
-        "WHERE projection_id = ?",
-        (before["projection_id"],),
-    ).fetchone()
+    stored = stored_projection(context, before["projection_id"])
     sources = json.loads(stored["source_ids_json"])
     tail_index = sources.index("span:m5.r0")
     assert payload in json.loads(stored["projection_json"])[tail_index]["content"]
@@ -2389,10 +1991,7 @@ def test_user_delete_redacts_indexed_alias_in_stored_unfolded_tail(tmp_path):
     assert messages[5]["content"] == "prefix\n[deleted by user]\nsuffix\n"
     assert context.content("m5.r0") == "prefix\n[deleted by user]\nsuffix\n"
     assert context.state("m2.r0") == "purged"
-    projection_json = context._db.execute(
-        "SELECT projection_json FROM projections WHERE projection_id = ?",
-        (after["projection_id"],),
-    ).fetchone()["projection_json"]
+    projection_json = stored_projection(context, after["projection_id"])["projection_json"]
     assert payload not in projection_json
     assert payload.encode() not in path.read_bytes()
     assert after["projection_hash"] == before["projection_hash"]
@@ -2406,21 +2005,12 @@ def test_user_delete_redacts_indexed_child_alias_in_stored_unfolded_tail(tmp_pat
     payload = "XYZ12345"
     marker = "[deleted by user]"
     path = tmp_path / "folds.sqlite3"
-    messages = tool_exchange("first", {}, payload)
-    messages.extend(
-        tool_exchange(
-            "second",
-            {},
-            f"prefix\n{payload}\nsuffix\n",
-            call_id="call_1",
-        )
-    )
-    messages[3]["content"] = "keep unrelated source prose"
-    config = FoldConfig(min_span_tokens=0, chunk_tokens=3)
-    context = FoldingContext(path, "session", config=config)
-    context.sync(
-        messages,
-        {"first": noop_tool(name="first"), "second": noop_tool(name="second")},
+    context, messages = two_results(
+        tmp_path,
+        payload,
+        f"prefix\n{payload}\nsuffix\n",
+        chunk_tokens=3,
+        second_user="keep unrelated source prose",
     )
     child_id = "m5.r0.c1"
     assert context.content(child_id) == payload
@@ -2429,11 +2019,7 @@ def test_user_delete_redacts_indexed_child_alias_in_stored_unfolded_tail(tmp_pat
     context.unfold(child_id)
     context.record_request(context.project(messages))
     before = context.projection_chain()[-1]
-    stored = context._db.execute(
-        "SELECT projection_json, source_ids_json FROM projections "
-        "WHERE projection_id = ?",
-        (before["projection_id"],),
-    ).fetchone()
+    stored = stored_projection(context, before["projection_id"])
     sources = json.loads(stored["source_ids_json"])
     tail_index = sources.index(f"span:{child_id}")
     before_messages = json.loads(stored["projection_json"])
@@ -2454,10 +2040,7 @@ def test_user_delete_redacts_indexed_child_alias_in_stored_unfolded_tail(tmp_pat
     assert messages[5]["content"] == f"prefix\n{marker}\nsuffix\n"
     assert context.content("m5.r0") == f"prefix\n{marker}\nsuffix\n"
     assert context.state("m2.r0") == "purged"
-    projection_json = context._db.execute(
-        "SELECT projection_json FROM projections WHERE projection_id = ?",
-        (after["projection_id"],),
-    ).fetchone()["projection_json"]
+    projection_json = stored_projection(context, after["projection_id"])["projection_json"]
     assert payload not in projection_json
     assert payload.encode() not in path.read_bytes()
     assert after["projection_hash"] == before["projection_hash"]
@@ -2466,7 +2049,7 @@ def test_user_delete_redacts_indexed_child_alias_in_stored_unfolded_tail(tmp_pat
     projection_id = after["projection_id"]
     context.close()
 
-    resumed = FoldingContext(path, "session", config=config)
+    resumed = context_for(tmp_path, chunk_tokens=3)
     assert resumed.reconstruct_projection(projection_id) == historical
     assert payload not in json.dumps(resumed.reconstruct_projection(projection_id))
 
@@ -2478,22 +2061,12 @@ def test_user_delete_scopes_indexed_child_tail_redaction_to_body(
     # Regression caught: common payload text can also occur in a synthetic
     # tail's generated header, which is not provenance-owned result data.
     marker = "[deleted by user]"
-    path = tmp_path / "folds.sqlite3"
-    messages = tool_exchange("first", {}, payload)
-    messages.extend(
-        tool_exchange(
-            "second",
-            {},
-            f"prefix\n{payload}\nsuffix\n",
-            call_id="call_1",
-        )
-    )
-    messages[3]["content"] = f"unrelated {payload} prose remains"
-    config = FoldConfig(min_span_tokens=0, chunk_tokens=chunk_tokens)
-    context = FoldingContext(path, "session", config=config)
-    context.sync(
-        messages,
-        {"first": noop_tool(name="first"), "second": noop_tool(name="second")},
+    context, messages = two_results(
+        tmp_path,
+        payload,
+        f"prefix\n{payload}\nsuffix\n",
+        chunk_tokens=chunk_tokens,
+        second_user=f"unrelated {payload} prose remains",
     )
     child_id = next(
         span_id
@@ -2505,11 +2078,7 @@ def test_user_delete_scopes_indexed_child_tail_redaction_to_body(
     context.unfold(child_id)
     context.record_request(context.project(messages))
     before = context.projection_chain()[-1]
-    stored = context._db.execute(
-        "SELECT projection_json, source_ids_json FROM projections "
-        "WHERE projection_id = ?",
-        (before["projection_id"],),
-    ).fetchone()
+    stored = stored_projection(context, before["projection_id"])
     sources_before = json.loads(stored["source_ids_json"])
     tail_index = sources_before.index(f"span:{child_id}")
     before_tail = json.loads(stored["projection_json"])[tail_index]["content"]
@@ -2526,11 +2095,8 @@ def test_user_delete_scopes_indexed_child_tail_redaction_to_body(
             "content": f"[unfolded {child_id}, originally from {payload}]",
         }
     ]
-    malformed_json = json.dumps(
-        malformed, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    )
     context._last_projection_sources = (
-        hashlib.sha256(malformed_json.encode()).hexdigest(),
+        canonical_hash(malformed),
         [f"span:{child_id}"],
     )
     context.record_request(malformed)
@@ -2556,11 +2122,7 @@ def test_user_delete_scopes_indexed_child_tail_redaction_to_body(
     }
     assert messages[5]["content"] == f"prefix\n{marker}\nsuffix\n"
     assert context.content("m5.r0") == f"prefix\n{marker}\nsuffix\n"
-    stored_after = context._db.execute(
-        "SELECT projection_json, source_ids_json FROM projections "
-        "WHERE projection_id = ?",
-        (after["projection_id"],),
-    ).fetchone()
+    stored_after = stored_projection(context, after["projection_id"])
     assert json.loads(stored_after["source_ids_json"]) == sources_before
     stored_tail = json.loads(stored_after["projection_json"])[tail_index]["content"]
     assert stored_tail.partition("\n")[2] == after_body
@@ -2574,7 +2136,7 @@ def test_user_delete_scopes_indexed_child_tail_redaction_to_body(
     malformed_id = malformed_after["projection_id"]
     context.close()
 
-    resumed = FoldingContext(path, "session", config=config)
+    resumed = context_for(tmp_path, chunk_tokens=chunk_tokens)
     assert resumed.reconstruct_projection(projection_id) == historical
     assert resumed.reconstruct_projection(malformed_id) == malformed
 
@@ -2586,22 +2148,12 @@ def test_user_delete_targets_only_exact_blocks_in_stored_rendered_result(
     # Regression caught: an ordinary message source contains generated span
     # headers and sibling bodies, none of which belong to an exact child alias.
     marker = "[deleted by user]"
-    path = tmp_path / "folds.sqlite3"
-    messages = tool_exchange("first", {}, payload)
-    messages.extend(
-        tool_exchange(
-            "second",
-            {},
-            f"prefix {payload} stays\n{payload}\n{payload}",
-            call_id="call_1",
-        )
-    )
-    messages[3]["content"] = f"unrelated {payload} prose remains"
-    config = FoldConfig(min_span_tokens=0, chunk_tokens=chunk_tokens)
-    context = FoldingContext(path, "session", config=config)
-    context.sync(
-        messages,
-        {"first": noop_tool(name="first"), "second": noop_tool(name="second")},
+    context, messages = two_results(
+        tmp_path,
+        payload,
+        f"prefix {payload} stays\n{payload}\n{payload}",
+        chunk_tokens=chunk_tokens,
+        second_user=f"unrelated {payload} prose remains",
     )
     target_ids = [
         span_id
@@ -2611,11 +2163,7 @@ def test_user_delete_targets_only_exact_blocks_in_stored_rendered_result(
     assert len(target_ids) == 2
     context.record_request(context.project(messages))
     before = context.projection_chain()[-1]
-    stored = context._db.execute(
-        "SELECT projection_json, source_ids_json FROM projections "
-        "WHERE projection_id = ?",
-        (before["projection_id"],),
-    ).fetchone()
+    stored = stored_projection(context, before["projection_id"])
     sources_before = json.loads(stored["source_ids_json"])
     message_index = sources_before.index("message:m5")
     before_rendered = json.loads(stored["projection_json"])[message_index]["content"]
@@ -2680,11 +2228,7 @@ def test_user_delete_targets_only_exact_blocks_in_stored_rendered_result(
         "role": "user",
         "content": f"unrelated {payload} prose remains",
     }
-    stored_after = context._db.execute(
-        "SELECT projection_json, source_ids_json FROM projections "
-        "WHERE projection_id = ?",
-        (after["projection_id"],),
-    ).fetchone()
+    stored_after = stored_projection(context, after["projection_id"])
     assert json.loads(stored_after["source_ids_json"]) == sources_before
     assert json.loads(stored_after["projection_json"])[message_index] == historical[
         message_index
@@ -2695,7 +2239,7 @@ def test_user_delete_targets_only_exact_blocks_in_stored_rendered_result(
     projection_id = after["projection_id"]
     context.close()
 
-    resumed = FoldingContext(path, "session", config=config)
+    resumed = context_for(tmp_path, chunk_tokens=chunk_tokens)
     assert resumed.reconstruct_projection(projection_id) == historical
 
 
@@ -2703,7 +2247,6 @@ def test_user_delete_redacts_indexed_body_identical_to_its_generated_header(tmp_
     # Regression caught: the body can itself look exactly like its generated
     # header, so only structurally valid header/body candidates are ambiguous.
     marker = "[deleted by user]"
-    path = tmp_path / "folds.sqlite3"
     token_count = 0
     for _ in range(10):
         payload = f"[m5.r0.c1 · ~{token_count} tok]"
@@ -2713,27 +2256,19 @@ def test_user_delete_redacts_indexed_body_identical_to_its_generated_header(tmp_
         token_count = next_count
     assert count_text_tokens(payload) == token_count
 
-    messages = tool_exchange("first", {}, payload)
-    messages.extend(
-        tool_exchange("second", {}, f"prefix\n{payload}", call_id="call_1")
-    )
-    messages[3]["content"] = "unrelated body prose remains"
-    config = FoldConfig(min_span_tokens=0, chunk_tokens=token_count)
-    context = FoldingContext(path, "session", config=config)
-    context.sync(
-        messages,
-        {"first": noop_tool(name="first"), "second": noop_tool(name="second")},
+    context, messages = two_results(
+        tmp_path,
+        payload,
+        f"prefix\n{payload}",
+        chunk_tokens=token_count,
+        second_user="unrelated body prose remains",
     )
     target_id = "m5.r0.c1"
     assert context.content(target_id) == payload
 
     context.record_request(context.project(messages))
     before = context.projection_chain()[-1]
-    stored = context._db.execute(
-        "SELECT projection_json, source_ids_json FROM projections "
-        "WHERE projection_id = ?",
-        (before["projection_id"],),
-    ).fetchone()
+    stored = stored_projection(context, before["projection_id"])
     sources_before = json.loads(stored["source_ids_json"])
     message_index = sources_before.index("message:m5")
     before_rendered = json.loads(stored["projection_json"])[message_index]["content"]
@@ -2763,11 +2298,7 @@ def test_user_delete_redacts_indexed_body_identical_to_its_generated_header(tmp_
     }
     assert messages[5]["content"] == f"prefix\n{marker}"
     assert context.content("m5.r0") == f"prefix\n{marker}"
-    stored_after = context._db.execute(
-        "SELECT projection_json, source_ids_json FROM projections "
-        "WHERE projection_id = ?",
-        (after["projection_id"],),
-    ).fetchone()
+    stored_after = stored_projection(context, after["projection_id"])
     assert json.loads(stored_after["source_ids_json"]) == sources_before
     assert json.loads(stored_after["projection_json"])[message_index] == historical[
         message_index
@@ -2778,7 +2309,7 @@ def test_user_delete_redacts_indexed_body_identical_to_its_generated_header(tmp_
     projection_id = after["projection_id"]
     context.close()
 
-    resumed = FoldingContext(path, "session", config=config)
+    resumed = context_for(tmp_path, chunk_tokens=token_count)
     assert resumed.reconstruct_projection(projection_id) == historical
 
 
@@ -2787,31 +2318,13 @@ def test_user_delete_scopes_rendered_root_body_and_skips_malformed_layout(tmp_pa
     # without the deterministic header/body separator is unsafe to interpret.
     payload = "m5"
     marker = "[deleted by user]"
-    messages = tool_exchange("first", {}, payload)
-    messages.extend(
-        tool_exchange(
-            "second",
-            {},
-            f"prefix\n{payload}\nsuffix\n",
-            call_id="call_1",
-        )
-    )
-    config = FoldConfig(min_span_tokens=0, chunk_tokens=2)
-    context = FoldingContext(tmp_path / "folds.sqlite3", "session", config=config)
-    context.sync(
-        messages,
-        {"first": noop_tool(name="first"), "second": noop_tool(name="second")},
+    context, messages = two_results(
+        tmp_path, payload, f"prefix\n{payload}\nsuffix\n", chunk_tokens=2
     )
 
     def record_with_owner(content: str) -> dict:
         projection = [{"role": "tool", "tool_call_id": "call_1", "content": content}]
-        projection_json = json.dumps(
-            projection, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-        )
-        context._last_projection_sources = (
-            hashlib.sha256(projection_json.encode()).hexdigest(),
-            ["message:m5"],
-        )
+        context._last_projection_sources = (canonical_hash(projection), ["message:m5"])
         context.record_request(projection)
         return context.projection_chain()[-1]
 
@@ -2848,18 +2361,8 @@ def test_user_delete_rejects_ambiguous_render_without_partial_erasure(tmp_path):
     # Regression caught: two valid blocks for one target cannot be safely
     # attributed, and succeeding would leave selected bytes recoverable.
     payload = "m5"
-    messages = tool_exchange("first", {}, payload)
-    messages.extend(
-        tool_exchange("second", {}, f"prefix\n{payload}\nsuffix", call_id="call_1")
-    )
-    context = FoldingContext(
-        tmp_path / "folds.sqlite3",
-        "session",
-        config=FoldConfig(min_span_tokens=0, chunk_tokens=2),
-    )
-    context.sync(
-        messages,
-        {"first": noop_tool(name="first"), "second": noop_tool(name="second")},
+    context, messages = two_results(
+        tmp_path, payload, f"prefix\n{payload}\nsuffix", chunk_tokens=2
     )
     context.record_request(context.project(messages))
     duplicate_content = (
@@ -2868,37 +2371,19 @@ def test_user_delete_rejects_ambiguous_render_without_partial_erasure(tmp_path):
     duplicate_projection = [
         {"role": "tool", "tool_call_id": "call_1", "content": duplicate_content}
     ]
-    duplicate_json = json.dumps(
-        duplicate_projection,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
     context._last_projection_sources = (
-        hashlib.sha256(duplicate_json.encode()).hexdigest(),
+        canonical_hash(duplicate_projection),
         ["message:m5"],
     )
     context.record_request(duplicate_projection)
-    projections_before = [
-        dict(row)
-        for row in context._db.execute(
-            "SELECT projection_id, projection_hash, parent_hash, projection_json, "
-            "source_ids_json, redacted FROM projections ORDER BY projection_id"
-        ).fetchall()
-    ]
+    projections_before = projection_rows(context)
     shadow_before = context.shadow_messages()
     live_before = deepcopy(messages)
 
     with pytest.raises(ProjectionError, match="ambiguous"):
         context.delete("m2.r0")
 
-    projections_after = [
-        dict(row)
-        for row in context._db.execute(
-            "SELECT projection_id, projection_hash, parent_hash, projection_json, "
-            "source_ids_json, redacted FROM projections ORDER BY projection_id"
-        ).fetchall()
-    ]
+    projections_after = projection_rows(context)
     assert projections_after == projections_before
     assert all(row["redacted"] == 0 for row in projections_after)
     assert context.state("m2.r0") == "visible"
@@ -2963,9 +2448,7 @@ def test_user_delete_redacts_embedded_stored_notice_without_user_prose(tmp_path)
     messages = tool_exchange("noop", {}, payload) + [
         {"role": "user", "content": f"user prose keeps {payload}"}
     ]
-    context = FoldingContext(
-        tmp_path / "folds.sqlite3", "session", config=FoldConfig(min_span_tokens=0)
-    )
+    context = context_for(tmp_path)
     context.sync(messages, {"noop": noop_tool()})
     context._db.execute(
         "INSERT INTO notices(span_id, message_id, kind, content, created_turn, "
@@ -3001,16 +2484,14 @@ def test_resume_restores_only_provenance_targeted_messages_before_sync(tmp_path)
         )
     )
     pre_delete = deepcopy(messages)
-    path = tmp_path / "folds.sqlite3"
-    config = FoldConfig(min_span_tokens=0, chunk_tokens=3)
-    first = FoldingContext(path, "session", config=config)
-    tools = {"first": noop_tool(name="first"), "second": noop_tool(name="second")}
+    first = context_for(tmp_path, chunk_tokens=3)
+    tools = first_second_tools()
     first.sync(messages, tools)
     original_ids = first.span_ids()
     first.delete("m2.r0")
     first.close()
 
-    resumed = FoldingContext(path, "session", config=config)
+    resumed = context_for(tmp_path, chunk_tokens=3)
     resumed.sync(pre_delete, tools)
 
     child_copy = "".join(
@@ -3027,16 +2508,12 @@ def test_resume_ignores_a_crash_tail_without_reusing_its_ids(tmp_path):
     # Regression caught: SQLite may ingest an in-flight exchange before the
     # SessionLog commits it. Resume must use the completed transcript, while new
     # IDs continue past the abandoned rows instead of pointing at new content.
-    path = tmp_path / "folds.sqlite3"
-    completed = tool_exchange("noop", {}, "ok") + [
-        {"role": "assistant", "content": "done"}
-    ]
-    crashed = completed + tool_exchange("dump", {}, "abandoned", call_id="call_1")
-    first = FoldingContext(path, "session", config=FoldConfig(min_span_tokens=0))
+    completed, crashed = completed_then_crashed("ok", "abandoned", names=("noop", "dump"))
+    first = context_for(tmp_path)
     first.sync(crashed, {"noop": noop_tool(), "dump": noop_tool(name="dump")})
     first.close()
 
-    resumed = FoldingContext(path, "session", config=FoldConfig(min_span_tokens=0))
+    resumed = context_for(tmp_path)
     resumed.sync(completed, {"noop": noop_tool()})
 
     assert resumed.reconstruct() == resumed.project(completed)
@@ -3048,15 +2525,8 @@ def test_resume_ignores_a_crash_tail_without_reusing_its_ids(tmp_path):
 
 
 def test_same_process_rollback_deactivates_the_abandoned_tool_branch(tmp_path):
-    completed = tool_exchange("noop", {}, "ok") + [
-        {"role": "assistant", "content": "done"}
-    ]
-    crashed = completed + tool_exchange("dump", {}, "abandoned", call_id="call_1")
-    context = FoldingContext(
-        tmp_path / "folds.sqlite3",
-        "session",
-        config=FoldConfig(min_span_tokens=0),
-    )
+    completed, crashed = completed_then_crashed("ok", "abandoned", names=("noop", "dump"))
+    context = context_for(tmp_path)
     context.sync(crashed, {"noop": noop_tool(), "dump": noop_tool(name="dump")})
 
     context.sync(completed, {"noop": noop_tool()})

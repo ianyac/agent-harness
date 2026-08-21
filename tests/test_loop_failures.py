@@ -1,15 +1,6 @@
 from harness.loop import run_turn
-from harness.tools.base import Tool
 from tests.fake_llm import FakeLLM
-
-
-def tool_named(name: str, execute) -> Tool:
-    return Tool(
-        name=name,
-        description="Test tool.",
-        parameters={"type": "object", "properties": {}},
-        execute=execute,
-    )
+from tests.helpers import simple_tool
 
 
 def one_call(name: str, arguments: dict | None = None, raw: str | None = None) -> dict:
@@ -26,7 +17,7 @@ def boom():
 def test_tool_exception_becomes_an_error_result_and_the_turn_completes():
     llm = FakeLLM([one_call("fragile"), {"type": "text", "content": "sorry"}])
     messages = []
-    reply = run_turn(messages, "go", llm, tools={"fragile": tool_named("fragile", boom)})
+    reply = run_turn(messages, "go", llm, tools={"fragile": simple_tool("fragile", boom)})
     assert messages[2]["role"] == "tool"
     assert "Error" in messages[2]["content"] and "boom" in messages[2]["content"]
     # the model's second call was shown the error text
@@ -47,7 +38,7 @@ def test_error_then_success_within_one_turn():
         [one_call("flaky"), one_call("flaky"), {"type": "text", "content": "done"}]
     )
     messages = []
-    run_turn(messages, "try", llm, tools={"flaky": tool_named("flaky", flaky)})
+    run_turn(messages, "try", llm, tools={"flaky": simple_tool("flaky", flaky)})
     results = [m["content"] for m in messages if m["role"] == "tool"]
     assert "transient" in results[0]
     assert results[1] == "worked"
@@ -56,7 +47,7 @@ def test_error_then_success_within_one_turn():
 def test_unknown_tool_name_becomes_an_error_result_listing_available_tools():
     llm = FakeLLM([one_call("teleport"), {"type": "text", "content": "oops"}])
     messages = []
-    run_turn(messages, "go", llm, tools={"add": tool_named("add", lambda: "0")})
+    run_turn(messages, "go", llm, tools={"add": simple_tool("add", lambda: "0")})
     assert messages[2]["role"] == "tool"
     assert "teleport" in messages[2]["content"]
     assert "add" in messages[2]["content"]  # tells the model what exists
@@ -67,7 +58,7 @@ def test_malformed_arguments_json_becomes_an_error_result():
         [one_call("add", raw='{"a": 1, '), {"type": "text", "content": "oops"}]
     )
     messages = []
-    run_turn(messages, "go", llm, tools={"add": tool_named("add", lambda: "0")})
+    run_turn(messages, "go", llm, tools={"add": simple_tool("add", lambda: "0")})
     assert messages[2]["role"] == "tool"
     assert "Error" in messages[2]["content"]
 
@@ -80,7 +71,7 @@ def test_iteration_cap_returns_a_graceful_message_instead_of_raising():
         messages,
         "loop",
         llm,
-        tools={"add": tool_named("add", lambda: "0")},
+        tools={"add": simple_tool("add", lambda: "0")},
         max_iterations=3,
     )
     assert reply["role"] == "assistant"

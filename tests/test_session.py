@@ -5,13 +5,7 @@ import subprocess
 import pytest
 
 from harness.session import SessionLog, lock, unlock
-
-
-def exchange(question: str, answer: str) -> list[dict]:
-    return [
-        {"role": "user", "content": question},
-        {"role": "assistant", "content": answer},
-    ]
+from tests.helpers import exchange, tool_call
 
 
 def test_recorded_turns_round_trip(tmp_path):
@@ -84,13 +78,7 @@ def test_resume_rolls_back_a_turn_interrupted_mid_record(tmp_path):
                     "message": {
                         "role": "assistant",
                         "content": None,
-                        "tool_calls": [
-                            {
-                                "id": "call_1",
-                                "type": "function",
-                                "function": {"name": "noop", "arguments": "{}"},
-                            }
-                        ],
+                        "tool_calls": [tool_call("noop", {}, "call_1")],
                     },
                 }
             )

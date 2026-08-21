@@ -2,19 +2,14 @@ import json
 
 import pytest
 
-from harness.folding import FoldConfig, FoldError, FoldingContext
+from harness.folding import FoldError
 from harness.tools.folding import fold_tool, unfold_tool
-from tests.test_folding import rich_note, tool_exchange
+from tests.test_folding import context_for, rich_note, tool_exchange
 
 
 def context_with_result(tmp_path):
-    context = FoldingContext(
-        tmp_path / "folds.sqlite3",
-        "session",
-        config=FoldConfig(min_span_tokens=0),
-    )
-    messages = tool_exchange("noop", {}, "evidence")
-    context.sync(messages)
+    context = context_for(tmp_path)
+    context.sync(tool_exchange("noop", {}, "evidence"))
     return context
 
 

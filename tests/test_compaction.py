@@ -2,29 +2,13 @@ from copy import deepcopy
 
 from harness.compaction import DEFAULT_SUMMARY_INSTRUCTION, compact, estimate_tokens
 from tests.fake_llm import FakeLLM
-
-
-def exchange(question: str, answer: str) -> list[dict]:
-    return [
-        {"role": "user", "content": question},
-        {"role": "assistant", "content": answer},
-    ]
+from tests.helpers import exchange, tool_call
 
 
 def tool_exchange(question: str, answer: str) -> list[dict]:
     return [
         {"role": "user", "content": question},
-        {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [
-                {
-                    "id": "call_1",
-                    "type": "function",
-                    "function": {"name": "noop", "arguments": "{}"},
-                }
-            ],
-        },
+        {"role": "assistant", "content": None, "tool_calls": [tool_call("noop", {}, "call_1")]},
         {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
         {"role": "assistant", "content": answer},
     ]
@@ -96,13 +80,7 @@ def test_cut_falls_forward_when_the_tail_owns_the_only_boundary():
             {
                 "role": "assistant",
                 "content": None,
-                "tool_calls": [
-                    {
-                        "id": f"call_{i}",
-                        "type": "function",
-                        "function": {"name": "noop", "arguments": "{}"},
-                    }
-                ],
+                "tool_calls": [tool_call("noop", {}, f"call_{i}")],
             },
             {"role": "tool", "tool_call_id": f"call_{i}", "content": "ok"},
         ]
@@ -124,13 +102,7 @@ def test_a_lone_leading_summary_is_never_resummarized():
             {
                 "role": "assistant",
                 "content": None,
-                "tool_calls": [
-                    {
-                        "id": f"call_{i}",
-                        "type": "function",
-                        "function": {"name": "noop", "arguments": "{}"},
-                    }
-                ],
+                "tool_calls": [tool_call("noop", {}, f"call_{i}")],
             },
             {"role": "tool", "tool_call_id": f"call_{i}", "content": "x " * 200},
         ]

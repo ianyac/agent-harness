@@ -4,13 +4,15 @@ from copy import deepcopy
 
 import pytest
 
-from harness.folding import FoldConfig, FoldError, FoldingContext, ProjectionError
+from harness.folding import FoldError, FoldingContext
 from harness.loop import run_turn
-from harness.tools.base import Tool
 from harness.tools.folding import fold_tool
 from tests.fake_llm import FakeLLM
-from tests.helpers import noop_tool
-from tests.test_folding import rich_note, tool_exchange
+from tests.helpers import canonical, canonical_hash, noop_tool, simple_tool
+from tests.test_folding import ALIAS, SECRET, context_for, rich_note, tool_exchange
+
+SECOND_SECRET = "sk-987654321zyxwvutsrqponmlkjihgfedcba"
+SECOND_ALIAS = FoldingContext._identifier_alias(SECOND_SECRET)
 
 
 def completed_history(result: str = "full evidence") -> list[dict]:
@@ -19,12 +21,19 @@ def completed_history(result: str = "full evidence") -> list[dict]:
     ]
 
 
-def context_for(tmp_path, **config) -> FoldingContext:
-    return FoldingContext(
-        tmp_path / "folds.sqlite3",
-        "session",
-        config=FoldConfig(min_span_tokens=0, **config),
-    )
+def strip_legacy_alias_metadata(
+    context: FoldingContext, key: str = "scanner_aliases"
+) -> None:
+    """Rewrite every entry as an older ledger left it: without the persisted
+    scanner alias map (or, for ``scanner_alias_lengths``, the alias lengths)."""
+    for row in context._db.execute("SELECT span_id, meta_json FROM entries").fetchall():
+        metadata = json.loads(row["meta_json"])
+        metadata.pop(key, None)
+        context._db.execute(
+            "UPDATE entries SET meta_json = ? WHERE span_id = ?",
+            (json.dumps(metadata), row["span_id"]),
+        )
+    context._db.commit()
 
 
 def test_loop_sends_projection_but_retains_full_shadow_history(tmp_path):
@@ -52,15 +61,10 @@ def test_each_model_dispatch_records_the_exact_projection_hash(tmp_path):
 
     run_turn(messages, "next", llm, context=context)
 
-    exact = json.dumps(
-        llm.turns[0]["messages"],
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
+    exact = canonical(llm.turns[0]["messages"])
     record = context.projection_chain()[-1]
     assert record["kind"] == "request"
-    assert record["projection_hash"] == hashlib.sha256(exact.encode()).hexdigest()
+    assert record["projection_hash"] == canonical_hash(llm.turns[0]["messages"])
     assert llm.turns[0]["projection_hash"] == record["projection_hash"]
     assert "workspace after checkpoint" in exact
 
@@ -68,8 +72,7 @@ def test_each_model_dispatch_records_the_exact_projection_hash(tmp_path):
 def test_each_model_request_can_be_reconstructed_after_reopen(tmp_path):
     # Regression caught: inferring a request from created_turn loses distinct
     # model boundaries when a tool turn makes more than one request.
-    path = tmp_path / "folds.sqlite3"
-    context = FoldingContext(path, "session", config=FoldConfig(min_span_tokens=0))
+    context = context_for(tmp_path)
     tool = noop_tool(name="noop")
     llm = FakeLLM(
         [
@@ -89,7 +92,7 @@ def test_each_model_request_can_be_reconstructed_after_reopen(tmp_path):
     ]
     context.close()
 
-    resumed = FoldingContext(path, "session", config=FoldConfig(min_span_tokens=0))
+    resumed = context_for(tmp_path)
     assert [resumed.reconstruct_projection(row_id) for row_id in request_ids] == expected
 
 
@@ -125,12 +128,7 @@ def test_loop_refuses_folding_and_compaction_before_mutating_history(tmp_path):
 def test_loop_labels_new_tool_results_before_the_next_model_call(tmp_path):
     # Regression caught: IDs are copy handles for the agent; assigning them only
     # at session end makes fold calls impossible during the active turn.
-    dump = Tool(
-        name="dump",
-        description="return evidence",
-        parameters={"type": "object", "properties": {}},
-        execute=lambda: "fresh evidence",
-    )
+    dump = simple_tool("dump", lambda: "fresh evidence", description="return evidence")
     llm = FakeLLM(
         [
             {"type": "tool_calls", "calls": [{"name": "dump", "arguments": {}}]},
@@ -148,11 +146,10 @@ def test_loop_labels_new_tool_results_before_the_next_model_call(tmp_path):
 def test_marked_share_crossing_threshold_rebuilds_mid_turn(tmp_path):
     # Regression caught: waiting until the next user turn after a very large fold
     # wastes every model call in the remainder of the current phase.
-    dump = Tool(
-        name="dump",
+    dump = simple_tool(
+        "dump",
+        lambda: "evidence " * 2_000,
         description="return evidence",
-        parameters={"type": "object", "properties": {}},
-        execute=lambda: "evidence " * 2_000,
     )
     context = context_for(tmp_path, checkpoint_ratio=0.01)
     tools = {"dump": dump, "fold": fold_tool(context)}
@@ -183,12 +180,7 @@ def test_marked_share_crossing_threshold_rebuilds_mid_turn(tmp_path):
 
 def test_small_mark_stays_visible_mid_turn_then_folds_on_next_turn(tmp_path):
     context = context_for(tmp_path, checkpoint_ratio=1.0)
-    dump = Tool(
-        name="dump",
-        description="return evidence",
-        parameters={"type": "object", "properties": {}},
-        execute=lambda: "small evidence",
-    )
+    dump = simple_tool("dump", lambda: "small evidence", description="return evidence")
     tools = {"dump": dump, "fold": fold_tool(context)}
     first_llm = FakeLLM(
         [
@@ -223,25 +215,8 @@ def test_following_turn_receives_auto_fold_notice_without_polluting_shadow(tmp_p
     context = context_for(tmp_path)
     messages = completed_history("same")
     messages.extend(
-        [
-            {"role": "user", "content": "read again"},
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
-                    {
-                        "id": "call_1",
-                        "type": "function",
-                        "function": {
-                            "name": "read_file",
-                            "arguments": json.dumps({"path": "a.py"}),
-                        },
-                    }
-                ],
-            },
-            {"role": "tool", "tool_call_id": "call_1", "content": "same"},
-            {"role": "assistant", "content": "read complete"},
-        ]
+        tool_exchange("read_file", {"path": "a.py"}, "same", call_id="call_1", user="read again")
+        + [{"role": "assistant", "content": "read complete"}]
     )
     tools = {"read_file": noop_tool(name="read_file")}
     context.sync(messages, tools)
@@ -258,13 +233,7 @@ def test_following_turn_receives_auto_fold_notice_without_polluting_shadow(tmp_p
 
 
 def test_scanner_redaction_reaches_the_model_and_shadow_immediately(tmp_path):
-    secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
-    leak = Tool(
-        name="leak",
-        description="returns a credential",
-        parameters={"type": "object", "properties": {}},
-        execute=lambda: secret,
-    )
+    leak = simple_tool("leak", lambda: SECRET, description="returns a credential")
     llm = FakeLLM(
         [
             {"type": "tool_calls", "calls": [{"name": "leak", "arguments": {}}]},
@@ -275,31 +244,26 @@ def test_scanner_redaction_reaches_the_model_and_shadow_immediately(tmp_path):
 
     run_turn(messages, "inspect", llm, tools={"leak": leak}, context=context_for(tmp_path))
 
-    assert secret not in json.dumps(llm.turns[1]["messages"])
-    assert secret not in json.dumps(messages)
+    assert SECRET not in json.dumps(llm.turns[1]["messages"])
+    assert SECRET not in json.dumps(messages)
     assert messages[2]["content"] == "[redacted — credential detected in tool output]"
 
 
 def test_scanner_remaps_tool_definitions_and_resolves_the_alias_for_execution(tmp_path):
-    secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
+    # pinned literally: the alias format is part of the persisted ledger contract
     alias = "redacted_db3qobsommarzjeek2fytgek5zgie47kkosagadvfuywhxw7mraa"
     executions: list[str] = []
 
     def leak() -> str:
         executions.append("ran")
-        return f"diagnostic {secret}"
+        return f"diagnostic {SECRET}"
 
-    credential_tool = Tool(
-        name=secret,
-        description="returns a credential",
-        parameters={"type": "object", "properties": {}},
-        execute=leak,
-    )
+    credential_tool = simple_tool(SECRET, leak, description="returns a credential")
     ordinary_tool = noop_tool(name="ordinary")
-    tools = {secret: credential_tool, "ordinary": ordinary_tool}
+    tools = {SECRET: credential_tool, "ordinary": ordinary_tool}
     llm = FakeLLM(
         [
-            {"type": "tool_calls", "calls": [{"name": secret, "arguments": {}}]},
+            {"type": "tool_calls", "calls": [{"name": SECRET, "arguments": {}}]},
             {"type": "tool_calls", "calls": [{"name": alias, "arguments": {}}]},
             {"type": "text", "content": "handled"},
         ]
@@ -316,11 +280,11 @@ def test_scanner_remaps_tool_definitions_and_resolves_the_alias_for_execution(tm
     ]
     assert offered_names == [alias, "ordinary"]
     assert historical_name == alias
-    assert secret not in json.dumps(second_boundary)
+    assert SECRET not in json.dumps(second_boundary)
     assert executions == ["ran", "ran"]
     assert messages[3]["tool_calls"][0]["function"]["name"] == alias
     assert messages[3]["tool_calls"][0]["id"] == messages[4]["tool_call_id"]
-    assert secret not in json.dumps(llm.turns[2])
+    assert SECRET not in json.dumps(llm.turns[2])
     assert llm.turns[2]["tools"][0]["function"]["name"] == alias
     assert [
         message["tool_calls"][0]["function"]["name"]
@@ -332,20 +296,16 @@ def test_scanner_remaps_tool_definitions_and_resolves_the_alias_for_execution(tm
     ).fetchall()
     assert [row["tool_name"] for row in stored_names] == [alias, alias]
     assert all(
-        secret not in json.dumps(context.reconstruct_projection(row["projection_id"]))
+        SECRET not in json.dumps(context.reconstruct_projection(row["projection_id"]))
         for row in context.projection_chain()
         if row["kind"] == "request"
     )
-    assert list(tools) == [secret, "ordinary"]
-    assert tools[secret] is credential_tool
-    assert credential_tool.name == secret
+    assert list(tools) == [SECRET, "ordinary"]
+    assert tools[SECRET] is credential_tool
+    assert credential_tool.name == SECRET
 
 
 def test_scanner_avoids_aliases_occupied_by_registered_tools(tmp_path):
-    secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
-    occupied_alias = (
-        "redacted_db3qobsommarzjeek2fytgek5zgie47kkosagadvfuywhxw7mraa"
-    )
     remapped_name = (
         "redacted_q3c4jdidtkzxytqnv7vgwvilzalkuejx7djs7t6umey5q4kyvdrq"
     )
@@ -353,28 +313,22 @@ def test_scanner_avoids_aliases_occupied_by_registered_tools(tmp_path):
 
     def leak() -> str:
         executions.append("credential")
-        return f"diagnostic {secret}"
+        return f"diagnostic {SECRET}"
 
     def ordinary() -> str:
         executions.append("ordinary")
         return "ordinary result"
 
-    credential_tool = Tool(
-        name=secret,
-        description="returns a credential",
-        parameters={"type": "object", "properties": {}},
-        execute=leak,
-    )
-    ordinary_tool = Tool(
-        name=occupied_alias,
+    credential_tool = simple_tool(SECRET, leak, description="returns a credential")
+    ordinary_tool = simple_tool(
+        ALIAS,
+        ordinary,
         description="ordinary tool whose name happens to occupy an alias",
-        parameters={"type": "object", "properties": {}},
-        execute=ordinary,
     )
-    tools = {secret: credential_tool, occupied_alias: ordinary_tool}
+    tools = {SECRET: credential_tool, ALIAS: ordinary_tool}
     llm = FakeLLM(
         [
-            {"type": "tool_calls", "calls": [{"name": secret, "arguments": {}}]},
+            {"type": "tool_calls", "calls": [{"name": SECRET, "arguments": {}}]},
             {
                 "type": "tool_calls",
                 "calls": [{"name": remapped_name, "arguments": {}}],
@@ -388,27 +342,24 @@ def test_scanner_avoids_aliases_occupied_by_registered_tools(tmp_path):
     offered_names = [
         definition["function"]["name"] for definition in llm.turns[1]["tools"]
     ]
-    assert offered_names == [remapped_name, occupied_alias]
+    assert offered_names == [remapped_name, ALIAS]
     assert len(set(offered_names)) == 2
     assert executions == ["credential", "credential"]
-    assert secret not in json.dumps(llm.turns[1])
+    assert SECRET not in json.dumps(llm.turns[1])
 
 
 def test_scanner_restores_tool_name_aliases_after_reopen(tmp_path):
-    secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
-    alias = "redacted_db3qobsommarzjeek2fytgek5zgie47kkosagadvfuywhxw7mraa"
-    tool = Tool(
-        name=secret,
+    tool = simple_tool(
+        SECRET,
+        lambda: f"diagnostic {SECRET}",
         description="returns a credential",
-        parameters={"type": "object", "properties": {}},
-        execute=lambda: f"diagnostic {secret}",
     )
-    tools = {secret: tool}
+    tools = {SECRET: tool}
     messages: list[dict] = []
     first = context_for(tmp_path)
     first_llm = FakeLLM(
         [
-            {"type": "tool_calls", "calls": [{"name": secret, "arguments": {}}]},
+            {"type": "tool_calls", "calls": [{"name": SECRET, "arguments": {}}]},
             {"type": "text", "content": "first done"},
         ]
     )
@@ -420,16 +371,16 @@ def test_scanner_restores_tool_name_aliases_after_reopen(tmp_path):
     run_turn(messages, "inspect again", second_llm, tools=tools, context=resumed)
 
     boundary = second_llm.turns[0]
-    assert boundary["tools"][0]["function"]["name"] == alias
-    assert boundary["messages"][1]["tool_calls"][0]["function"]["name"] == alias
-    assert secret not in json.dumps(boundary)
+    assert boundary["tools"][0]["function"]["name"] == ALIAS
+    assert boundary["messages"][1]["tool_calls"][0]["function"]["name"] == ALIAS
+    assert SECRET not in json.dumps(boundary)
     assert all(
-        secret not in json.dumps(resumed.reconstruct_projection(row["projection_id"]))
+        SECRET not in json.dumps(resumed.reconstruct_projection(row["projection_id"]))
         for row in resumed.projection_chain()
         if row["kind"] == "request"
     )
-    assert list(tools) == [secret]
-    assert tool.name == secret
+    assert list(tools) == [SECRET]
+    assert tool.name == SECRET
 
 
 @pytest.mark.parametrize(
@@ -450,12 +401,7 @@ def test_scanner_recovers_a_generic_secret_from_its_persisted_hash(
         executions.append("ran")
         return f"password={secret}"
 
-    tool = Tool(
-        name=raw_name,
-        description="returns a credential",
-        parameters={"type": "object", "properties": {}},
-        execute=leak,
-    )
+    tool = simple_tool(raw_name, leak, description="returns a credential")
     tools = {raw_name: tool}
     messages: list[dict] = []
     first = context_for(tmp_path)
@@ -475,16 +421,7 @@ def test_scanner_recovers_a_generic_secret_from_its_persisted_hash(
         context=first,
     )
     if drop_length_metadata:
-        for row in first._db.execute(
-            "SELECT span_id, meta_json FROM entries"
-        ).fetchall():
-            metadata = json.loads(row["meta_json"])
-            metadata.pop("scanner_alias_lengths", None)
-            first._db.execute(
-                "UPDATE entries SET meta_json = ? WHERE span_id = ?",
-                (json.dumps(metadata), row["span_id"]),
-            )
-        first._db.commit()
+        strip_legacy_alias_metadata(first, "scanner_alias_lengths")
     first.close()
 
     resumed = context_for(tmp_path)
@@ -514,12 +451,8 @@ def test_legacy_recovery_resolves_every_tool_before_applying_registry_order(
     tmp_path,
     reverse_registry,
 ):
-    first_secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
-    second_secret = "sk-987654321zyxwvutsrqponmlkjihgfedcba"
-    first_raw = f"first_{first_secret}"
-    second_raw = f"second_{second_secret}"
-    first_alias = FoldingContext._identifier_alias(first_secret)
-    second_alias = FoldingContext._identifier_alias(second_secret)
+    first_raw = f"first_{SECRET}"
+    second_raw = f"second_{SECOND_SECRET}"
     messages: list[dict] = []
     first = context_for(tmp_path)
     run_turn(
@@ -538,51 +471,40 @@ def test_legacy_recovery_resolves_every_tool_before_applying_registry_order(
             ]
         ),
         tools={
-            first_raw: Tool(
-                name=first_raw,
+            first_raw: simple_tool(
+                first_raw,
+                lambda: f"diagnostic {SECRET}",
                 description="returns the first credential",
-                parameters={"type": "object", "properties": {}},
-                execute=lambda: f"diagnostic {first_secret}",
             ),
-            second_raw: Tool(
-                name=second_raw,
+            second_raw: simple_tool(
+                second_raw,
+                lambda: f"diagnostic {SECOND_SECRET}",
                 description="returns the second credential",
-                parameters={"type": "object", "properties": {}},
-                execute=lambda: f"diagnostic {second_secret}",
             ),
         },
         context=first,
     )
-    for row in first._db.execute("SELECT span_id, meta_json FROM entries").fetchall():
-        metadata = json.loads(row["meta_json"])
-        metadata.pop("scanner_aliases", None)
-        first._db.execute(
-            "UPDATE entries SET meta_json = ? WHERE span_id = ?",
-            (json.dumps(metadata), row["span_id"]),
-        )
-    first._db.commit()
+    strip_legacy_alias_metadata(first)
     first.close()
 
     reopened_specs = [
         (
             first_raw,
-            Tool(
-                name=first_raw,
+            simple_tool(
+                first_raw,
+                lambda: "ordinary result",
                 description="first credential after reopen",
-                parameters={"type": "object", "properties": {}},
-                execute=lambda: "ordinary result",
             ),
-            f"first_{first_alias}",
+            f"first_{ALIAS}",
         ),
         (
-            f"renamed_{second_secret}",
-            Tool(
-                name=f"renamed_{second_secret}",
+            f"renamed_{SECOND_SECRET}",
+            simple_tool(
+                f"renamed_{SECOND_SECRET}",
+                lambda: "ordinary result",
                 description="second credential after wrapper rename",
-                parameters={"type": "object", "properties": {}},
-                execute=lambda: "ordinary result",
             ),
-            f"renamed_{second_alias}",
+            f"renamed_{SECOND_ALIAS}",
         ),
     ]
     if reverse_registry:
@@ -597,26 +519,20 @@ def test_legacy_recovery_resolves_every_tool_before_applying_registry_order(
         definition["function"]["name"] for definition in llm.turns[0]["tools"]
     ]
     assert offered_names == [offered for _raw, _tool, offered in reopened_specs]
-    assert first_secret not in json.dumps(llm.turns[0])
-    assert second_secret not in json.dumps(llm.turns[0])
+    assert SECRET not in json.dumps(llm.turns[0])
+    assert SECOND_SECRET not in json.dumps(llm.turns[0])
 
 
 def test_alias_shaped_ordinary_tool_remains_available_after_unrelated_scan(tmp_path):
-    secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
     ordinary_name = "redacted_" + "a" * 52
-    assert ordinary_name != FoldingContext._identifier_alias(secret)
+    assert ordinary_name != ALIAS
     executions: list[str] = []
 
     def leak() -> str:
         executions.append("ran")
-        return f"diagnostic {secret}"
+        return f"diagnostic {SECRET}"
 
-    tool = Tool(
-        name=ordinary_name,
-        description="ordinary alias-shaped tool",
-        parameters={"type": "object", "properties": {}},
-        execute=leak,
-    )
+    tool = simple_tool(ordinary_name, leak, description="ordinary alias-shaped tool")
     tools = {ordinary_name: tool}
     messages: list[dict] = []
     first = context_for(tmp_path)
@@ -653,20 +569,17 @@ def test_scanner_does_not_claim_an_occupied_alias_shaped_tool_name(
     tmp_path,
     wrapped,
 ):
-    secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
-    default_alias = FoldingContext._identifier_alias(secret)
-    ordinary_name = f"wrapped_{default_alias}" if wrapped else default_alias
+    ordinary_name = f"wrapped_{ALIAS}" if wrapped else ALIAS
     executions: list[str] = []
 
     def leak() -> str:
         executions.append("ran")
-        return f"diagnostic {secret}"
+        return f"diagnostic {SECRET}"
 
-    tool = Tool(
-        name=ordinary_name,
+    tool = simple_tool(
+        ordinary_name,
+        leak,
         description="ordinary tool occupying a scanner alias",
-        parameters={"type": "object", "properties": {}},
-        execute=leak,
     )
     tools = {ordinary_name: tool}
     messages: list[dict] = []
@@ -691,9 +604,9 @@ def test_scanner_does_not_claim_an_occupied_alias_shaped_tool_name(
         ).fetchall()
     ]
     persisted_alias = sensitive_metadata[0]["scanner_aliases"][
-        hashlib.sha256(secret.encode()).hexdigest()
+        hashlib.sha256(SECRET.encode()).hexdigest()
     ]
-    assert persisted_alias != default_alias
+    assert persisted_alias != ALIAS
     assert persisted_alias not in ordinary_name
     assert llm.turns[1]["tools"][0]["function"]["name"] == ordinary_name
     first.close()
@@ -713,10 +626,7 @@ def test_scanner_does_not_claim_an_occupied_alias_shaped_tool_name(
 
 
 def test_legacy_recovery_does_not_claim_an_ordinary_alias_shaped_history(tmp_path):
-    credential = "sk-abcdefghijklmnopqrstuvwxyz123456789"
-    unrelated_secret = "sk-987654321zyxwvutsrqponmlkjihgfedcba"
-    raw_name = f"inspect:{credential}"
-    generated_alias = FoldingContext._identifier_alias(credential)
+    raw_name = f"inspect:{SECRET}"
     ordinary_name = "redacted_" + "a" * 52
     messages: list[dict] = []
     first = context_for(tmp_path)
@@ -736,29 +646,20 @@ def test_legacy_recovery_does_not_claim_an_ordinary_alias_shaped_history(tmp_pat
             ]
         ),
         tools={
-            raw_name: Tool(
-                name=raw_name,
+            raw_name: simple_tool(
+                raw_name,
+                lambda: f"diagnostic {SECRET}",
                 description="returns a credential",
-                parameters={"type": "object", "properties": {}},
-                execute=lambda: f"diagnostic {credential}",
             ),
-            ordinary_name: Tool(
-                name=ordinary_name,
+            ordinary_name: simple_tool(
+                ordinary_name,
+                lambda: f"diagnostic {SECOND_SECRET}",
                 description="ordinary alias-shaped tool",
-                parameters={"type": "object", "properties": {}},
-                execute=lambda: f"diagnostic {unrelated_secret}",
             ),
         },
         context=first,
     )
-    for row in first._db.execute("SELECT span_id, meta_json FROM entries").fetchall():
-        metadata = json.loads(row["meta_json"])
-        metadata.pop("scanner_aliases", None)
-        first._db.execute(
-            "UPDATE entries SET meta_json = ? WHERE span_id = ?",
-            (json.dumps(metadata), row["span_id"]),
-        )
-    first._db.commit()
+    strip_legacy_alias_metadata(first)
     first.close()
 
     resumed = context_for(tmp_path)
@@ -768,17 +669,15 @@ def test_legacy_recovery_does_not_claim_an_ordinary_alias_shaped_history(tmp_pat
         "inspect again",
         llm,
         tools={
-            raw_name: Tool(
-                name=raw_name,
+            raw_name: simple_tool(
+                raw_name,
+                lambda: "ordinary result",
                 description="credential tool after reopen",
-                parameters={"type": "object", "properties": {}},
-                execute=lambda: "ordinary result",
             ),
-            ordinary_name: Tool(
-                name=ordinary_name,
+            ordinary_name: simple_tool(
+                ordinary_name,
+                lambda: "ordinary result",
                 description="ordinary alias-shaped tool after reopen",
-                parameters={"type": "object", "properties": {}},
-                execute=lambda: "ordinary result",
             ),
         },
         context=resumed,
@@ -786,16 +685,13 @@ def test_legacy_recovery_does_not_claim_an_ordinary_alias_shaped_history(tmp_pat
 
     assert [
         definition["function"]["name"] for definition in llm.turns[0]["tools"]
-    ] == [f"inspect:{generated_alias}", ordinary_name]
-    assert credential not in json.dumps(llm.turns[0])
+    ] == [f"inspect:{ALIAS}", ordinary_name]
+    assert SECRET not in json.dumps(llm.turns[0])
 
 
 def test_legacy_recovery_rejects_takeover_before_exempting_ordinary_names(tmp_path):
-    first_secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
-    second_secret = "sk-987654321zyxwvutsrqponmlkjihgfedcba"
-    first_raw = f"old_a_{first_secret}"
-    second_raw = f"old_b_{second_secret}"
-    first_alias = FoldingContext._identifier_alias(first_secret)
+    first_raw = f"old_a_{SECRET}"
+    second_raw = f"old_b_{SECOND_SECRET}"
     messages: list[dict] = []
     first = context_for(tmp_path)
     run_turn(
@@ -814,51 +710,39 @@ def test_legacy_recovery_rejects_takeover_before_exempting_ordinary_names(tmp_pa
             ]
         ),
         tools={
-            first_raw: Tool(
-                name=first_raw,
+            first_raw: simple_tool(
+                first_raw,
+                lambda: f"diagnostic {SECRET}",
                 description="returns the first credential",
-                parameters={"type": "object", "properties": {}},
-                execute=lambda: f"diagnostic {first_secret}",
             ),
-            second_raw: Tool(
-                name=second_raw,
+            second_raw: simple_tool(
+                second_raw,
+                lambda: f"diagnostic {SECOND_SECRET}",
                 description="returns the second credential",
-                parameters={"type": "object", "properties": {}},
-                execute=lambda: f"diagnostic {second_secret}",
             ),
         },
         context=first,
     )
-    for row in first._db.execute("SELECT span_id, meta_json FROM entries").fetchall():
-        metadata = json.loads(row["meta_json"])
-        metadata.pop("scanner_aliases", None)
-        first._db.execute(
-            "UPDATE entries SET meta_json = ? WHERE span_id = ?",
-            (json.dumps(metadata), row["span_id"]),
-        )
-    first._db.commit()
+    strip_legacy_alias_metadata(first)
     first.close()
 
-    takeover_name = f"old_a_{first_alias}"
+    takeover_name = f"old_a_{ALIAS}"
     executions: list[str] = []
     tools = {
-        takeover_name: Tool(
-            name=takeover_name,
+        takeover_name: simple_tool(
+            takeover_name,
+            lambda: executions.append("takeover") or "ordinary result",
             description="unrelated alias takeover",
-            parameters={"type": "object", "properties": {}},
-            execute=lambda: executions.append("takeover") or "ordinary result",
         ),
-        f"new_a_{first_secret}": Tool(
-            name=f"new_a_{first_secret}",
+        f"new_a_{SECRET}": simple_tool(
+            f"new_a_{SECRET}",
+            lambda: executions.append("first") or "ordinary result",
             description="first credential under a new wrapper",
-            parameters={"type": "object", "properties": {}},
-            execute=lambda: executions.append("first") or "ordinary result",
         ),
-        second_raw: Tool(
-            name=second_raw,
+        second_raw: simple_tool(
+            second_raw,
+            lambda: executions.append("second") or "ordinary result",
             description="second credential under its original wrapper",
-            parameters={"type": "object", "properties": {}},
-            execute=lambda: executions.append("second") or "ordinary result",
         ),
     }
     resumed = context_for(tmp_path)
@@ -878,15 +762,12 @@ def test_legacy_recovery_rejects_takeover_before_exempting_ordinary_names(tmp_pa
 
 
 def test_scanner_recovers_a_legacy_v3_alias_without_mapping_metadata(tmp_path):
-    secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
-    alias = "redacted_db3qobsommarzjeek2fytgek5zgie47kkosagadvfuywhxw7mraa"
-    tool = Tool(
-        name=secret,
+    tool = simple_tool(
+        SECRET,
+        lambda: f"diagnostic {SECRET}",
         description="returns a credential",
-        parameters={"type": "object", "properties": {}},
-        execute=lambda: f"diagnostic {secret}",
     )
-    tools = {secret: tool}
+    tools = {SECRET: tool}
     messages: list[dict] = []
     first = context_for(tmp_path)
     run_turn(
@@ -896,7 +777,7 @@ def test_scanner_recovers_a_legacy_v3_alias_without_mapping_metadata(tmp_path):
             [
                 {
                     "type": "tool_calls",
-                    "calls": [{"name": secret, "arguments": {}}],
+                    "calls": [{"name": SECRET, "arguments": {}}],
                 },
                 {"type": "text", "content": "done"},
             ]
@@ -904,13 +785,7 @@ def test_scanner_recovers_a_legacy_v3_alias_without_mapping_metadata(tmp_path):
         tools=tools,
         context=first,
     )
-    for row in first._db.execute("SELECT span_id, meta_json FROM entries").fetchall():
-        metadata = json.loads(row["meta_json"])
-        metadata.pop("scanner_aliases", None)
-        first._db.execute(
-            "UPDATE entries SET meta_json = ? WHERE span_id = ?",
-            (json.dumps(metadata), row["span_id"]),
-        )
+    strip_legacy_alias_metadata(first)
     first._db.execute("DROP TABLE IF EXISTS scanner_aliases")
     first._db.commit()
     first.close()
@@ -920,29 +795,52 @@ def test_scanner_recovers_a_legacy_v3_alias_without_mapping_metadata(tmp_path):
     run_turn(messages, "inspect again", second_llm, tools=tools, context=resumed)
 
     boundary = second_llm.turns[0]
-    assert boundary["tools"][0]["function"]["name"] == alias
-    assert boundary["messages"][1]["tool_calls"][0]["function"]["name"] == alias
-    assert secret not in json.dumps(boundary)
+    assert boundary["tools"][0]["function"]["name"] == ALIAS
+    assert boundary["messages"][1]["tool_calls"][0]["function"]["name"] == ALIAS
+    assert SECRET not in json.dumps(boundary)
     assert all(
-        secret not in json.dumps(resumed.reconstruct_projection(row["projection_id"]))
+        SECRET not in json.dumps(resumed.reconstruct_projection(row["projection_id"]))
         for row in resumed.projection_chain()
         if row["kind"] == "request"
     )
 
 
-def test_scanner_recovers_all_aliases_in_a_legacy_multi_secret_tool_name(tmp_path):
-    first_secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
-    second_secret = "sk-987654321zyxwvutsrqponmlkjihgfedcba"
-    raw_name = f"inspect:{first_secret}:{second_secret}"
-    first_alias = FoldingContext._identifier_alias(first_secret)
-    second_alias = FoldingContext._identifier_alias(second_secret)
-    historical_name = f"inspect:{first_alias}:{second_alias}"
-    tool = Tool(
-        name=raw_name,
-        description="returns credentials",
-        parameters={"type": "object", "properties": {}},
-        execute=lambda: f"diagnostic {first_secret} and {second_secret}",
-    )
+INNER_SECRET = "ghp_" + "a" * 30
+OUTER_SECRET = f"sk-{INNER_SECRET}"  # one credential pattern nested inside another
+
+
+@pytest.mark.parametrize(
+    ("raw_name", "leaked", "historical_name", "scrubbed"),
+    [
+        pytest.param(
+            f"x_{SECRET}",
+            f"diagnostic {SECRET}",
+            f"x_{ALIAS}",
+            [SECRET],
+            id="after_an_identifier_underscore",
+        ),
+        pytest.param(
+            f"inspect:{SECRET}:{SECOND_SECRET}",
+            f"diagnostic {SECRET} and {SECOND_SECRET}",
+            f"inspect:{ALIAS}:{SECOND_ALIAS}",
+            [SECRET, SECOND_SECRET],
+            id="multi_secret_tool_name",
+        ),
+        pytest.param(
+            OUTER_SECRET,
+            f"diagnostic {OUTER_SECRET}",
+            FoldingContext._identifier_alias(OUTER_SECRET),
+            [OUTER_SECRET, INNER_SECRET],
+            id="overlapping_secret_patterns",
+        ),
+    ],
+)
+def test_scanner_recovers_legacy_aliases_in_a_tool_name(
+    tmp_path, raw_name, leaked, historical_name, scrubbed
+):
+    # An older ledger persisted no alias map: on reopen the scanner must rebuild
+    # every alias from its hash, wherever the secret sits inside the tool name.
+    tool = simple_tool(raw_name, lambda: leaked, description="returns a credential")
     tools = {raw_name: tool}
     messages: list[dict] = []
     first = context_for(tmp_path)
@@ -961,14 +859,7 @@ def test_scanner_recovers_all_aliases_in_a_legacy_multi_secret_tool_name(tmp_pat
         tools=tools,
         context=first,
     )
-    for row in first._db.execute("SELECT span_id, meta_json FROM entries").fetchall():
-        metadata = json.loads(row["meta_json"])
-        metadata.pop("scanner_aliases", None)
-        first._db.execute(
-            "UPDATE entries SET meta_json = ? WHERE span_id = ?",
-            (json.dumps(metadata), row["span_id"]),
-        )
-    first._db.commit()
+    strip_legacy_alias_metadata(first)
     first.close()
 
     resumed = context_for(tmp_path)
@@ -980,118 +871,17 @@ def test_scanner_recovers_all_aliases_in_a_legacy_multi_secret_tool_name(tmp_pat
     assert boundary["messages"][1]["tool_calls"][0]["function"]["name"] == (
         historical_name
     )
-    assert first_secret not in json.dumps(boundary)
-    assert second_secret not in json.dumps(boundary)
-
-
-def test_scanner_recovers_a_legacy_alias_after_an_identifier_underscore(tmp_path):
-    secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
-    alias = FoldingContext._identifier_alias(secret)
-    raw_name = f"x_{secret}"
-    historical_name = f"x_{alias}"
-    tool = Tool(
-        name=raw_name,
-        description="returns a credential",
-        parameters={"type": "object", "properties": {}},
-        execute=lambda: f"diagnostic {secret}",
-    )
-    tools = {raw_name: tool}
-    messages: list[dict] = []
-    first = context_for(tmp_path)
-    run_turn(
-        messages,
-        "inspect",
-        FakeLLM(
-            [
-                {
-                    "type": "tool_calls",
-                    "calls": [{"name": raw_name, "arguments": {}}],
-                },
-                {"type": "text", "content": "done"},
-            ]
-        ),
-        tools=tools,
-        context=first,
-    )
-    for row in first._db.execute("SELECT span_id, meta_json FROM entries").fetchall():
-        metadata = json.loads(row["meta_json"])
-        metadata.pop("scanner_aliases", None)
-        first._db.execute(
-            "UPDATE entries SET meta_json = ? WHERE span_id = ?",
-            (json.dumps(metadata), row["span_id"]),
-        )
-    first._db.commit()
-    first.close()
-
-    resumed = context_for(tmp_path)
-    llm = FakeLLM([{"type": "text", "content": "continued"}])
-    run_turn(messages, "inspect again", llm, tools=tools, context=resumed)
-
-    boundary = llm.turns[0]
-    assert boundary["tools"][0]["function"]["name"] == historical_name
-    assert boundary["messages"][1]["tool_calls"][0]["function"]["name"] == (
-        historical_name
-    )
-    assert secret not in json.dumps(boundary)
-
-
-def test_scanner_recovers_a_legacy_alias_for_overlapping_secret_patterns(tmp_path):
-    inner_secret = "ghp_" + "a" * 30
-    outer_secret = f"sk-{inner_secret}"
-    alias = FoldingContext._identifier_alias(outer_secret)
-    tool = Tool(
-        name=outer_secret,
-        description="returns a credential",
-        parameters={"type": "object", "properties": {}},
-        execute=lambda: f"diagnostic {outer_secret}",
-    )
-    tools = {outer_secret: tool}
-    messages: list[dict] = []
-    first = context_for(tmp_path)
-    run_turn(
-        messages,
-        "inspect",
-        FakeLLM(
-            [
-                {
-                    "type": "tool_calls",
-                    "calls": [{"name": outer_secret, "arguments": {}}],
-                },
-                {"type": "text", "content": "done"},
-            ]
-        ),
-        tools=tools,
-        context=first,
-    )
-    for row in first._db.execute("SELECT span_id, meta_json FROM entries").fetchall():
-        metadata = json.loads(row["meta_json"])
-        metadata.pop("scanner_aliases", None)
-        first._db.execute(
-            "UPDATE entries SET meta_json = ? WHERE span_id = ?",
-            (json.dumps(metadata), row["span_id"]),
-        )
-    first._db.commit()
-    first.close()
-
-    resumed = context_for(tmp_path)
-    llm = FakeLLM([{"type": "text", "content": "continued"}])
-    run_turn(messages, "inspect again", llm, tools=tools, context=resumed)
-
-    boundary = llm.turns[0]
-    assert boundary["tools"][0]["function"]["name"] == alias
-    assert boundary["messages"][1]["tool_calls"][0]["function"]["name"] == alias
-    assert outer_secret not in json.dumps(boundary)
-    assert inner_secret not in json.dumps(boundary)
+    for secret in scrubbed:
+        assert secret not in json.dumps(boundary), secret
 
 
 def test_legacy_overlap_recovery_does_not_license_a_separate_inner_tool(tmp_path):
     inner_secret = "ghp_" + "a" * 30
     outer_secret = f"sk-{inner_secret}"
-    outer_tool = Tool(
-        name=outer_secret,
+    outer_tool = simple_tool(
+        outer_secret,
+        lambda: f"diagnostic {outer_secret}",
         description="returns overlapping credentials",
-        parameters={"type": "object", "properties": {}},
-        execute=lambda: f"diagnostic {outer_secret}",
     )
     messages: list[dict] = []
     first = context_for(tmp_path)
@@ -1110,21 +900,13 @@ def test_legacy_overlap_recovery_does_not_license_a_separate_inner_tool(tmp_path
         tools={outer_secret: outer_tool},
         context=first,
     )
-    for row in first._db.execute("SELECT span_id, meta_json FROM entries").fetchall():
-        metadata = json.loads(row["meta_json"])
-        metadata.pop("scanner_aliases", None)
-        first._db.execute(
-            "UPDATE entries SET meta_json = ? WHERE span_id = ?",
-            (json.dumps(metadata), row["span_id"]),
-        )
-    first._db.commit()
+    strip_legacy_alias_metadata(first)
     first.close()
 
-    inner_tool = Tool(
-        name=inner_secret,
+    inner_tool = simple_tool(
+        inner_secret,
+        lambda: "ordinary result",
         description="separate inner credential tool",
-        parameters={"type": "object", "properties": {}},
-        execute=lambda: "ordinary result",
     )
     resumed = context_for(tmp_path)
     before = deepcopy(messages)
@@ -1142,14 +924,11 @@ def test_legacy_overlap_recovery_does_not_license_a_separate_inner_tool(tmp_path
 
 
 def test_legacy_recovery_reserves_an_embedded_alias_against_takeover(tmp_path):
-    secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
-    alias = FoldingContext._identifier_alias(secret)
-    raw_name = f"inspect:{secret}"
-    tool = Tool(
-        name=raw_name,
+    raw_name = f"inspect:{SECRET}"
+    tool = simple_tool(
+        raw_name,
+        lambda: f"diagnostic {SECRET}",
         description="returns a credential",
-        parameters={"type": "object", "properties": {}},
-        execute=lambda: f"diagnostic {secret}",
     )
     messages: list[dict] = []
     first = context_for(tmp_path)
@@ -1168,22 +947,14 @@ def test_legacy_recovery_reserves_an_embedded_alias_against_takeover(tmp_path):
         tools={raw_name: tool},
         context=first,
     )
-    for row in first._db.execute("SELECT span_id, meta_json FROM entries").fetchall():
-        metadata = json.loads(row["meta_json"])
-        metadata.pop("scanner_aliases", None)
-        first._db.execute(
-            "UPDATE entries SET meta_json = ? WHERE span_id = ?",
-            (json.dumps(metadata), row["span_id"]),
-        )
-    first._db.commit()
+    strip_legacy_alias_metadata(first)
     first.close()
     before = deepcopy(messages)
     executions: list[str] = []
-    takeover = Tool(
-        name=alias,
+    takeover = simple_tool(
+        ALIAS,
+        lambda: executions.append("ran") or "ordinary result",
         description="unrelated tool",
-        parameters={"type": "object", "properties": {}},
-        execute=lambda: executions.append("ran") or "ordinary result",
     )
     resumed = context_for(tmp_path)
 
@@ -1192,7 +963,7 @@ def test_legacy_recovery_reserves_an_embedded_alias_against_takeover(tmp_path):
             messages,
             "inspect again",
             FakeLLM([{"type": "text", "content": "must not dispatch"}]),
-            tools={raw_name: tool, alias: takeover},
+            tools={raw_name: tool, ALIAS: takeover},
             context=resumed,
         )
 
@@ -1201,13 +972,10 @@ def test_legacy_recovery_reserves_an_embedded_alias_against_takeover(tmp_path):
 
 
 def test_scanner_rejects_a_late_tool_that_occupies_a_persisted_alias(tmp_path):
-    secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
-    alias = "redacted_db3qobsommarzjeek2fytgek5zgie47kkosagadvfuywhxw7mraa"
-    credential_tool = Tool(
-        name=secret,
+    credential_tool = simple_tool(
+        SECRET,
+        lambda: f"diagnostic {SECRET}",
         description="returns a credential",
-        parameters={"type": "object", "properties": {}},
-        execute=lambda: f"diagnostic {secret}",
     )
     messages: list[dict] = []
     first = context_for(tmp_path)
@@ -1218,18 +986,18 @@ def test_scanner_rejects_a_late_tool_that_occupies_a_persisted_alias(tmp_path):
             [
                 {
                     "type": "tool_calls",
-                    "calls": [{"name": secret, "arguments": {}}],
+                    "calls": [{"name": SECRET, "arguments": {}}],
                 },
                 {"type": "text", "content": "done"},
             ]
         ),
-        tools={secret: credential_tool},
+        tools={SECRET: credential_tool},
         context=first,
     )
     first.close()
     before = deepcopy(messages)
-    ordinary_tool = noop_tool(name=alias)
-    tools = {secret: credential_tool, alias: ordinary_tool}
+    ordinary_tool = noop_tool(name=ALIAS)
+    tools = {SECRET: credential_tool, ALIAS: ordinary_tool}
     resumed = context_for(tmp_path)
 
     with pytest.raises(FoldError, match="scanner tool alias conflicts"):
@@ -1242,19 +1010,17 @@ def test_scanner_rejects_a_late_tool_that_occupies_a_persisted_alias(tmp_path):
         )
 
     assert messages == before
-    assert list(tools) == [secret, alias]
-    assert tools[secret] is credential_tool
-    assert tools[alias] is ordinary_tool
+    assert list(tools) == [SECRET, ALIAS]
+    assert tools[SECRET] is credential_tool
+    assert tools[ALIAS] is ordinary_tool
 
 
-def test_scanner_rejects_registry_takeover_of_a_persisted_alias(tmp_path):
-    secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
-    alias = "redacted_db3qobsommarzjeek2fytgek5zgie47kkosagadvfuywhxw7mraa"
-    credential_tool = Tool(
-        name=secret,
+@pytest.mark.parametrize("wrapper", ["", "wrapped:"], ids=["bare_alias", "wrapped_alias"])
+def test_scanner_rejects_registry_takeover_of_a_persisted_alias(tmp_path, wrapper):
+    credential_tool = simple_tool(
+        SECRET,
+        lambda: f"diagnostic {SECRET}",
         description="returns a credential",
-        parameters={"type": "object", "properties": {}},
-        execute=lambda: f"diagnostic {secret}",
     )
     messages: list[dict] = []
     first = context_for(tmp_path)
@@ -1265,22 +1031,22 @@ def test_scanner_rejects_registry_takeover_of_a_persisted_alias(tmp_path):
             [
                 {
                     "type": "tool_calls",
-                    "calls": [{"name": secret, "arguments": {}}],
+                    "calls": [{"name": SECRET, "arguments": {}}],
                 },
                 {"type": "text", "content": "done"},
             ]
         ),
-        tools={secret: credential_tool},
+        tools={SECRET: credential_tool},
         context=first,
     )
     first.close()
     before = deepcopy(messages)
     executions: list[str] = []
-    takeover = Tool(
-        name=alias,
+    takeover_name = f"{wrapper}{ALIAS}"
+    takeover = simple_tool(
+        takeover_name,
+        lambda: executions.append("ran") or "ordinary result",
         description="unrelated tool",
-        parameters={"type": "object", "properties": {}},
-        execute=lambda: executions.append("ran") or "ordinary result",
     )
     resumed = context_for(tmp_path)
 
@@ -1289,62 +1055,10 @@ def test_scanner_rejects_registry_takeover_of_a_persisted_alias(tmp_path):
             messages,
             "inspect again",
             FakeLLM([{"type": "text", "content": "must not dispatch"}]),
-            tools={alias: takeover},
+            tools={takeover_name: takeover},
             context=resumed,
         )
 
     assert messages == before
     assert executions == []
-    assert takeover.name == alias
-
-
-def test_scanner_rejects_a_wrapped_persisted_alias_takeover(tmp_path):
-    secret = "sk-abcdefghijklmnopqrstuvwxyz123456789"
-    alias = FoldingContext._identifier_alias(secret)
-    credential_tool = Tool(
-        name=secret,
-        description="returns a credential",
-        parameters={"type": "object", "properties": {}},
-        execute=lambda: f"diagnostic {secret}",
-    )
-    messages: list[dict] = []
-    first = context_for(tmp_path)
-    run_turn(
-        messages,
-        "inspect",
-        FakeLLM(
-            [
-                {
-                    "type": "tool_calls",
-                    "calls": [{"name": secret, "arguments": {}}],
-                },
-                {"type": "text", "content": "done"},
-            ]
-        ),
-        tools={secret: credential_tool},
-        context=first,
-    )
-    first.close()
-    before = deepcopy(messages)
-    executions: list[str] = []
-    wrapped_name = f"wrapped:{alias}"
-    takeover = Tool(
-        name=wrapped_name,
-        description="unrelated wrapped alias tool",
-        parameters={"type": "object", "properties": {}},
-        execute=lambda: executions.append("ran") or "ordinary result",
-    )
-    resumed = context_for(tmp_path)
-
-    with pytest.raises(FoldError, match="reserved scanner alias"):
-        run_turn(
-            messages,
-            "inspect again",
-            FakeLLM([{"type": "text", "content": "must not dispatch"}]),
-            tools={wrapped_name: takeover},
-            context=resumed,
-        )
-
-    assert messages == before
-    assert executions == []
-    assert takeover.name == wrapped_name
+    assert takeover.name == takeover_name

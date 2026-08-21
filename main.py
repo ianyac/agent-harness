@@ -16,7 +16,7 @@ from harness.hooks import (
     run_stop,
     with_hooks,
 )
-from harness.folding import FoldingContext
+from harness.folding import FoldError, FoldingContext
 from harness.llm import make_llm
 from harness.loop import run_turn
 from harness.mcp import MCPError, MCPServer, load_config, mcp_tools
@@ -386,12 +386,18 @@ def main():
     folding = None
     if selected_context_mode == "folding":
         fold_db, decision_log = folding_paths(session_path)
-        folding = FoldingContext(
-            fold_db,
-            session_id=session_path.stem,
-            decision_log_path=decision_log,
-            session_log_path=session_path,
-        )
+        try:
+            folding = FoldingContext(
+                fold_db,
+                session_id=session_path.stem,
+                decision_log_path=decision_log,
+                session_log_path=session_path,
+            )
+        except FoldError as error:
+            # a ledger from another schema or projection template: fail
+            # closed at the CLI boundary rather than with a traceback
+            unlock(session_path)
+            parser.error(f"cannot open folding ledger for {session_path.name}: {error}")
         atexit.register(folding.close)
 
     # the action journal is keyed to the session and appended across

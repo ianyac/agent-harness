@@ -3,7 +3,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from harness.folding import FoldingContext
+from harness.folding import FoldConfig, FoldingContext
 from main import folding_paths
 
 
@@ -83,6 +83,24 @@ def test_resume_automatically_restores_the_persisted_folding_mode(tmp_path):
     assert result.returncode == 0
     assert "recoverable context folding enabled; compaction disabled" in result.stdout
     assert (sessions / "s.folds.sqlite3").exists()
+
+
+def test_resume_rejects_an_incompatible_folding_ledger_at_the_cli_boundary(tmp_path):
+    # Regression caught: a ledger written under another config or projection
+    # template must fail closed with a CLI error and a released lock, not a
+    # traceback from inside FoldingContext.
+    sessions = persisted_folding_session(tmp_path, ledger=False)
+    FoldingContext(
+        sessions / "s.folds.sqlite3", "s", config=FoldConfig(min_span_tokens=1)
+    ).close()
+
+    result = run_main("--resume", "s", workspace=tmp_path)
+
+    assert result.returncode == 2
+    assert "cannot open folding ledger for s.jsonl" in result.stderr
+    assert "resume config does not match" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not (sessions / "s.lock").exists()
 
 
 def test_resume_refuses_to_silently_replace_a_missing_folding_ledger(tmp_path):

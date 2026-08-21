@@ -84,10 +84,41 @@ _IDENTIFIER_SECRET_PATTERNS = (
     re.compile(r"AKIA[A-Z0-9]{16}"),
 )
 _REDACTION_MARKER = "[redacted — credential detected in tool output]"
+_DELETE_MARKER = "[deleted by user]"
 _SCANNER_ALIAS_PATTERN = re.compile(r"redacted_[a-z2-7]{52}")
 _SECRET_SHA_PATTERN = re.compile(r"[0-9a-f]{64}")
 _IDENTIFIER_VALUE_KEYS = frozenset(
     {"call_id", "id", "name", "tool_call_id", "tool_name"}
+)
+_ARGUMENT_KEYS = frozenset({"args", "arguments", "args_json"})
+_TEXT_KEYS = frozenset(
+    {"content", "note", "output", "payload", "result", "summary_text", "text"}
+)
+# Keys that name message, event, and tool schema slots. Outside exhaustive
+# mode they are kept verbatim so a scrubbed transcript still replays.
+_PROTOCOL_KEYS = frozenset(
+    {
+        "actor",
+        "call_id",
+        "decider",
+        "ev",
+        "event",
+        "field",
+        "id",
+        "message_id",
+        "name",
+        "origin",
+        "parent_id",
+        "placement",
+        "reason",
+        "session_id",
+        "span",
+        "span_id",
+        "state",
+        "tool_call_id",
+        "tool_name",
+        "type",
+    }
 )
 _SCHEMA_VERSION = 3
 
@@ -213,6 +244,13 @@ def _sha(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
 
+def _longest_first(replacements: dict[str, str]) -> dict[str, str]:
+    """Order substring replacements so an outer match is applied before an inner one."""
+    return dict(
+        sorted(replacements.items(), key=lambda item: len(item[0]), reverse=True)
+    )
+
+
 def _token_label(tokens: int) -> str:
     if tokens < 1_000:
         return str(tokens)
@@ -255,6 +293,30 @@ def _split_span(text: str, limit: int) -> list[str]:
     if current:
         chunks.append(current)
     return chunks or [text]
+
+
+# In-memory state that sync() restores alongside the SQLite rollback when
+# ingestion fails part-way. Copied members are snapshotted; plain members are
+# restored by reference (the shadow ref must remain the caller's own list).
+_SYNC_COPIED_STATE = (
+    "_active_ids",
+    "_snapshots",
+    "_last_projection_sources",
+    "_current_notices",
+    "_current_notice_ids",
+    "_scanner_identifier_replacements",
+    "_scanner_aliases",
+    "_scanner_alias_lengths",
+    "_legacy_scanner_tool_names",
+    "_reserved_scanner_tool_names",
+)
+_SYNC_PLAIN_STATE = (
+    "_shadow_ref",
+    "_vacuum_pending",
+    "_turn_user_id",
+    "_event_seq",
+    "_sync_in_progress",
+)
 
 
 class FoldingContext:
@@ -341,7 +403,7 @@ class FoldingContext:
             (self.session_id,),
         ).fetchone()
         new_config = existing_config is None
-        if existing_config is None:
+        if new_config:
             self._db.execute(
                 "INSERT INTO session_config(session_id, config_json) VALUES (?, ?)",
                 (self.session_id, snapshot),
@@ -385,33 +447,14 @@ class FoldingContext:
     def close(self) -> None:
         self._db.close()
 
-    def __enter__(self) -> FoldingContext:
-        return self
-
-    def __exit__(self, *_exc: object) -> None:
-        self.close()
-
     def sync(
         self,
         messages: list[dict],
         tools: dict[str, Tool] | None = None,
     ) -> None:
         message_snapshot = deepcopy(messages)
-        active_ids = self._active_ids.copy()
-        snapshots = self._snapshots.copy()
-        last_projection_sources = deepcopy(self._last_projection_sources)
-        shadow_ref = self._shadow_ref
-        vacuum_pending = self._vacuum_pending
-        turn_user_id = self._turn_user_id
-        current_notices = self._current_notices.copy()
-        current_notice_ids = self._current_notice_ids.copy()
-        event_seq = self._event_seq
-        scanner_identifier_replacements = self._scanner_identifier_replacements.copy()
-        scanner_aliases = self._scanner_aliases.copy()
-        scanner_alias_lengths = self._scanner_alias_lengths.copy()
-        legacy_scanner_tool_names = self._legacy_scanner_tool_names.copy()
-        reserved_scanner_tool_names = self._reserved_scanner_tool_names.copy()
-        sync_in_progress = self._sync_in_progress
+        saved = {name: deepcopy(getattr(self, name)) for name in _SYNC_COPIED_STATE}
+        saved.update({name: getattr(self, name) for name in _SYNC_PLAIN_STATE})
         self._sync_in_progress = True
         try:
             self._sync_pending(messages, tools)
@@ -419,23 +462,10 @@ class FoldingContext:
         except BaseException:
             self._db.rollback()
             messages[:] = message_snapshot
-            self._active_ids = active_ids
-            self._snapshots = snapshots
-            self._last_projection_sources = last_projection_sources
-            self._shadow_ref = shadow_ref
-            self._vacuum_pending = vacuum_pending
-            self._turn_user_id = turn_user_id
-            self._current_notices = current_notices
-            self._current_notice_ids = current_notice_ids
-            self._event_seq = event_seq
-            self._scanner_identifier_replacements = scanner_identifier_replacements
-            self._scanner_aliases = scanner_aliases
-            self._scanner_alias_lengths = scanner_alias_lengths
-            self._legacy_scanner_tool_names = legacy_scanner_tool_names
-            self._reserved_scanner_tool_names = reserved_scanner_tool_names
-            self._sync_in_progress = sync_in_progress
+            for name, value in saved.items():
+                setattr(self, name, value)
             raise
-        self._sync_in_progress = sync_in_progress
+        self._sync_in_progress = saved["_sync_in_progress"]
         if self._vacuum_pending:
             self._db.execute("VACUUM")
             self._vacuum_pending = False
@@ -640,104 +670,9 @@ class FoldingContext:
         }
         secrets = self._secret_values(content)
         if secrets:
-            identifier_replacements = self._sensitive_identifier_replacements(
-                secrets,
-                tuple(tool.name for tool in tools.values()),
+            self._quarantine_sensitive_result(
+                span_id, message, content, meta, secrets, tools
             )
-            projection_updates = self._prepare_sensitive_projection_redactions(
-                secrets, identifier_replacements
-            )
-            self._scanner_identifier_replacements.update(identifier_replacements)
-            self._scanner_identifier_replacements = dict(
-                sorted(
-                    self._scanner_identifier_replacements.items(),
-                    key=lambda item: len(item[0]),
-                    reverse=True,
-                )
-            )
-            self._purge_session_log(
-                secrets,
-                _REDACTION_MARKER,
-                replace_substrings=True,
-                exhaustive=True,
-                identifier_replacements=identifier_replacements,
-            )
-            for secret, replacement in identifier_replacements.items():
-                secret_sha = _sha(secret)
-                self._scanner_aliases[secret_sha] = replacement
-                self._scanner_alias_lengths[secret_sha] = len(secret)
-            sanitized_meta = dict(
-                self._scrub_structured(
-                    meta,
-                    secrets,
-                    _REDACTION_MARKER,
-                    replace_substrings=True,
-                    exhaustive=True,
-                    identifier_replacements=identifier_replacements,
-                )
-            )
-            sanitized_meta["scanner_aliases"] = {
-                _sha(secret): replacement
-                for secret, replacement in identifier_replacements.items()
-            }
-            sanitized_meta["scanner_alias_lengths"] = {
-                _sha(secret): len(secret) for secret in identifier_replacements
-            }
-            sanitized_tool_name = sanitized_meta.get("tool_name")
-            if (
-                isinstance(sanitized_tool_name, str)
-                and any(
-                    replacement in sanitized_tool_name
-                    for replacement in identifier_replacements.values()
-                )
-            ):
-                self._reserved_scanner_tool_names.add(sanitized_tool_name)
-            self._scrub_sqlite(
-                secrets,
-                _REDACTION_MARKER,
-                replace_substrings=True,
-                exhaustive=True,
-                identifier_replacements=identifier_replacements,
-            )
-            self._apply_projection_redactions(projection_updates)
-            self._scrub_live_shadow(
-                secrets,
-                _REDACTION_MARKER,
-                replace_substrings=True,
-                exhaustive=True,
-                identifier_replacements=identifier_replacements,
-            )
-            self._current_notices = [
-                str(
-                    self._scrub_data(
-                        notice,
-                        secrets,
-                        _REDACTION_MARKER,
-                        replace_substrings=True,
-                    )
-                )
-                for notice in self._current_notices
-            ]
-            self._insert_entry(
-                span_id,
-                None,
-                "tool_result",
-                "tool",
-                None,
-                sanitized_meta,
-                content_sha=_sha(content),
-                tokens_est=count_text_tokens(content),
-                state="purged",
-            )
-            self._db.execute(
-                "INSERT INTO folds(span_id, reason, note, decider, folded_turn, "
-                "placement, applied_turn) VALUES (?, 'sensitive', ?, 'scanner', ?, "
-                "'in_place', ?)",
-                (span_id, "credential detected in tool output", self.turn, self.turn),
-            )
-            message["content"] = _REDACTION_MARKER
-            self._vacuum_pending = True
-            self._event("scanner_hit", span=span_id)
             return
 
         self._insert_entry(span_id, None, "tool_result", "tool", content, meta)
@@ -758,6 +693,111 @@ class FoldingContext:
                 (span_id, call["tool_call_id"]),
             )
             self._apply_heuristics(span_id, call, tool)
+
+    def _quarantine_sensitive_result(
+        self,
+        span_id: str,
+        message: dict,
+        content: str,
+        meta: dict,
+        secrets: tuple[str, ...],
+        tools: dict[str, Tool],
+    ) -> None:
+        """Purge a credential-bearing result from every local copy, in place."""
+        identifier_replacements = self._sensitive_identifier_replacements(
+            secrets,
+            tuple(tool.name for tool in tools.values()),
+        )
+        projection_updates = self._prepare_sensitive_projection_redactions(
+            secrets, identifier_replacements
+        )
+        self._scanner_identifier_replacements.update(identifier_replacements)
+        self._scanner_identifier_replacements = _longest_first(
+            self._scanner_identifier_replacements
+        )
+        self._purge_session_log(
+            secrets,
+            _REDACTION_MARKER,
+            replace_substrings=True,
+            exhaustive=True,
+            identifier_replacements=identifier_replacements,
+        )
+        new_aliases = {
+            _sha(secret): replacement
+            for secret, replacement in identifier_replacements.items()
+        }
+        new_alias_lengths = {
+            _sha(secret): len(secret) for secret in identifier_replacements
+        }
+        self._scanner_aliases.update(new_aliases)
+        self._scanner_alias_lengths.update(new_alias_lengths)
+        sanitized_meta = dict(
+            self._scrub_structured(
+                meta,
+                secrets,
+                _REDACTION_MARKER,
+                replace_substrings=True,
+                exhaustive=True,
+                identifier_replacements=identifier_replacements,
+            )
+        )
+        sanitized_meta["scanner_aliases"] = new_aliases
+        sanitized_meta["scanner_alias_lengths"] = new_alias_lengths
+        sanitized_tool_name = sanitized_meta.get("tool_name")
+        if (
+            isinstance(sanitized_tool_name, str)
+            and any(
+                replacement in sanitized_tool_name
+                for replacement in identifier_replacements.values()
+            )
+        ):
+            self._reserved_scanner_tool_names.add(sanitized_tool_name)
+        self._scrub_sqlite(
+            secrets,
+            _REDACTION_MARKER,
+            replace_substrings=True,
+            exhaustive=True,
+            identifier_replacements=identifier_replacements,
+        )
+        self._apply_projection_redactions(projection_updates)
+        self._scrub_live_shadow(
+            secrets,
+            _REDACTION_MARKER,
+            replace_substrings=True,
+            exhaustive=True,
+            identifier_replacements=identifier_replacements,
+        )
+        self._current_notices = [
+            str(
+                self._scrub_data(
+                    notice,
+                    secrets,
+                    _REDACTION_MARKER,
+                    replace_substrings=True,
+                )
+            )
+            for notice in self._current_notices
+        ]
+        self._insert_entry(
+            span_id,
+            None,
+            "tool_result",
+            "tool",
+            None,
+            sanitized_meta,
+            content_sha=_sha(content),
+            tokens_est=count_text_tokens(content),
+            state="purged",
+        )
+        self._db.execute(
+            "INSERT INTO folds(span_id, reason, note, decider, folded_turn, "
+            "placement, applied_turn) VALUES (?, 'sensitive', ?, 'scanner', ?, "
+            "'in_place', ?)",
+            (span_id, "credential detected in tool output", self.turn, self.turn),
+        )
+        message["content"] = _REDACTION_MARKER
+        self._vacuum_pending = True
+        self._event("scanner_hit", span=span_id)
 
     def _insert_entry(
         self,
@@ -794,10 +834,6 @@ class FoldingContext:
             "INSERT INTO span_state(span_id, state) VALUES (?, ?)",
             (span_id, state),
         )
-
-    @staticmethod
-    def _contains_secret(content: str) -> bool:
-        return bool(FoldingContext._secret_values(content))
 
     @staticmethod
     def _secret_values(content: str) -> tuple[str, ...]:
@@ -971,8 +1007,6 @@ class FoldingContext:
             "VALUES (?, 'auto', ?, ?)",
             (span_id, f"[auto-folded {span_id} — {reason}: {note}]", self.turn),
         )
-        if not self._sync_in_progress:
-            self._db.commit()
         return True
 
     def span_ids(self) -> list[str]:
@@ -1387,13 +1421,7 @@ class FoldingContext:
             for secret in secrets
             if _sha(secret) in self._scanner_aliases or secret in recovered
         }
-        effective_replacements = dict(
-            sorted(
-                effective_replacements.items(),
-                key=lambda item: len(item[0]),
-                reverse=True,
-            )
-        )
+        effective_replacements = _longest_first(effective_replacements)
         uncovered_secrets = {
             secret
             for tool_name, secrets in candidates_by_tool
@@ -1420,26 +1448,16 @@ class FoldingContext:
         """Return scanner-safe names for definitions offered to the model."""
         aliases: dict[str, str] = {}
         offered_names: set[str] = set()
-        registered_tools = list(tools.values())
         candidates_by_tool = [
             (tool.name, self._scanner_secret_candidates(tool.name))
-            for tool in registered_tools
+            for tool in tools.values()
         ]
         self._recover_legacy_scanner_aliases(candidates_by_tool)
-        reserved_aliases = {
-            replacement: secret_sha
-            for secret_sha, replacement in self._scanner_aliases.items()
-        }
-        for tool, (_tool_name, secret_candidates) in zip(
-            registered_tools, candidates_by_tool, strict=True
-        ):
-            if tool.name in self._reserved_scanner_tool_names:
-                raise FoldError(
-                    "scanner tool alias conflicts: registered tool name uses a "
-                    "reserved scanner alias; "
-                    "start a new session with non-conflicting tool names"
-                )
-            if any(alias in tool.name for alias in reserved_aliases):
+        reserved_aliases = set(self._scanner_aliases.values())
+        for tool_name, secret_candidates in candidates_by_tool:
+            if tool_name in self._reserved_scanner_tool_names or any(
+                alias in tool_name for alias in reserved_aliases
+            ):
                 raise FoldError(
                     "scanner tool alias conflicts: registered tool name uses a "
                     "reserved scanner alias; "
@@ -1450,22 +1468,16 @@ class FoldingContext:
                 replacement = self._scanner_aliases.get(_sha(secret))
                 if replacement is not None:
                     replacements[secret] = replacement
-            replacements = dict(
-                sorted(
-                    replacements.items(),
-                    key=lambda item: len(item[0]),
-                    reverse=True,
-                )
-            )
-            cleaned = self._replace_identifiers(tool.name, replacements)
+            replacements = _longest_first(replacements)
+            cleaned = self._replace_identifiers(tool_name, replacements)
             if cleaned in offered_names:
                 raise FoldError(
                     "scanner tool alias conflicts with another registered tool; "
                     "start a new session with non-conflicting tool names"
                 )
             offered_names.add(cleaned)
-            if cleaned != tool.name:
-                aliases[tool.name] = cleaned
+            if cleaned != tool_name:
+                aliases[tool_name] = cleaned
         return aliases
 
     def pin(self, span_id: str) -> str:
@@ -1525,7 +1537,7 @@ class FoldingContext:
         payload = self._entry(target)["content"]
         if payload is None:
             raise self._unknown_span(target)
-        span_ids, _owner_ids = self._user_delete_aliases(target)
+        span_ids = self._user_delete_aliases(target)
         indexed_parents = self._user_delete_indexed_parents(payload) - span_ids
         indexed_span_ids = indexed_parents | self._user_delete_descendants(indexed_parents)
         indexed_target_ids = indexed_parents | self._user_delete_indexed_children(
@@ -1605,7 +1617,7 @@ class FoldingContext:
         input_aliases: list[dict[str, str]],
         payload: str,
     ) -> dict[str, list[dict[str, object]]]:
-        marker = "[deleted by user]"
+        marker = _DELETE_MARKER
         operations: dict[str, list[dict[str, object]]] = {}
 
         def add(source_id: str, operation: dict[str, object]) -> None:
@@ -1674,7 +1686,7 @@ class FoldingContext:
             cleaned = self._scrub_text(
                 row["content"],
                 erased,
-                "[deleted by user]",
+                _DELETE_MARKER,
                 mode="data",
                 replace_substrings=True,
             )
@@ -1683,13 +1695,13 @@ class FoldingContext:
             operations.setdefault(str(row["message_id"]), []).append(
                 {
                     "kind": "notice",
-                    "marker": "[deleted by user]",
+                    "marker": _DELETE_MARKER,
                     "content": row["content"],
                     "replacement": cleaned,
                 }
             )
 
-    def _user_delete_aliases(self, target: str) -> tuple[set[str], set[str]]:
+    def _user_delete_aliases(self, target: str) -> set[str]:
         root = self._entry(target)
         payload = root["content"]
         span_ids = {target, *self.child_ids(target)}
@@ -1703,8 +1715,7 @@ class FoldingContext:
                 span_ids.add(row["span_id"])
                 span_ids.update(self.child_ids(row["span_id"]))
         span_ids.update(self._user_delete_descendants(span_ids))
-        owner_ids = {span_id.split(".", 1)[0] for span_id in span_ids}
-        return span_ids, owner_ids
+        return span_ids
 
     def _user_delete_descendants(self, span_ids: set[str]) -> set[str]:
         descendants: set[str] = set()
@@ -1813,7 +1824,7 @@ class FoldingContext:
             "AND content = ?",
             [*parent_ids, payload],
         ).fetchall()
-        marker = "[deleted by user]"
+        marker = _DELETE_MARKER
         for row in rows:
             self._db.execute(
                 "UPDATE entries SET content = ?, content_sha = ?, tokens_est = ? "
@@ -1840,6 +1851,18 @@ class FoldingContext:
             )
             owner_contents[parent_id.split(".", 1)[0]] = content
         return owner_contents
+
+    @staticmethod
+    def _redact_argument_field(args_json: str, field: str, payload: str) -> str | None:
+        """Canonical arguments with ``field`` erased when it holds exactly ``payload``."""
+        try:
+            arguments = json.loads(args_json)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(arguments, dict) or arguments.get(field) != payload:
+            return None
+        arguments[field] = _DELETE_MARKER
+        return _canonical(arguments)
 
     def _scrub_delete_entry_metadata(
         self,
@@ -1874,14 +1897,11 @@ class FoldingContext:
             alias = aliases_by_span.get(str(row["span_id"]))
             if alias is None:
                 continue
-            try:
-                arguments = json.loads(metadata.get("args_json", ""))
-            except json.JSONDecodeError:
+            args_json = self._redact_argument_field(
+                metadata.get("args_json", ""), alias["field"], payload
+            )
+            if args_json is None:
                 continue
-            if not isinstance(arguments, dict) or arguments.get(alias["field"]) != payload:
-                continue
-            arguments[alias["field"]] = "[deleted by user]"
-            args_json = _canonical(arguments)
             metadata["args_json"] = args_json
             tool_name = metadata.get("tool_name")
             if isinstance(tool_name, str):
@@ -1904,14 +1924,11 @@ class FoldingContext:
             ).fetchone()
             if row is None:
                 continue
-            try:
-                args = json.loads(row["args_json"])
-            except json.JSONDecodeError:
+            args_json = self._redact_argument_field(
+                row["args_json"], alias["field"], payload
+            )
+            if args_json is None:
                 continue
-            if not isinstance(args, dict) or args.get(alias["field"]) != payload:
-                continue
-            args[alias["field"]] = "[deleted by user]"
-            args_json = _canonical(args)
             self._db.execute(
                 "UPDATE tool_calls SET args_json = ?, canonical_key = ? "
                 "WHERE tool_call_id = ?",
@@ -1930,7 +1947,7 @@ class FoldingContext:
         cleaned = deepcopy(message)
         content = cleaned.get("content")
         if root_owner and content == payload:
-            cleaned["content"] = "[deleted by user]"
+            cleaned["content"] = _DELETE_MARKER
         elif indexed_content is not None:
             cleaned["content"] = indexed_content
         for alias in input_aliases:
@@ -1938,13 +1955,11 @@ class FoldingContext:
                 if call.get("id") != alias["call_id"]:
                     continue
                 function = call.get("function") or {}
-                try:
-                    arguments = json.loads(function.get("arguments", ""))
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(arguments, dict) and arguments.get(alias["field"]) == payload:
-                    arguments[alias["field"]] = "[deleted by user]"
-                    function["arguments"] = _canonical(arguments)
+                arguments = FoldingContext._redact_argument_field(
+                    function.get("arguments", ""), alias["field"], payload
+                )
+                if arguments is not None:
+                    function["arguments"] = arguments
         return cleaned
 
     def _scrub_delete_messages(
@@ -1990,25 +2005,23 @@ class FoldingContext:
     def _scrub_delete_folds_and_notices(
         self, span_ids: set[str], erased: list[str]
     ) -> dict[int, str]:
-        if span_ids:
-            placeholders = ",".join("?" for _ in span_ids)
-            rows = self._db.execute(
-                f"SELECT fold_id, note FROM folds WHERE span_id IN ({placeholders})",
-                list(span_ids),
-            ).fetchall()
-            for row in rows:
-                cleaned = self._scrub_text(
-                    row["note"], erased, "[deleted by user]", mode="data",
-                    replace_substrings=True,
-                )
-                if cleaned != row["note"]:
-                    self._db.execute(
-                        "UPDATE folds SET note = ? WHERE fold_id = ?",
-                        (cleaned, row["fold_id"]),
-                    )
         if not span_ids:
             return {}
         placeholders = ",".join("?" for _ in span_ids)
+        rows = self._db.execute(
+            f"SELECT fold_id, note FROM folds WHERE span_id IN ({placeholders})",
+            list(span_ids),
+        ).fetchall()
+        for row in rows:
+            cleaned = self._scrub_text(
+                row["note"], erased, _DELETE_MARKER, mode="data",
+                replace_substrings=True,
+            )
+            if cleaned != row["note"]:
+                self._db.execute(
+                    "UPDATE folds SET note = ? WHERE fold_id = ?",
+                    (cleaned, row["fold_id"]),
+                )
         rows = self._db.execute(
             f"SELECT notice_id, content FROM notices WHERE span_id IN ({placeholders})",
             list(span_ids),
@@ -2016,7 +2029,7 @@ class FoldingContext:
         updates: dict[int, str] = {}
         for row in rows:
             cleaned = self._scrub_text(
-                row["content"], erased, "[deleted by user]", mode="data",
+                row["content"], erased, _DELETE_MARKER, mode="data",
                 replace_substrings=True,
             )
             if cleaned != row["content"]:
@@ -2054,50 +2067,12 @@ class FoldingContext:
                 ],
                 payload=payload,
             )
-            if cleaned == message or not isinstance(cleaned, dict):
+            if cleaned == message:
                 continue
             message.clear()
             message.update(cleaned)
             if index < len(self._snapshots):
                 self._snapshots[index] = _canonical(message)
-
-    def _purge_entry_copies(
-        self, erased: list[str], marker: str, *, replace_substrings: bool
-    ) -> None:
-        rows = self._db.execute(
-            "SELECT span_id, parent_id, role, content FROM entries "
-            "WHERE content IS NOT NULL"
-        ).fetchall()
-        for row in rows:
-            content = row["content"]
-            cleaned = str(
-                self._scrub_data(
-                    content, erased, marker, replace_substrings=replace_substrings
-                )
-            )
-            if cleaned == content:
-                continue
-            span_id = row["span_id"]
-            if content in erased:
-                if row["parent_id"] is not None and row["role"] == "tool_result":
-                    # A chunk is an index into its parent, not an independent
-                    # copy. Sanitizing it here lets reconciliation repartition
-                    # the cleaned parent coherently. If this is a target chunk,
-                    # its purged parent terminally purges it below.
-                    self._db.execute(
-                        "UPDATE entries SET content = ?, content_sha = ?, "
-                        "tokens_est = ? WHERE span_id = ?",
-                        (marker, _sha(marker), count_text_tokens(marker), span_id),
-                    )
-                else:
-                    self._mark_entry_purged(span_id)
-            else:
-                self._db.execute(
-                    "UPDATE entries SET content = ?, content_sha = ?, tokens_est = ? "
-                    "WHERE span_id = ?",
-                    (cleaned, _sha(cleaned), count_text_tokens(cleaned), span_id),
-                )
-        self._reconcile_child_copies()
 
     def _mark_entry_purged(self, span_id: str) -> None:
         state = self._db.execute(
@@ -2119,68 +2094,14 @@ class FoldingContext:
                 (span_id, self.turn, self.turn),
             )
 
-    def _reconcile_child_copies(self, parent_ids: set[str] | None = None) -> None:
-        """Keep chunk storage from retaining bytes removed from its parent."""
-        query = (
-            "SELECT DISTINCT p.span_id, p.content, s.state FROM entries p "
-            "JOIN entries c ON c.parent_id = p.span_id "
-            "JOIN span_state s ON s.span_id = p.span_id "
-            "WHERE p.session_id = ? "
-            "AND p.role = 'tool_result' AND c.role = 'tool_result' "
-        )
-        parameters: list[object] = [self.session_id]
-        if parent_ids is not None:
-            if not parent_ids:
-                return
-            query += "AND p.span_id IN (" + ",".join("?" for _ in parent_ids) + ") "
-            parameters.extend(parent_ids)
-        parents = self._db.execute(query + "ORDER BY p.rowid", parameters).fetchall()
-        for parent in parents:
-            children = self._db.execute(
-                "SELECT e.span_id, e.content, s.state FROM entries e "
-                "JOIN span_state s USING(span_id) "
-                "WHERE e.parent_id = ? AND e.session_id = ? "
-                "AND e.role = 'tool_result' ORDER BY e.rowid",
-                (parent["span_id"], self.session_id),
-            ).fetchall()
-            if parent["state"] == "purged":
-                for child in children:
-                    self._mark_entry_purged(child["span_id"])
-                continue
-
-            content = parent["content"] or ""
-            if "".join(child["content"] or "" for child in children) == content:
-                continue
-            pieces = _split_span(content, self.config.chunk_tokens)
-            if len(pieces) > len(children):
-                pieces = [
-                    *pieces[: len(children) - 1],
-                    "".join(pieces[len(children) - 1 :]),
-                ]
-            else:
-                pieces.extend("" for _ in range(len(children) - len(pieces)))
-            for child, piece in zip(children, pieces):
-                if child["state"] == "purged":
-                    continue
-                self._db.execute(
-                    "UPDATE entries SET content = ?, content_sha = ?, tokens_est = ? "
-                    "WHERE span_id = ?",
-                    (
-                        piece,
-                        _sha(piece),
-                        count_text_tokens(piece),
-                        child["span_id"],
-                    ),
-                )
-
     def _scrub_live_shadow(
         self,
         erased: tuple[str, ...] | list[str],
         marker: str,
         *,
         replace_substrings: bool,
-        exhaustive: bool = False,
-        identifier_replacements: dict[str, str] | None = None,
+        exhaustive: bool,
+        identifier_replacements: dict[str, str],
     ) -> None:
         if self._shadow_ref is None:
             return
@@ -2193,7 +2114,7 @@ class FoldingContext:
                 exhaustive=exhaustive,
                 identifier_replacements=identifier_replacements,
             )
-            if cleaned == message or not isinstance(cleaned, dict):
+            if cleaned == message:
                 continue
             message.clear()
             message.update(cleaned)
@@ -2220,10 +2141,8 @@ class FoldingContext:
                 if key == "role":
                     cleaned[key] = item
                 elif exhaustive and key in _IDENTIFIER_VALUE_KEYS:
-                    cleaned[key] = cls._scrub_identifier(
-                        item, erased, identifier_replacements
-                    )
-                elif key in {"args", "arguments", "args_json"}:
+                    cleaned[key] = cls._scrub_identifier(item, identifier_replacements)
+                elif key in _ARGUMENT_KEYS:
                     cleaned[key] = cls._scrub_arguments(
                         item, erased, marker, replace_substrings=replace_substrings
                     )
@@ -2236,41 +2155,11 @@ class FoldingContext:
                         exhaustive=exhaustive,
                         identifier_replacements=identifier_replacements,
                     )
-                elif key in {
-                    "content",
-                    "note",
-                    "output",
-                    "payload",
-                    "result",
-                    "summary_text",
-                    "text",
-                }:
+                elif key in _TEXT_KEYS:
                     cleaned[key] = cls._scrub_data(
                         item, erased, marker, replace_substrings=replace_substrings
                     )
-                elif not exhaustive and key in {
-                    "actor",
-                    "call_id",
-                    "decider",
-                    "ev",
-                    "event",
-                    "field",
-                    "id",
-                    "message_id",
-                    "name",
-                    "origin",
-                    "parent_id",
-                    "placement",
-                    "reason",
-                    "role",
-                    "session_id",
-                    "span",
-                    "span_id",
-                    "state",
-                    "tool_call_id",
-                    "tool_name",
-                    "type",
-                }:
+                elif not exhaustive and key in _PROTOCOL_KEYS:
                     cleaned[key] = item
                 else:
                     cleaned[key] = cls._scrub_structured(
@@ -2322,18 +2211,9 @@ class FoldingContext:
         return cleaned
 
     @classmethod
-    def _scrub_identifier(
-        cls,
-        value: object,
-        erased: tuple[str, ...] | list[str],
-        replacements: dict[str, str] | None = None,
-    ) -> object:
+    def _scrub_identifier(cls, value: object, replacements: dict[str, str]) -> object:
         if not isinstance(value, str):
             return value
-        if replacements is None:
-            replacements = {
-                secret: cls._identifier_alias(secret) for secret in erased if secret
-            }
         return cls._replace_identifiers(value, replacements)
 
     @classmethod
@@ -2350,18 +2230,7 @@ class FoldingContext:
                     tool_name, separator, _arguments = item.partition(":")
                     found.add(tool_name if separator else item)
                     continue
-                if key in {
-                    "args",
-                    "arguments",
-                    "args_json",
-                    "content",
-                    "note",
-                    "output",
-                    "payload",
-                    "result",
-                    "summary_text",
-                    "text",
-                }:
+                if key in _ARGUMENT_KEYS or key in _TEXT_KEYS:
                     continue
                 cls._collect_identifier_values(item, found)
         elif isinstance(value, list):
@@ -2371,7 +2240,7 @@ class FoldingContext:
     def _sensitive_identifier_replacements(
         self,
         secrets: tuple[str, ...],
-        offered_tool_names: tuple[str, ...] = (),
+        offered_tool_names: tuple[str, ...],
     ) -> dict[str, str]:
         identifiers = set(offered_tool_names)
         identifiers.update({
@@ -2536,7 +2405,7 @@ class FoldingContext:
         tool_name, separator, arguments = value.partition(":")
         if not separator:
             return (
-                cls._scrub_identifier(value, erased, identifier_replacements)
+                cls._scrub_identifier(value, identifier_replacements)
                 if exhaustive
                 else value
             )
@@ -2544,7 +2413,7 @@ class FoldingContext:
             arguments, erased, marker, replace_substrings=replace_substrings
         )
         cleaned_name = (
-            cls._scrub_identifier(tool_name, erased, identifier_replacements)
+            cls._scrub_identifier(tool_name, identifier_replacements)
             if exhaustive
             else tool_name
         )
@@ -2598,7 +2467,7 @@ class FoldingContext:
             )
         if mode == "identifier":
             return (
-                str(cls._scrub_identifier(value, erased, identifier_replacements))
+                str(cls._scrub_identifier(value, identifier_replacements))
                 if exhaustive
                 else value
             )
@@ -2614,8 +2483,8 @@ class FoldingContext:
         marker: str,
         *,
         replace_substrings: bool,
-        exhaustive: bool = False,
-        identifier_replacements: dict[str, str] | None = None,
+        exhaustive: bool,
+        identifier_replacements: dict[str, str],
     ) -> None:
         columns = (
             ("entries", "content", "data"),
@@ -2665,17 +2534,17 @@ class FoldingContext:
         validated: list[tuple[int, list[dict], list[str]]] = []
         for row in rows:
             projection_id = int(row["projection_id"])
+            messages = self._decode_projection_messages(
+                projection_id, row["projection_json"]
+            )
             try:
-                messages = json.loads(row["projection_json"])
                 sources = json.loads(row["source_ids_json"])
             except (TypeError, json.JSONDecodeError) as error:
                 raise ProjectionError(
                     f"projection {projection_id} is malformed"
                 ) from error
             if not (
-                isinstance(messages, list)
-                and all(isinstance(message, dict) for message in messages)
-                and isinstance(sources, list)
+                isinstance(sources, list)
                 and all(isinstance(source, str) for source in sources)
                 and len(sources) == len(messages)
             ):
@@ -2687,6 +2556,20 @@ class FoldingContext:
                 raise ProjectionError(f"projection {projection_id} hash mismatch")
             validated.append((projection_id, messages, sources))
         return validated
+
+    @staticmethod
+    def _decode_projection_messages(
+        projection_id: int, projection_json: str
+    ) -> list[dict]:
+        try:
+            messages = json.loads(projection_json)
+        except (TypeError, json.JSONDecodeError) as error:
+            raise ProjectionError(f"projection {projection_id} is malformed") from error
+        if not isinstance(messages, list) or not all(
+            isinstance(message, dict) for message in messages
+        ):
+            raise ProjectionError(f"projection {projection_id} is malformed")
+        return messages
 
     def _prepare_sensitive_projection_redactions(
         self, secrets: tuple[str, ...], identifier_replacements: dict[str, str]
@@ -2781,8 +2664,6 @@ class FoldingContext:
         for projection_id, messages, sources in self._validated_projection_rows():
             changed = False
             for message, source in zip(messages, sources):
-                if not isinstance(message, dict) or not isinstance(source, str):
-                    continue
                 source_id = source.split(":", 1)[1] if ":" in source else source
                 source_operations = operations.get(source_id)
                 if source_operations is None:
@@ -2869,7 +2750,7 @@ class FoldingContext:
     def _purge_session_log(
         self,
         erased: tuple[str, ...] | list[str],
-        marker: str = "[deleted by user]",
+        marker: str = _DELETE_MARKER,
         *,
         replace_substrings: bool,
         exhaustive: bool = False,
@@ -3157,9 +3038,7 @@ class FoldingContext:
                 return "illegal_state" if cause == "already" else cause
         return "invalid"
 
-    def checkpoint(self, turn: int | None = None, reason: str = "explicit") -> int:
-        if turn is not None:
-            self.turn = turn
+    def checkpoint(self, reason: str = "explicit") -> int:
         projection_hash: str | None = None
         parent_hash: str | None = None
         with self._db:
@@ -3227,14 +3106,7 @@ class FoldingContext:
         ).fetchone()
         if row is None:
             raise ProjectionError(f"unknown projection {projection_id}")
-        try:
-            messages = json.loads(row["projection_json"])
-        except (TypeError, json.JSONDecodeError) as error:
-            raise ProjectionError(f"projection {projection_id} is malformed") from error
-        if not isinstance(messages, list) or not all(
-            isinstance(message, dict) for message in messages
-        ):
-            raise ProjectionError(f"projection {projection_id} is malformed")
+        messages = self._decode_projection_messages(projection_id, row["projection_json"])
         if not row["redacted"] and _sha(_canonical(messages)) != row["projection_hash"]:
             raise ProjectionError(f"projection {projection_id} hash mismatch")
         return messages
@@ -3440,30 +3312,38 @@ class FoldingContext:
                 arguments = json.loads(call["function"]["arguments"])
             except json.JSONDecodeError:
                 continue
-            state = self.state(span_id, turn)
-            replacement: str | None = None
-            if state == "purged":
-                replacement = self._purge_marker(span_id, turn)
-            elif state == "quarantined":
-                replacement = self._marker(span_id, self._latest_fold(span_id, turn))
-            elif self._is_tail_reinstated(span_id, turn):
-                replacement = (
-                    f"[unfolded {span_id} → tail, turn "
-                    f"{self._latest_fold(span_id, turn)['unfolded_turn']}]"
-                )
-            elif state == "folded":
-                fold = self._open_fold(span_id, turn)
-                if fold is not None and fold["placement"] is not None:
-                    replacement = self._marker(span_id, fold)
+            replacement = self._state_marker(span_id, turn)
             if replacement is not None:
                 arguments[meta["field"]] = replacement
                 call["function"]["arguments"] = _canonical(arguments)
 
     def _render_result(self, span_id: str, turn: int | None = None) -> str:
         entry = self._entry(span_id)
+        marker = self._state_marker(span_id, turn)
+        if marker is not None:
+            return marker
+
+        children = self.child_ids(span_id)
+        header = f"[{span_id} · ~{_token_label(entry['tokens_est'])} tok]"
+        if not children:
+            return f"{header}\n{entry['content']}"
+        rendered = [header]
+        for child_id in children:
+            child = self._entry(child_id)
+            body = self._state_marker(child_id, turn)
+            if body is None:
+                body = (
+                    f"[{child_id} · ~{_token_label(child['tokens_est'])} tok]\n"
+                    f"{child['content']}"
+                )
+            rendered.append(body)
+        return "\n".join(rendered)
+
+    def _state_marker(self, span_id: str, turn: int | None) -> str | None:
+        """The marker standing in for a span, or None while it still renders in full."""
         state = self.state(span_id, turn)
         if state == "purged":
-            return self._purge_marker(span_id, turn)
+            return self._purge_marker(span_id)
         if state == "quarantined":
             return self._marker(span_id, self._latest_fold(span_id, turn))
         if self._is_tail_reinstated(span_id, turn):
@@ -3475,39 +3355,7 @@ class FoldingContext:
             open_fold = self._open_fold(span_id, turn)
             if open_fold is not None and open_fold["placement"] is not None:
                 return self._marker(span_id, open_fold)
-
-        children = self.child_ids(span_id)
-        header = f"[{span_id} · ~{_token_label(entry['tokens_est'])} tok]"
-        if not children:
-            return f"{header}\n{entry['content']}"
-        rendered = [header]
-        for child_id in children:
-            child = self._entry(child_id)
-            child_state = self.state(child_id, turn)
-            if child_state == "purged":
-                body = self._purge_marker(child_id, turn)
-            elif child_state == "quarantined":
-                body = self._marker(child_id, self._latest_fold(child_id, turn))
-            elif self._is_tail_reinstated(child_id, turn):
-                body = (
-                    f"[unfolded {child_id} → tail, turn "
-                    f"{self._latest_fold(child_id, turn)['unfolded_turn']}]"
-                )
-            elif child_state == "folded":
-                child_fold = self._open_fold(child_id, turn)
-                body = (
-                    self._marker(child_id, child_fold)
-                    if child_fold is not None and child_fold["placement"] is not None
-                    else f"[{child_id} · ~{_token_label(child['tokens_est'])} tok]\n"
-                    f"{child['content']}"
-                )
-            else:
-                body = (
-                    f"[{child_id} · ~{_token_label(child['tokens_est'])} tok]\n"
-                    f"{child['content']}"
-                )
-            rendered.append(body)
-        return "\n".join(rendered)
+        return None
 
     def _marker(self, span_id: str, fold: sqlite3.Row) -> str:
         reason = fold["reason"]
@@ -3528,12 +3376,12 @@ class FoldingContext:
             f'{provenance}{reason}: "{note}" unfold available]'
         )
 
-    def _purge_marker(self, span_id: str, turn: int | None = None) -> str:
+    def _purge_marker(self, span_id: str) -> str:
         deleted = self._db.execute(
             "SELECT 1 FROM folds WHERE span_id = ? AND reason = 'user_delete' LIMIT 1",
             (span_id,),
         ).fetchone()
-        return "[deleted by user]" if deleted is not None else _REDACTION_MARKER
+        return _DELETE_MARKER if deleted is not None else _REDACTION_MARKER
 
     def _latest_fold(self, span_id: str, turn: int | None = None) -> sqlite3.Row:
         if turn is None:

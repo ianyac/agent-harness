@@ -149,4 +149,36 @@ describe("ConversationHeader", () => {
     expect(screen.queryByRole("dialog", { name: "Enable accept all?" })).not.toBeInTheDocument();
     expect(onSetSessionMode).not.toHaveBeenCalled();
   });
+
+  it("exposes the activity button as a toggle that reflects the open inspector", async () => {
+    const user = userEvent.setup();
+    const onToggleActivity = vi.fn();
+    const { rerender } = render(
+      <ConversationHeader
+        {...{ sessionId: "session-1" }}
+        workspace="/work/one"
+        branch={null}
+        mode="default"
+        onSetSessionMode={() => {}}
+        onToggleActivity={onToggleActivity}
+      />,
+    );
+    const activity = screen.getByRole("button", { name: "Activity" });
+    expect(activity).toHaveAttribute("aria-pressed", "false");
+    await user.click(activity);
+    expect(onToggleActivity).toHaveBeenCalledTimes(1);
+
+    rerender(
+      <ConversationHeader
+        {...{ sessionId: "session-1" }}
+        workspace="/work/one"
+        branch={null}
+        mode="default"
+        activityOpen
+        onSetSessionMode={() => {}}
+        onToggleActivity={onToggleActivity}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "Activity" })).toHaveAttribute("aria-pressed", "true");
+  });
 });

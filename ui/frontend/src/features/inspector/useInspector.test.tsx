@@ -1,8 +1,8 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { useInspector } from "./useInspector";
+import { INSPECTOR_DOCK_QUERY, useInspector } from "./useInspector";
 
 type MemoryStorage = Pick<Storage, "getItem" | "setItem"> & { values: Map<string, string> };
 
@@ -28,7 +28,7 @@ function Harness({
   return (
     <>
       <output aria-label="Inspector state">
-        {`${model.open ? "open" : "closed"}|${model.pinned ? "pinned" : "unpinned"}|${model.selectedActivityId ?? "overview"}|${model.width}`}
+        {`${model.open ? "open" : "closed"}|${model.pinned ? "pinned" : "unpinned"}|${model.selectedActivityId ?? "overview"}|${model.width}|${model.docked ? "docked" : "floating"}`}
       </output>
       {showOverview ? (
         <button type="button" onClick={(event) => model.openOverview(event.currentTarget)}>Overview</button>
@@ -116,5 +116,39 @@ describe("useInspector", () => {
     rerender(<Harness sessionId="session-a" store={store} showOverview={false} />);
     await user.click(screen.getByRole("button", { name: "Close" }));
     expect(document.activeElement).not.toBe(origin);
+  });
+
+  it("docks only while open on a wide viewport and floats otherwise", async () => {
+    const user = userEvent.setup();
+    const store = storage();
+    let wide = true;
+    const listeners = new Set<() => void>();
+    const matchMedia = vi.fn((query: string) => ({
+      get matches() { return query === INSPECTOR_DOCK_QUERY ? wide : false; },
+      media: query,
+      addEventListener: (_type: string, listener: () => void) => { listeners.add(listener); },
+      removeEventListener: (_type: string, listener: () => void) => { listeners.delete(listener); },
+    }));
+    vi.stubGlobal("matchMedia", matchMedia);
+    try {
+      render(<Harness sessionId="session-a" store={store} />);
+      const state = screen.getByRole("status", { name: "Inspector state" });
+      expect(state).toHaveTextContent("closed|unpinned|overview|420|floating");
+
+      await user.click(screen.getByRole("button", { name: "Overview" }));
+      expect(state).toHaveTextContent("open|unpinned|overview|420|docked");
+
+      wide = false;
+      act(() => { listeners.forEach((listener) => listener()); });
+      expect(state).toHaveTextContent("open|unpinned|overview|420|floating");
+
+      wide = true;
+      act(() => { listeners.forEach((listener) => listener()); });
+      expect(state).toHaveTextContent("docked");
+      await user.click(screen.getByRole("button", { name: "Close" }));
+      expect(state).toHaveTextContent("closed|unpinned|overview|420|floating");
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });

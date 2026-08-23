@@ -98,6 +98,20 @@ for (const width of [1440, 1100, 900, 720]) {
     } else {
       expect(box!.x).toBeGreaterThan(width / 2);
     }
+    // From 1100px the inspector docks: the conversation yields its width so
+    // the header actions and the send button stay fully visible beside it.
+    const shellDocked = await page.locator(".app-shell").evaluate((shell) => shell.hasAttribute("data-inspector-docked"));
+    expect(shellDocked).toBe(width >= 1100);
+    if (width >= 1100) {
+      // The shell's margin eases in, so poll until both edges have settled.
+      const rightEdge = async (locator: ReturnType<typeof page.getByRole>) => {
+        const edgeBox = await locator.boundingBox();
+        return edgeBox === null ? Number.POSITIVE_INFINITY : edgeBox.x + edgeBox.width;
+      };
+      await expect.poll(() => rightEdge(page.getByRole("region", { name: "Message composer" }))).toBeLessThanOrEqual(box!.x + 1);
+      await expect.poll(() => rightEdge(page.getByRole("button", { name: "Activity", exact: true }))).toBeLessThanOrEqual(box!.x + 1);
+      await expect(page.getByRole("button", { name: "Activity", exact: true })).toHaveAttribute("aria-pressed", "true");
+    }
     const inspectorClose = page.getByRole("button", { name: "Close activity inspector" });
     const inspectorCloseBox = await inspectorClose.boundingBox();
     expect(inspectorCloseBox).not.toBeNull();

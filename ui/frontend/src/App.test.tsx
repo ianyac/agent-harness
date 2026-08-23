@@ -2279,6 +2279,72 @@ describe("App", () => {
     expect(screen.queryByRole("region", { name: "Selected activity detail" })).not.toBeInTheDocument();
   });
 
+  it("toggles the inspector from the header: overview closes, a selected activity returns to overview, and the shell docks on wide viewports", async () => {
+    const user = userEvent.setup();
+    const active = session({ session_id: "header-toggle" });
+    const transcript = {
+      ...emptyTranscript(),
+      activities: {
+        "activity-toggle": {
+          activityId: "activity-toggle",
+          turnId: "turn-toggle",
+          parentActivityId: null,
+          actor: "tool",
+          name: "read_file",
+          args: { path: "README.md" },
+          startedAt: "2026-08-09T04:00:00Z",
+          status: "complete" as const,
+          result: "complete file contents",
+          isError: false,
+          durationMs: 12,
+        },
+      },
+      activityOrder: ["activity-toggle"],
+      timeline: [{ kind: "activity" as const, activityId: "activity-toggle" }],
+    };
+    const matchMedia = vi.fn((query: string) => ({
+      matches: query === "(min-width: 1100px)",
+      media: query,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    }));
+    vi.stubGlobal("matchMedia", matchMedia);
+    try {
+      const { container } = render(
+        <App
+          client={clientWithSessions([active])}
+          sidebarStorage={storage}
+          draftStorage={storage}
+          transcriptBySession={{ [active.session_id]: transcript }}
+        />,
+      );
+      const shell = () => container.querySelector(".app-shell") as HTMLElement;
+
+      const activity = await screen.findByRole("button", { name: "Activity" });
+      expect(activity).toHaveAttribute("aria-pressed", "false");
+      expect(shell()).not.toHaveAttribute("data-inspector-docked");
+
+      await user.click(activity);
+      expect(screen.getByRole("dialog", { name: "Activity inspector" })).toHaveAttribute("data-docked");
+      expect(screen.getByRole("button", { name: "Activity" })).toHaveAttribute("aria-pressed", "true");
+      expect(shell()).toHaveAttribute("data-inspector-docked");
+      expect(shell().style.getPropertyValue("--inspector-width")).toBe("420px");
+
+      await user.click(screen.getByRole("button", { name: /Open activity: read file/i }));
+      expect(screen.getByRole("region", { name: "Selected activity detail" })).toBeVisible();
+      await user.click(screen.getByRole("button", { name: "Activity" }));
+      expect(screen.getByRole("dialog", { name: "Activity inspector" })).toBeVisible();
+      expect(screen.queryByRole("region", { name: "Selected activity detail" })).not.toBeInTheDocument();
+
+      await user.click(screen.getByRole("button", { name: "Activity" }));
+      expect(screen.queryByRole("dialog", { name: "Activity inspector" })).not.toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Activity" })).toHaveAttribute("aria-pressed", "false");
+      expect(shell()).not.toHaveAttribute("data-inspector-docked");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("owns one exact inspector shortcut and isolates pinned open state by active session", async () => {
     const user = userEvent.setup();
     const sessionA = session({ session_id: "inspector-a", title: "Inspector A" });

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import type { CSSProperties } from "react";
 
 import { ApiClient } from "./api/http";
 import { useSessionSockets } from "./api/useSessionSockets";
@@ -691,12 +692,25 @@ export function App({
     sessionId: activeSession?.session_id ?? null,
     storage: inspectorStorage ?? sidebarStorage,
   });
+  // Width the inspector is being dragged to, so the docked shell follows live.
+  const [inspectorPreviewWidth, setInspectorPreviewWidth] = useState<number | null>(null);
   const activeElement = () => document.activeElement instanceof HTMLElement
     ? document.activeElement
     : null;
   const openInspectorOverview = () => {
     onToggleActivity();
     inspector.openOverview(activeElement());
+  };
+  // The header button is a toggle: it closes an inspector already showing
+  // the overview, and otherwise brings the overview up (from closed or from
+  // a selected activity).
+  const toggleInspectorOverview = () => {
+    if (inspector.open && inspector.selectedActivityId === null) {
+      onToggleActivity();
+      inspector.close();
+      return;
+    }
+    openInspectorOverview();
   };
   const toggleInspector = () => {
     onToggleActivity();
@@ -806,7 +820,11 @@ export function App({
 
   const nativeShell = selectedPlatform?.kind === "tauri";
   return (
-    <div className={nativeShell ? "app-shell app-shell--tauri" : "app-shell"}>
+    <div
+      className={nativeShell ? "app-shell app-shell--tauri" : "app-shell"}
+      data-inspector-docked={inspector.docked || undefined}
+      style={{ "--inspector-width": `${inspectorPreviewWidth ?? inspector.width}px` } as CSSProperties}
+    >
       {nativeShell ? (
         <div className="native-titlebar" data-tauri-drag-region aria-hidden="true" />
       ) : null}
@@ -878,7 +896,8 @@ export function App({
             latestContext={activeTranscript?.latestContext ?? null}
             mode={activeSession.mode}
             onSetSessionMode={(event) => routeSessionEvent(activeSession.session_id, event)}
-            onToggleActivity={openInspectorOverview}
+            activityOpen={inspector.open}
+            onToggleActivity={toggleInspectorOverview}
           />
         )}
         <main aria-label={settingsOpen ? "Settings" : "Conversation"} className="conversation-main">
@@ -960,6 +979,7 @@ export function App({
         <ActivityInspector
           open={inspector.open}
           narrow={inspector.narrow}
+          docked={inspector.docked}
           width={inspector.width}
           pinned={inspector.pinned}
           sessionId={activeSession.session_id}
@@ -970,6 +990,7 @@ export function App({
           onPinnedChange={inspector.setPinned}
           onSelectActivity={inspector.selectActivity}
           onWidthChange={inspector.setWidth}
+          onWidthPreview={setInspectorPreviewWidth}
           copyText={inspectorCopyText}
         />
       ) : null}

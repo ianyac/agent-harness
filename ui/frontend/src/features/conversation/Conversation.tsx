@@ -159,6 +159,20 @@ export function Conversation({
     previousRunning.current = state.running;
   }, [state.running, state.terminal]);
 
+  // Stay pinned to the latest message when the viewport reflows — window
+  // resizes, the inspector docking beside the transcript, the composer
+  // growing — as long as the reader was already at the bottom.
+  useEffect(() => {
+    const scroller = scrollerRef.current;
+    if (scroller === null || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => {
+      if (wasNearBottom.current) scroller.scrollTop = scroller.scrollHeight;
+    });
+    observer.observe(scroller);
+    if (scroller.firstElementChild !== null) observer.observe(scroller.firstElementChild);
+    return () => observer.disconnect();
+  }, []);
+
   useLayoutEffect(() => {
     const scroller = scrollerRef.current;
     if (scroller === null) return;

@@ -31,7 +31,8 @@
   min-height: 72px;
   max-height: 220px;
   padding: 14px 16px 8px;
-  resize: vertical;
+  overflow-y: auto;
+  resize: none;
   border: 0;
   border-radius: var(--radius-conversation) var(--radius-conversation) 0 0;
   outline: 0;

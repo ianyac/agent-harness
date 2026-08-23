@@ -324,16 +324,39 @@
   padding: 0;
   place-items: center;
   cursor: pointer;
-  transition: background-color var(--motion-fast) var(--motion-easing);
+  transition: background-color var(--motion-fast) var(--motion-easing),
+    opacity var(--motion-fast) var(--motion-easing);
+}
+
+/* On pointer devices the row menu waits for hover, focus, an open menu, or
+   the active row, so a truncated title's ellipsis isn't followed by a second
+   one. Touch and the rail keep it always visible. */
+@media (hover: hover) {
+  .sidebar:not([data-collapsed="true"]) .row .moreButton {
+    opacity: 0;
+  }
+
+  .sidebar:not([data-collapsed="true"]) .row:hover .moreButton,
+  .sidebar:not([data-collapsed="true"]) .row:focus-within .moreButton,
+  .sidebar:not([data-collapsed="true"]) .row[data-active] .moreButton,
+  .sidebar:not([data-collapsed="true"]) .row .moreButton[data-state="open"] {
+    opacity: 1;
+  }
 }
 
 .menu {
   z-index: 50;
   min-width: 168px;
   padding: 4px;
-  border: 1px solid var(--color-border);
+  border: 1px solid var(--color-border-strong);
   border-radius: var(--radius-menu);
   background: var(--color-elevated);
+  box-shadow: var(--shadow-md);
+}
+
+/* Focus lands on the menu container when it opens; the highlighted item is
+   the focus indicator, so the container itself stays ring-free. */
+.menu:focus-visible {
   box-shadow: var(--shadow-md);
 }
 
@@ -556,6 +579,12 @@
   cursor: pointer;
   font-weight: 500;
   transition: background-color var(--motion-fast) var(--motion-easing);
+}
+
+.headerButton[aria-pressed="true"],
+.headerButton[data-state="open"] {
+  color: var(--color-ink);
+  background: color-mix(in srgb, var(--color-ink) 9%, transparent);
 }
 
 .overlay {

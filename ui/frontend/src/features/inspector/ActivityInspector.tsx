@@ -83,6 +83,7 @@ function SelectedActivity({
 export type ActivityInspectorProps = {
   readonly open: boolean;
   readonly narrow: boolean;
+  readonly docked?: boolean;
   readonly width: number;
   readonly pinned: boolean;
   readonly sessionId: string;
@@ -93,12 +94,15 @@ export type ActivityInspectorProps = {
   readonly onPinnedChange: (pinned: boolean) => void;
   readonly onSelectActivity: (activityId: string) => void;
   readonly onWidthChange: (width: number) => void;
+  /** Live width while a pointer resize is in flight; null once it settles. */
+  readonly onWidthPreview?: (width: number | null) => void;
   readonly copyText?: CopyText;
 };
 
 export function ActivityInspector({
   open,
   narrow,
+  docked = false,
   width,
   pinned,
   sessionId,
@@ -109,6 +113,7 @@ export function ActivityInspector({
   onPinnedChange,
   onSelectActivity,
   onWidthChange,
+  onWidthPreview,
   copyText = copyToClipboard,
 }: ActivityInspectorProps) {
   const closeRef = useRef<HTMLButtonElement>(null);
@@ -182,6 +187,7 @@ export function ActivityInspector({
       const next = clampInspectorWidth(startWidth + startX - move.clientX);
       dragWidthRef.current = next;
       setDragWidth(next);
+      onWidthPreview?.(next);
     };
     const stop = () => {
       window.removeEventListener("pointermove", onMove);
@@ -191,6 +197,7 @@ export function ActivityInspector({
       if (dragWidthRef.current !== null) onWidthChange(dragWidthRef.current);
       dragWidthRef.current = null;
       setDragWidth(null);
+      onWidthPreview?.(null);
     };
     stopPointerResize.current = stop;
     window.addEventListener("pointermove", onMove);
@@ -205,6 +212,7 @@ export function ActivityInspector({
         <Dialog.Content
           className={styles.inspector}
           data-narrow={narrow || undefined}
+          data-docked={docked || undefined}
           data-modal={String(narrow)}
           style={{ "--inspector-width": `${dragWidth ?? clampedWidth}px` } as CSSProperties}
           onOpenAutoFocus={(event) => {

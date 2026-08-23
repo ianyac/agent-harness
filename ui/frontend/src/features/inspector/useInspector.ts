@@ -5,6 +5,10 @@ const PIN_KEY_PREFIX = "agent-harness:inspector-pinned:";
 export const INSPECTOR_MIN_WIDTH = 320;
 export const INSPECTOR_MAX_WIDTH = 640;
 const DEFAULT_WIDTH = 420;
+const NARROW_QUERY = "(max-width: 720px)";
+// Below this the inspector overlays the transcript; from here up it docks
+// beside it and the conversation shell yields the width.
+export const INSPECTOR_DOCK_QUERY = "(min-width: 1100px)";
 
 export type InspectorStorage = Pick<Storage, "getItem" | "setItem">;
 
@@ -19,6 +23,7 @@ export type InspectorModel = {
   readonly selectedActivityId: string | null;
   readonly width: number;
   readonly narrow: boolean;
+  readonly docked: boolean;
   readonly openOverview: (origin?: HTMLElement | null) => void;
   readonly openActivity: (activityId: string, origin?: HTMLElement | null) => void;
   readonly selectActivity: (activityId: string) => void;
@@ -69,9 +74,8 @@ function storedPin(storage: InspectorStorage | undefined, sessionId: string): bo
   return read(storage, `${PIN_KEY_PREFIX}${sessionId}`) === "true";
 }
 
-function useNarrowInspector(): boolean {
-  const query = "(max-width: 720px)";
-  const [narrow, setNarrow] = useState(() =>
+function useMediaQuery(query: string): boolean {
+  const [matches, setMatches] = useState(() =>
     typeof window !== "undefined" && typeof window.matchMedia === "function"
       ? window.matchMedia(query).matches
       : false,
@@ -80,13 +84,13 @@ function useNarrowInspector(): boolean {
   useEffect(() => {
     if (typeof window === "undefined" || typeof window.matchMedia !== "function") return;
     const media = window.matchMedia(query);
-    const update = () => setNarrow(media.matches);
+    const update = () => setMatches(media.matches);
     update();
     media.addEventListener("change", update);
     return () => media.removeEventListener("change", update);
-  }, []);
+  }, [query]);
 
-  return narrow;
+  return matches;
 }
 
 export function useInspector({ sessionId, storage: providedStorage }: UseInspectorOptions): InspectorModel {
@@ -96,7 +100,8 @@ export function useInspector({ sessionId, storage: providedStorage }: UseInspect
   const [pinned, setPinnedState] = useState(open);
   const [selectedActivityId, setSelectedActivityId] = useState<string | null>(null);
   const [width, setWidthState] = useState(() => storedWidth(storage));
-  const narrow = useNarrowInspector();
+  const narrow = useMediaQuery(NARROW_QUERY);
+  const wide = useMediaQuery(INSPECTOR_DOCK_QUERY);
   const previousSession = useRef(sessionId);
   const origin = useRef<HTMLElement | null>(null);
   const openMemory = useRef(new Map<string, boolean>());
@@ -217,6 +222,7 @@ export function useInspector({ sessionId, storage: providedStorage }: UseInspect
     selectedActivityId,
     width,
     narrow,
+    docked: open && wide,
     openOverview,
     openActivity,
     selectActivity,

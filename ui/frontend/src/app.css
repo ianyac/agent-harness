@@ -3,6 +3,13 @@
 }
 
 .app-shell {
+  /* Docked inspector: the shell yields this much on the inline end. The
+     clamp keeps the conversation at least 480px wide however far the
+     inspector was dragged. */
+  --inspector-dock-width: min(
+    var(--inspector-width, 420px),
+    calc(100vw - var(--sidebar-width) - 480px)
+  );
   display: flex;
   height: 100dvh;
   overflow: hidden;
@@ -53,6 +60,16 @@
   grid-template-rows: auto minmax(0, 1fr) auto;
   min-width: 0;
   min-height: 100dvh;
+}
+
+.app-shell[data-inspector-docked] > .conversation-shell {
+  margin-inline-end: var(--inspector-dock-width);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .conversation-shell {
+    transition: margin-inline-end var(--motion-standard) var(--motion-easing);
+  }
 }
 
 .connection-lifecycle {

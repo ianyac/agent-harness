@@ -125,6 +125,18 @@
   overflow-wrap: anywhere;
 }
 
+/* A terminal block cursor marks where a streaming reply is still being
+   written, whenever its tail is prose. */
+.message[data-streaming] .markdown > p:last-child::after {
+  content: "";
+  display: inline-block;
+  width: 0.55em;
+  height: 1em;
+  margin-inline-start: 2px;
+  vertical-align: -0.15em;
+  background: var(--color-accent-solid);
+}
+
 .markdown p,
 .markdown ul,
 .markdown ol,
@@ -253,6 +265,10 @@
   tab-size: 2;
 }
 
+.codeBlock pre code {
+  font: inherit;
+}
+
 .diff code,
 .diffAddition,
 .diffRemoval,
@@ -296,18 +312,16 @@
   text-align: start;
   cursor: pointer;
   transition: border-color var(--motion-fast) var(--motion-easing),
-    box-shadow var(--motion-fast) var(--motion-easing),
-    transform var(--motion-fast) var(--motion-easing);
+    background-color var(--motion-fast) var(--motion-easing);
 }
 
 .activityCard:hover {
   border-color: var(--color-border-strong);
-  box-shadow: var(--shadow-sm);
-  transform: translateY(-1px);
+  background: color-mix(in srgb, var(--color-ink) 3%, var(--color-surface));
 }
 
 .activityCard:active {
-  transform: translateY(0);
+  background: color-mix(in srgb, var(--color-ink) 6%, var(--color-surface));
 }
 
 .statusMark {
@@ -484,6 +498,16 @@
   .message,
   .activityCard {
     animation: message-rise var(--motion-slow) var(--motion-easing-out) backwards;
+  }
+
+  .message[data-streaming] .markdown > p:last-child::after {
+    animation: caret-blink 1s steps(1, end) infinite;
+  }
+
+  @keyframes caret-blink {
+    50% {
+      opacity: 0;
+    }
   }
 
   @keyframes message-rise {

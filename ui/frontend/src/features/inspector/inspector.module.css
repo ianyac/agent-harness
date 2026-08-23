@@ -24,6 +24,30 @@
   outline: none;
 }
 
+/* Docked beside the conversation (≥ 1100px): same clamp as the shell's
+   reserved margin so the two edges always meet. */
+.inspector[data-docked] {
+  width: min(var(--inspector-width), calc(100vw - var(--sidebar-width) - 480px));
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .inspector[data-docked] {
+    animation: inspector-dock-in var(--motion-standard) var(--motion-easing) backwards;
+  }
+
+  @keyframes inspector-dock-in {
+    from {
+      transform: translateX(24px);
+      opacity: 0;
+    }
+
+    to {
+      transform: translateX(0);
+      opacity: 1;
+    }
+  }
+}
+
 .resizeHandle {
   position: absolute;
   z-index: 1;

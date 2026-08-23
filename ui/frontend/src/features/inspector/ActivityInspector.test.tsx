@@ -397,6 +397,23 @@ describe("ActivityInspector", () => {
     expect(onWidthChange).toHaveBeenLastCalledWith(320);
   });
 
+  it("previews the live width while a pointer drag is in flight and clears it on release", () => {
+    const onWidthChange = vi.fn();
+    const onWidthPreview = vi.fn();
+    renderInspector({ width: 400, docked: true, onWidthChange, onWidthPreview });
+    expect(screen.getByRole("dialog", { name: "Activity inspector" })).toHaveAttribute("data-docked");
+    const separator = screen.getByRole("separator", { name: "Resize activity inspector" });
+    fireEvent(separator, new MouseEvent("pointerdown", { bubbles: true, button: 0, clientX: 400 }));
+    fireEvent(window, new MouseEvent("pointermove", { bubbles: true, clientX: 380 }));
+    expect(onWidthPreview).toHaveBeenLastCalledWith(420);
+    expect(onWidthChange).not.toHaveBeenCalled();
+    fireEvent(window, new MouseEvent("pointermove", { bubbles: true, clientX: 300 }));
+    expect(onWidthPreview).toHaveBeenLastCalledWith(500);
+    fireEvent(window, new MouseEvent("pointerup", { bubbles: true }));
+    expect(onWidthChange).toHaveBeenCalledExactlyOnceWith(500);
+    expect(onWidthPreview).toHaveBeenLastCalledWith(null);
+  });
+
   it("removes an active pointer resize operation when the inspector unmounts", () => {
     const onWidthChange = vi.fn();
     const { unmount } = renderInspector({ width: 400, onWidthChange });

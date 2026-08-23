@@ -13,6 +13,7 @@ type ConversationHeaderProps = {
   readonly latestContext?: JsonObject | null;
   readonly mode: BaseMode;
   readonly onSetSessionMode: (event: SetSessionMode) => void;
+  readonly activityOpen?: boolean;
   readonly onToggleActivity: () => void;
 };
 
@@ -40,6 +41,7 @@ export function ConversationHeader({
   latestContext = null,
   mode,
   onSetSessionMode,
+  activityOpen = false,
   onToggleActivity,
 }: ConversationHeaderProps) {
   const [confirmation, setConfirmation] = useState<{
@@ -117,7 +119,12 @@ export function ConversationHeader({
             </DropdownMenu.Content>
           </DropdownMenu.Portal>
         </DropdownMenu.Root>
-        <button type="button" className={styles.headerButton} onClick={onToggleActivity}>
+        <button
+          type="button"
+          className={styles.headerButton}
+          aria-pressed={activityOpen}
+          onClick={onToggleActivity}
+        >
           Activity
         </button>
       </div>

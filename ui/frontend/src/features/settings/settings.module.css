@@ -23,6 +23,10 @@
   margin: 0 auto;
 }
 
+.description {
+  margin-block: 6px 14px;
+}
+
 .scrollArea {
   min-height: 0;
 }
@@ -83,6 +87,7 @@
 }
 
 .field select {
+  max-width: 360px;
   min-height: 44px;
   padding: 7px 10px;
   border: 1px solid var(--color-border);

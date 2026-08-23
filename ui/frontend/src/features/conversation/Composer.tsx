@@ -1,6 +1,7 @@
 import {
   useEffect,
   useId,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -154,6 +155,14 @@ export function Composer({
   const runningBySession = useRef(new Map<string, boolean>([[sessionId, running]]));
   const previousActiveSession = useRef(sessionId);
   const listboxId = useId();
+  // Grow with the draft up to the stylesheet's max-height; the box never
+  // needs a manual grip and a long message stays fully in view.
+  useLayoutEffect(() => {
+    const textbox = textboxRef.current;
+    if (textbox === null) return;
+    textbox.style.height = "auto";
+    textbox.style.height = `${textbox.scrollHeight}px`;
+  }, [draft]);
   const slashQuery = draft.startsWith("/") ? draft.split(/\s/, 1)[0].toLocaleLowerCase() : "";
   const matchingCommands = useMemo(
     () => slashQuery === "" ? [] : commands.filter(({ command }) => command.startsWith(slashQuery)),
